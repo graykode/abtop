@@ -900,7 +900,7 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
                 let max_hdr = (children_area.width as usize).saturating_sub(2);
                 lines.push(Line::from(Span::styled(
                     truncate_str(
-                        &format!(" CHILDREN (►{} · {})", session.pid, if session.initial_prompt.is_empty() { &session.project_name } else { &session.initial_prompt }),
+                        &format!(" CHILDREN (►{} · {})", session.pid, &session.project_name),
                         max_hdr,
                     ),
                     Style::default().fg(TITLE).add_modifier(Modifier::BOLD),
