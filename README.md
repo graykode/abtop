@@ -4,6 +4,8 @@ A monitor for AI coding agents.
 
 Inspired by [htop](https://github.com/htop-dev/htop) and [btop](https://github.com/aristocratos/btop).
 
+![demo](demo.gif)
+
 Currently supports **Claude Code** and **Codex CLI**.
 
 ## Install
