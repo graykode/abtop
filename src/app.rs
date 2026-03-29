@@ -1,5 +1,5 @@
 use crate::collector::{MultiCollector, read_rate_limits};
-use crate::model::{AgentSession, RateLimitInfo};
+use crate::model::{AgentSession, RateLimitInfo, SessionStatus};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 
@@ -130,6 +130,21 @@ impl App {
 
     pub fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn kill_selected(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let session = &self.sessions[self.selected];
+        if session.status == SessionStatus::Done {
+            return;
+        }
+        let pid = session.pid;
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output();
+        self.tick();
     }
 
     pub fn quit(&mut self) {

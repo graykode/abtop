@@ -61,6 +61,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         KeyCode::Char('r') => app.tick(),
                         KeyCode::Down | KeyCode::Char('j') => app.select_next(),
                         KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
+                        KeyCode::Char('x') => app.kill_selected(),
                         _ => {}
                     }
                 }

@@ -1054,6 +1054,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled("↵", Style::default().fg(HI_FG)));
         spans.push(Span::styled(" jump ", Style::default().fg(MAIN_FG)));
     }
+    spans.push(Span::styled("x", Style::default().fg(HI_FG)));
+    spans.push(Span::styled(" kill ", Style::default().fg(MAIN_FG)));
     spans.push(Span::styled("q", Style::default().fg(HI_FG)));
     spans.push(Span::styled(" quit ", Style::default().fg(MAIN_FG)));
     spans.push(Span::styled("r", Style::default().fg(HI_FG)));
