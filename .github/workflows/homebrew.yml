@@ -1,0 +1,53 @@
+name: Update Homebrew Formula
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-formula:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for release assets
+        run: sleep 30
+
+      - name: Download checksums
+        run: |
+          gh release download ${{ github.event.release.tag_name }} \
+            --pattern 'sha256sums.txt' \
+            --dir /tmp
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update formula
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+
+          SHA_ARM=$(grep aarch64-apple-darwin /tmp/sha256sums.txt | awk '{print $1}')
+          SHA_INTEL=$(grep x86_64-apple-darwin /tmp/sha256sums.txt | awk '{print $1}')
+          SHA_LINUX_ARM=$(grep aarch64-unknown-linux-gnu /tmp/sha256sums.txt | awk '{print $1}')
+          SHA_LINUX_INTEL=$(grep x86_64-unknown-linux-gnu /tmp/sha256sums.txt | awk '{print $1}')
+
+          sed -i "s/{VERSION}/$VERSION/g" Formula/abtop.rb
+          sed -i "s/{SHA256_ARM}/$SHA_ARM/g" Formula/abtop.rb
+          sed -i "s/{SHA256_INTEL}/$SHA_INTEL/g" Formula/abtop.rb
+          sed -i "s/{SHA256_LINUX_ARM}/$SHA_LINUX_ARM/g" Formula/abtop.rb
+          sed -i "s/{SHA256_LINUX_INTEL}/$SHA_LINUX_INTEL/g" Formula/abtop.rb
+
+          cat Formula/abtop.rb
+
+      - name: Push to homebrew-tap
+        uses: cpina/github-action-push-to-another-repository@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.TAP_GITHUB_TOKEN }}
+        with:
+          source-directory: Formula
+          destination-github-username: graykode
+          destination-repository-name: homebrew-tap
+          target-directory: Formula
+          user-email: nlkey2022@gmail.com
+          commit-message: "abtop ${{ github.event.release.tag_name }}"
