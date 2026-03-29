@@ -7,6 +7,21 @@ use std::sync::mpsc;
 const GRAPH_HISTORY_LEN: usize = 200;
 /// Max concurrent summary jobs.
 const MAX_SUMMARY_JOBS: usize = 3;
+/// Max summary attempts per session before giving up.
+const MAX_SUMMARY_RETRIES: u32 = 2;
+
+/// Produce a terminal-safe fallback summary from a raw prompt.
+fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
+    let cleaned: String = prompt.chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .take(max_len)
+        .collect();
+    if prompt.chars().count() > max_len {
+        format!("{}…", cleaned)
+    } else {
+        cleaned
+    }
+}
 
 pub struct App {
     pub sessions: Vec<AgentSession>,
@@ -25,9 +40,12 @@ pub struct App {
     pub summaries: HashMap<String, String>,
     /// Session IDs currently being summarized.
     pending_summaries: HashSet<String>,
+    /// Per-session retry count for failed summary attempts.
+    summary_retries: HashMap<String, u32>,
     /// Channel to receive completed summaries from background threads.
-    summary_rx: mpsc::Receiver<(String, String)>,
-    summary_tx: mpsc::Sender<(String, String)>,
+    /// Tuple: (session_id, prompt, maybe_summary).
+    summary_rx: mpsc::Receiver<(String, String, Option<String>)>,
+    summary_tx: mpsc::Sender<(String, String, Option<String>)>,
 }
 
 impl App {
@@ -46,6 +64,7 @@ impl App {
             collector: MultiCollector::new(),
             summaries,
             pending_summaries: HashSet::new(),
+            summary_retries: HashMap::new(),
             summary_rx: rx,
             summary_tx: tx,
         }
@@ -83,20 +102,40 @@ impl App {
             self.rate_limit_counter += 1;
         }
 
-        // Drain completed summaries from background threads
-        while let Ok((sid, summary)) = self.summary_rx.try_recv() {
+        self.drain_and_retry_summaries();
+    }
+
+    /// Drain completed summary results and spawn retries. Does NOT recollect
+    /// sessions, so it is safe for `--once` mode (stable snapshot).
+    pub fn drain_and_retry_summaries(&mut self) {
+        while let Ok((sid, prompt, maybe_summary)) = self.summary_rx.try_recv() {
             self.pending_summaries.remove(&sid);
-            self.summaries.insert(sid, summary.clone());
-            // Persist to disk cache (best-effort)
-            save_summary_cache(&self.summaries);
+            match maybe_summary {
+                Some(summary) => {
+                    self.summary_retries.remove(&sid);
+                    self.summaries.insert(sid, summary);
+                    save_summary_cache(&self.summaries);
+                }
+                None => {
+                    let count = self.summary_retries.entry(sid.clone()).or_insert(0);
+                    *count += 1;
+                    if *count >= MAX_SUMMARY_RETRIES {
+                        // Exhausted — store sanitized fallback using prompt from worker
+                        self.summaries.insert(sid, sanitize_fallback(&prompt, 28));
+                        save_summary_cache(&self.summaries);
+                    }
+                }
+            }
         }
 
-        // Spawn summary jobs for new sessions
+        // Spawn summary jobs for sessions that need one
         for s in &self.sessions {
+            let retries = self.summary_retries.get(&s.session_id).copied().unwrap_or(0);
             if !s.initial_prompt.is_empty()
                 && !self.summaries.contains_key(&s.session_id)
                 && !self.pending_summaries.contains(&s.session_id)
                 && self.pending_summaries.len() < MAX_SUMMARY_JOBS
+                && retries < MAX_SUMMARY_RETRIES
             {
                 self.pending_summaries.insert(s.session_id.clone());
                 let sid = s.session_id.clone();
@@ -104,7 +143,7 @@ impl App {
                 let tx = self.summary_tx.clone();
                 std::thread::spawn(move || {
                     let result = generate_summary(&prompt);
-                    let _ = tx.send((sid, result));
+                    let _ = tx.send((sid, prompt, result));
                 });
             }
         }
@@ -114,12 +153,14 @@ impl App {
         !self.pending_summaries.is_empty()
     }
 
-    pub fn drain_summaries(&mut self) {
-        while let Ok((sid, summary)) = self.summary_rx.try_recv() {
-            self.pending_summaries.remove(&sid);
-            self.summaries.insert(sid, summary);
-            save_summary_cache(&self.summaries);
-        }
+    /// True if any session still qualifies for a summary retry.
+    pub fn has_retryable_summaries(&self) -> bool {
+        self.sessions.iter().any(|s| {
+            !s.initial_prompt.is_empty()
+                && !self.summaries.contains_key(&s.session_id)
+                && !self.pending_summaries.contains(&s.session_id)
+                && self.summary_retries.get(&s.session_id).copied().unwrap_or(0) < MAX_SUMMARY_RETRIES
+        })
     }
 
     pub fn select_next(&mut self) {
@@ -158,7 +199,7 @@ impl App {
         } else if self.pending_summaries.contains(&session.session_id) {
             "...".to_string()
         } else if !session.initial_prompt.is_empty() {
-            session.initial_prompt.clone()
+            sanitize_fallback(&session.initial_prompt, 50)
         } else {
             "—".to_string()
         }
@@ -166,7 +207,8 @@ impl App {
 }
 
 /// Call `claude --print` via stdin pipe to summarize a prompt.
-fn generate_summary(prompt: &str) -> String {
+/// Returns `None` on timeout so the caller can retry later.
+fn generate_summary(prompt: &str) -> Option<String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     use std::time::Duration;
@@ -186,7 +228,7 @@ fn generate_summary(prompt: &str) -> String {
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return prompt.chars().take(50).collect(),
+        Err(_) => return Some(sanitize_fallback(prompt, 50)),
     };
 
     // Write prompt via stdin (no shell injection)
@@ -194,17 +236,58 @@ fn generate_summary(prompt: &str) -> String {
         let _ = stdin.write_all(request.as_bytes());
     }
 
-    // Wait with timeout
-    let result = match child.wait_with_output() {
-        Ok(output) => Ok(output),
-        Err(e) => Err(e),
+    // Drain stdout in a background thread to prevent pipe-full deadlock,
+    // while polling the child with try_wait + timeout in this thread.
+    let stdout = child.stdout.take();
+    let stdout_handle = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Some(mut out) = stdout {
+            let _ = out.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let timeout = Duration::from_secs(10);
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap to avoid zombie
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
     };
 
-    let fallback: String = prompt
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(28)
-        .collect();
+    let status = match status {
+        Some(s) => s,
+        None => {
+            // After kill+wait the pipe is closed, so the reader should finish.
+            // Detach the thread rather than blocking indefinitely on join —
+            // if a descendant kept stdout open, we don't want to hang here.
+            drop(stdout_handle);
+            return None;
+        }
+    };
+
+    let stdout_bytes = stdout_handle.join().unwrap_or_default();
+    let result: Result<std::process::Output, std::io::Error> = Ok(std::process::Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: Vec::new(),
+    });
+
+    let fallback = sanitize_fallback(prompt, 28);
 
     match result {
         Ok(output) if output.status.success() => {
@@ -223,12 +306,12 @@ fn generate_summary(prompt: &str) -> String {
                 || lower.contains("initial conversation")
                 || lower.starts_with("greeting")
             {
-                fallback
+                Some(fallback)
             } else {
-                raw.trim_matches('"').trim_matches('\'').to_string()
+                Some(raw.trim_matches('"').trim_matches('\'').to_string())
             }
         }
-        _ => fallback,
+        _ => Some(fallback),
     }
 }
 

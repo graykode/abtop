@@ -16,15 +16,14 @@ fn main() -> io::Result<()> {
     if std::env::args().any(|a| a == "--once") {
         let mut app = App::new();
         app.tick();
-        // Wait for pending summaries (up to 20s)
-        if app.has_pending_summaries() {
-            for _ in 0..40 {
-                std::thread::sleep(Duration::from_millis(500));
-                app.drain_summaries();
-                if !app.has_pending_summaries() {
-                    break;
-                }
+        // Wait for summaries: retry-aware budget (up to 30s total to allow 2 × 10s attempts + slack)
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            app.drain_and_retry_summaries();
+            if !app.has_pending_summaries() && !app.has_retryable_summaries() {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(500));
         }
         print_snapshot(&app);
         return Ok(());
