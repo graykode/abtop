@@ -183,38 +183,31 @@ pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),     // header bar
-            Constraint::Length(top_h), // top: rate limit + context
-            Constraint::Min(10),      // middle
-            Constraint::Length(1),    // footer
+            Constraint::Length(1),      // header bar
+            Constraint::Length(top_h),  // top: rate limit + context
+            Constraint::Length(8),      // mid: tokens + projects + ports (horizontal)
+            Constraint::Min(10),       // sessions (full width)
+            Constraint::Length(1),     // footer
         ])
         .split(area);
 
     draw_header(f, app, chunks[0]);
     draw_top_panel(f, app, chunks[1]);
 
-    let mid = Layout::default()
+    let mid_panels = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(28), // left panels
-            Constraint::Percentage(72), // sessions
+            Constraint::Percentage(33), // tokens
+            Constraint::Percentage(34), // projects
+            Constraint::Percentage(33), // ports
         ])
         .split(chunks[2]);
 
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(40), // tokens
-            Constraint::Percentage(30), // projects
-            Constraint::Percentage(30), // ports
-        ])
-        .split(mid[0]);
-
-    draw_tokens_panel(f, app, left[0]);
-    draw_projects_panel(f, app, left[1]);
-    draw_ports_panel(f, app, left[2]);
-    draw_sessions_panel(f, app, mid[1]);
-    draw_footer(f, app, chunks[3]);
+    draw_tokens_panel(f, app, mid_panels[0]);
+    draw_projects_panel(f, app, mid_panels[1]);
+    draw_ports_panel(f, app, mid_panels[2]);
+    draw_sessions_panel(f, app, chunks[3]);
+    draw_footer(f, app, chunks[4]);
 }
 
 // ── header bar — btop style: ¹cpu ─ menu ─ preset * ── time ── BAT ──────────
@@ -688,7 +681,20 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
             Style::default()
         };
 
-        let sid_short = truncate_str(&session.session_id, 8);
+        // Project column: "project(session_id_short)"
+        let sid_short = if session.session_id.len() >= 7 {
+            &session.session_id[..7]
+        } else {
+            &session.session_id
+        };
+        let project_col = format!("{}({})", session.project_name, sid_short);
+
+        // Summary column: first prompt text
+        let summary_col = if session.initial_prompt.is_empty() {
+            "—".to_string()
+        } else {
+            session.initial_prompt.clone()
+        };
 
         rows.push(
             Row::new(vec![
@@ -698,16 +704,12 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(MAIN_FG),
                 )),
                 Cell::from(Span::styled(
-                    sid_short,
-                    Style::default().fg(INACTIVE_FG),
+                    project_col,
+                    Style::default().fg(TITLE),
                 )),
                 Cell::from(Span::styled(
-                    if session.initial_prompt.is_empty() {
-                        session.project_name.clone()
-                    } else {
-                        session.initial_prompt.clone()
-                    },
-                    Style::default().fg(TITLE),
+                    summary_col,
+                    Style::default().fg(MAIN_FG),
                 )),
                 Cell::from(Span::styled(status_icon, Style::default().fg(status_color))),
                 Cell::from(Span::styled(
@@ -744,11 +746,11 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
             Row::new(vec![
                 Cell::from(""),
                 Cell::from(""),
-                Cell::from(""),
                 Cell::from(Span::styled(
                     format!("└─ {}", truncate_str(&session.current_task, 50)),
                     Style::default().fg(GRAPH_TEXT),
                 )),
+                Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
