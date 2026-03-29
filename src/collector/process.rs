@@ -61,7 +61,7 @@ pub fn has_active_descendant(
     while let Some(p) = stack.pop() {
         if let Some(kids) = children_map.get(&p) {
             for &kid in kids {
-                if process_info.get(&kid).map_or(false, |p| p.cpu_pct > cpu_threshold) {
+                if process_info.get(&kid).is_some_and(|p| p.cpu_pct > cpu_threshold) {
                     return true;
                 }
                 stack.push(kid);

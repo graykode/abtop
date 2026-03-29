@@ -66,6 +66,7 @@ const BRAILLE_UP: [&str; 25] = [
 /// Generate 101-step gradient from start→mid→end, matching btop's generateGradients().
 fn make_gradient(start: (u8, u8, u8), mid: (u8, u8, u8), end: (u8, u8, u8)) -> [Color; 101] {
     let mut out = [Color::Reset; 101];
+    #[allow(clippy::needless_range_loop)]
     for i in 0..=100 {
         let (s, e, offset, range) = if i <= 50 {
             (start, mid, 0, 50)
@@ -286,7 +287,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let mid_h_ideal: u16 = 8;
     // Sessions: border(2) + header(1) + 2 rows/session + detail area
     let sessions_ideal: u16 = (app.sessions.len() as u16 * 2 + 7).max(8);
-    let context_ideal: u16 = (app.sessions.len() as u16 + 4).min(10).max(5);
+    let context_ideal: u16 = (app.sessions.len() as u16 + 4).clamp(5, 10);
 
     let available = h.saturating_sub(FIXED);
     // 1) Sessions get what they need first (min 5)
@@ -478,7 +479,7 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
     let header_style = Style::default().fg(MAIN_FG).add_modifier(Modifier::BOLD);
 
     // bar width = remaining space after Project(14) + Session(9) + pct(5) + padding
-    let bar_width = (area.width as usize).saturating_sub(30).min(20).max(4);
+    let bar_width = (area.width as usize).saturating_sub(30).clamp(4, 20);
 
     let mut rows = Vec::new();
 
@@ -593,7 +594,7 @@ fn draw_quota_panel(f: &mut Frame, app: &App, area: Rect) {
         };
         let col_area = Rect { x: col_x, y: inner.y, width: this_w, height: content_h };
         let col_w_usize = col_area.width as usize;
-        let bar_w = col_w_usize.saturating_sub(10).min(8).max(2);
+        let bar_w = col_w_usize.saturating_sub(10).clamp(2, 8);
 
         let mut lines: Vec<Line> = Vec::new();
 
@@ -608,7 +609,7 @@ fn draw_quota_panel(f: &mut Frame, app: &App, area: Rect) {
 
         if let Some(used_pct) = rl.five_hour_pct {
             let remaining = (100.0 - used_pct).clamp(0.0, 100.0);
-            let reset = rl.five_hour_resets_at.map(|ts| format_reset_time(ts)).unwrap_or_default();
+            let reset = rl.five_hour_resets_at.map(format_reset_time).unwrap_or_default();
             // Color by urgency: low remaining = red (high used), high remaining = green
             let c = grad_at(&cpu_grad, used_pct);
             let mut s = vec![styled_label(" 5h ")];
@@ -621,7 +622,7 @@ fn draw_quota_panel(f: &mut Frame, app: &App, area: Rect) {
         }
         if let Some(used_pct) = rl.seven_day_pct {
             let remaining = (100.0 - used_pct).clamp(0.0, 100.0);
-            let reset = rl.seven_day_resets_at.map(|ts| format_reset_time(ts)).unwrap_or_default();
+            let reset = rl.seven_day_resets_at.map(format_reset_time).unwrap_or_default();
             let c = grad_at(&cpu_grad, used_pct);
             let mut s = vec![styled_label(" 7d ")];
             s.extend(remaining_bar(remaining, bar_w, &cpu_grad));
@@ -676,7 +677,7 @@ fn draw_tokens_panel(f: &mut Frame, app: &App, area: Rect) {
     let used_grad = make_gradient(USED_START, USED_MID, USED_END);
     let cached_grad = make_gradient(CACHED_START, CACHED_MID, CACHED_END);
 
-    let bar_w = (area.width as usize).saturating_sub(20).min(15).max(5);
+    let bar_w = (area.width as usize).saturating_sub(20).clamp(5, 15);
 
     let total_line = vec![
         styled_label(" Total: "),
@@ -721,7 +722,7 @@ fn draw_tokens_panel(f: &mut Frame, app: &App, area: Rect) {
         .get(app.selected)
         .map(|s| s.token_history.clone())
         .unwrap_or_default();
-    let spark_w = (area.width as usize).saturating_sub(16).min(20).max(5);
+    let spark_w = (area.width as usize).saturating_sub(16).clamp(5, 20);
     let max_val = all_history.iter().copied().max().unwrap_or(1).max(1);
     let normalized: Vec<f64> = all_history
         .iter()
@@ -1180,11 +1181,7 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
     let visible_rows = table_area.height.saturating_sub(1) as usize; // -1 for header
     let selected_row_start = app.selected * 2;
     let selected_row_end = selected_row_start + 2;
-    let scroll_offset = if selected_row_end > visible_rows {
-        selected_row_end - visible_rows
-    } else {
-        0
-    };
+    let scroll_offset = selected_row_end.saturating_sub(visible_rows);
     let visible = if scroll_offset < rows.len() {
         rows.into_iter().skip(scroll_offset).collect::<Vec<_>>()
     } else {
@@ -1372,14 +1369,13 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
                 if use_two_cols {
                     let half_w = col_w / 2;
                     let name_w = half_w.saturating_sub(12);
-                    let mid = (session.subagents.len() + 1) / 2;
+                    let mid = session.subagents.len().div_ceil(2);
                     let left_agents = &session.subagents[..mid];
                     let right_agents = &session.subagents[mid..];
 
-                    for row_idx in 0..mid {
+                    for (row_idx, sa) in left_agents.iter().enumerate() {
                         let mut spans = Vec::new();
                         // Left column
-                        let sa = &left_agents[row_idx];
                         let icon = if sa.status == "working" { "●" } else { "✓" };
                         let fg = if sa.status == "working" { MAIN_FG } else { GRAPH_TEXT };
                         spans.push(Span::styled(

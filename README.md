@@ -13,7 +13,7 @@ See every Claude Code and Codex CLI session at a glance — token usage, context
 - Agent spawned a server and forgot to kill it? Orphan port detection.
 - Context window filling up? Per-session % bars with warnings.
 
-All read-only. No API keys. No network calls.
+All read-only. No API keys. No auth.
 
 ## Install
 
@@ -21,12 +21,6 @@ All read-only. No API keys. No network calls.
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/graykode/abtop/releases/latest/download/abtop-installer.sh | sh
-```
-
-### Windows
-
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://github.com/graykode/abtop/releases/latest/download/abtop-installer.ps1 | iex"
 ```
 
 ### Cargo
@@ -70,14 +64,14 @@ Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide g
 |-----|--------|
 | `↑`/`↓` or `k`/`j` | Select session |
 | `Enter` | Jump to session terminal (tmux only) |
-| `Tab` | Cycle focus between panels |
-| `1`–`4` | Toggle panel visibility |
+| `x` | Kill selected session |
+| `X` | Kill all orphan ports |
 | `q` | Quit |
 | `r` | Force refresh |
 
 ## Privacy
 
-abtop reads local files only. No network calls, no API keys, no auth. Tool names and file paths are shown in the UI, but file contents and prompt text are never displayed.
+abtop reads local files only. No API keys, no auth. Tool names and file paths are shown in the UI, but file contents and prompt text are never displayed. Session summaries are generated via `claude --print`, which makes its own API call — this is the only indirect network usage.
 
 ## License
 

@@ -182,7 +182,7 @@ impl ClaudeCollector {
             } else {
                 // Transcript is stale (>30s). Check CPU-based signals:
                 // 1. Claude process using CPU > 1% → likely thinking/streaming
-                let claude_cpu_active = proc.map_or(false, |p| p.cpu_pct > 1.0);
+                let claude_cpu_active = proc.is_some_and(|p| p.cpu_pct > 1.0);
                 // 2. Any descendant using significant CPU (>5%) → likely running a tool
                 //    (higher threshold avoids false positives from idle watchers/servers)
                 let has_active_descendant = process::has_active_descendant(
@@ -691,8 +691,6 @@ fn is_claude_process(pid: u32) -> bool {
 fn context_window_for_model(model: &str) -> u64 {
     if model.contains("[1m]") {
         1_000_000
-    } else if model.contains("opus") || model.contains("sonnet") || model.contains("haiku") {
-        200_000
     } else {
         200_000
     }

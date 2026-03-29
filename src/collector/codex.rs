@@ -66,7 +66,7 @@ impl CodexCollector {
                 seen_jsonl.insert(jsonl_path.clone());
                 if let Some(new_rl) = rl {
                     let newer = self.last_rate_limit.as_ref()
-                        .map_or(true, |old| new_rl.updated_at > old.updated_at);
+                        .is_none_or(|old| new_rl.updated_at > old.updated_at);
                     if newer { self.last_rate_limit = Some(new_rl); }
                 }
                 sessions.push(session);
@@ -106,7 +106,7 @@ impl CodexCollector {
                     ) {
                         if let Some(new_rl) = rl {
                             let newer = self.last_rate_limit.as_ref()
-                                .map_or(true, |old| new_rl.updated_at > old.updated_at);
+                                .is_none_or(|old| new_rl.updated_at > old.updated_at);
                             if newer { self.last_rate_limit = Some(new_rl); }
                         }
                         sessions.push(session);
@@ -156,9 +156,7 @@ impl CodexCollector {
         // so task_complete alone does NOT mean the session is finished when PID is alive.
         // However, for exec (one-shot) sessions, task_complete means truly done.
         let pid_alive = proc.is_some();
-        let status = if !pid_alive {
-            SessionStatus::Done
-        } else if is_exec && result.task_complete {
+        let status = if !pid_alive || (is_exec && result.task_complete) {
             SessionStatus::Done
         } else {
             let since_activity = std::time::SystemTime::now()
@@ -167,8 +165,8 @@ impl CodexCollector {
             if since_activity.as_secs() < 30 {
                 SessionStatus::Working
             } else {
-                let cpu_active = proc.map_or(false, |p| p.cpu_pct > 1.0);
-                let has_active_child = pid.map_or(false, |p| {
+                let cpu_active = proc.is_some_and(|p| p.cpu_pct > 1.0);
+                let has_active_child = pid.is_some_and(|p| {
                     process::has_active_descendant(p, children_map, process_info, 5.0)
                 });
                 if cpu_active || has_active_child {

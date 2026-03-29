@@ -218,7 +218,7 @@ impl App {
         for orphan in &self.orphan_ports {
             // 1. Verify PID still listens on the expected port
             let still_listening = fresh_ports.get(&orphan.pid)
-                .map_or(false, |ports| ports.contains(&orphan.port));
+                .is_some_and(|ports| ports.contains(&orphan.port));
             if !still_listening {
                 continue;
             }

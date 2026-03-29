@@ -160,7 +160,7 @@ impl MultiCollector {
             }
             // Check if process is still alive and still has the port open
             let still_listening = shared.ports.get(pid)
-                .map_or(false, |ports| ports.contains(&tracked.port));
+                .is_some_and(|ports| ports.contains(&tracked.port));
             let still_alive = shared.process_info.contains_key(pid);
             if still_alive && still_listening {
                 self.orphan_ports.push(OrphanPort {

@@ -8,9 +8,8 @@ Supports Claude Code and Codex CLI.
 
 ```
 src/
-├── main.rs                 # Entry, terminal setup, event loop, --setup/--demo flags
+├── main.rs                 # Entry, terminal setup, event loop, --setup flag
 ├── app.rs                  # App state, tick logic, key handling, summary generation
-├── demo.rs                 # Demo data population for --demo mode
 ├── setup.rs                # StatusLine hook installation (abtop --setup)
 ├── ui/
 │   └── mod.rs              # All panels in single file: header, context, quota,
@@ -35,24 +34,27 @@ src/
 │  token rate (200pt history)            S2 prediction  █████████91%⚠ │
 │                                        S3 api-server  ███      22%  │
 └──────────────────────────────────────────────────────────────────────┘
-┌─ ²quota ─────┐┌─ tokens ────┐┌─ projects ───┐┌─ ⁴sessions ────────┐
-│ CLAUDE       ││ Total  1.2M ││ abtop        ││►7336 abtop  ● opus │
-│ 5h ████ 35%  ││ Input  402k ││  main +3 ~18 ││  Stripe payment... │
-│   resets 2h  ││ Output  89k ││              ││  └─ Edit src/pay.rs│
-│ 7d ██ 12%    ││ Cache  710k ││ prediction   ││ 8840 pred  ◌ sonn  │
-│              ││ ▁▃▅▇█▇▅▃▁▃▅││  feat/x +1~2 ││  ML pipeline opt..│
-│ CODEX        ││ Turns: 48   ││              ││  └─ waiting        │
+┌─ ²quota ─────┐┌─ ³tokens ───┐┌─ ⁴projects ──┐┌─ ⁵ports ──────────┐
+│ CLAUDE       ││ Total  1.2M ││ abtop        ││ PORT  SESSION  CMD │
+│ 5h ████ 35%  ││ Input  402k ││  main +3 ~18 ││ :3000 api-srv node│
+│   resets 2h  ││ Output  89k ││              ││ :8080 predict crgo│
+│ 7d ██ 12%    ││ Cache  710k ││ prediction   ││                    │
+│              ││ ▁▃▅▇█▇▅▃▁▃▅││  feat/x +1~2 ││ ORPHAN PORTS       │
+│ CODEX        ││ Turns: 48   ││              ││ :4000 old-prj node│
 │ 5h █ 9%     ││ Avg: 25k/t  ││ api-server   ││                    │
-│ 7d ██ 14%    ││             ││  main ✓clean ││ CHILDREN           │
-└──────────────┘└─────────────┘└──────────────┘│  7401 cargo build  │
-┌─ ³ports ─────────────────────────────────────┐│                    │
-│ PORT  SESSION      CMD   PID                 ││ SUBAGENTS          │
-│ :3000 api-server   node 9150                 ││  explore-data ✓12k │
-│ :8080 prediction   cargo 8901                ││  run-tests    ●8k  │
-│                                              ││                    │
-│ ORPHAN PORTS                                 ││ MEM 4f · 12/200   │
-│ :4000 old-project  node 1234                 ││ v2.1.86 · 47m     │
-└──────────────────────────────────────────────┘└────────────────────┘
+│ 7d ██ 14%    ││             ││  main ✓clean ││                    │
+└──────────────┘└─────────────┘└──────────────┘└────────────────────┘
+┌─ ⁶sessions ─────────────────────────────────────────────────────────┐
+│ ►*CC 7336 abtop  ● Work opus  82% 1.2M  48  Edit src/pay.rs       │
+│  >CD 8840 pred   ◌ Wait sonn  91% 340k  12  waiting                │
+│ ─────────────────────────────────────────────────────────────────── │
+│  SESSION 7336 · /Users/graykode/abtop                               │
+│  Stripe payment integration...                                      │
+│  └─ Edit src/pay.rs                                                 │
+│  CHILDREN: 7401 cargo build                                         │
+│  SUBAGENTS: explore-data ✓12k · run-tests ●8k                      │
+│  MEM 4f · 12/200 │ v2.1.86 · 47m                                   │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 Panel rendering priority (top to bottom):
@@ -64,10 +66,10 @@ Panel rendering priority (top to bottom):
 Panel descriptions:
 - **¹context**: Left = token rate braille sparkline (200-point history). Right = per-session context % bars with yellow/red warning.
 - **²quota**: Claude + Codex rate limit gauges side-by-side (5h and 7d windows with reset countdown).
-- **tokens**: Total token breakdown (in/out/cache) + per-turn sparkline for selected session.
-- **projects**: Per-project git branch + added/modified file counts.
-- **³ports**: Agent-spawned open ports + orphan ports (from dead sessions). Conflict detection.
-- **⁴sessions**: Session list with summary title, current task, children, subagents, memory status.
+- **³tokens**: Total token breakdown (in/out/cache) + per-turn sparkline for selected session.
+- **⁴projects**: Per-project git branch + added/modified file counts.
+- **⁵ports**: Agent-spawned open ports + orphan ports (from dead sessions). Conflict detection.
+- **⁶sessions**: Full-width panel below mid row. Session list table (top) + selected session detail (bottom), separated by divider.
 
 ## Data Sources
 
@@ -276,8 +278,6 @@ Types: `feat`, `fix`, `refactor`, `docs`, `chore`
 cargo build                    # Build
 cargo run                      # Run TUI
 cargo run -- --once            # Print snapshot and exit
-cargo run -- --demo            # TUI with demo data (no live sessions needed)
-cargo run -- --demo --once     # Snapshot with demo data
 cargo run -- --setup           # Install StatusLine hook for rate limit collection
 cargo test                     # Tests
 cargo clippy                   # Lint
