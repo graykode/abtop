@@ -177,8 +177,8 @@ fn styled_label(text: &str) -> Span<'static> {
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
 
-    // Top panel height: fixed size, don't grow with session count
-    let top_h: u16 = 8;
+    // Top panel height: header + column header + sessions + summary + borders
+    let top_h: u16 = (app.sessions.len() as u16 + 5).min(12).max(6);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
