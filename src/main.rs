@@ -1,5 +1,6 @@
 mod app;
 mod collector;
+mod demo;
 mod model;
 mod setup;
 mod ui;
@@ -19,18 +20,24 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    let demo_mode = std::env::args().any(|a| a == "--demo");
+
     // --once flag: print snapshot and exit
     if std::env::args().any(|a| a == "--once") {
         let mut app = App::new();
-        app.tick();
-        // Wait for summaries: retry-aware budget (up to 30s total to allow 2 × 10s attempts + slack)
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while std::time::Instant::now() < deadline {
-            app.drain_and_retry_summaries();
-            if !app.has_pending_summaries() && !app.has_retryable_summaries() {
-                break;
+        if demo_mode {
+            demo::populate_demo(&mut app);
+        } else {
+            app.tick();
+            // Wait for summaries: retry-aware budget (up to 30s total to allow 2 × 10s attempts + slack)
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                app.drain_and_retry_summaries();
+                if !app.has_pending_summaries() && !app.has_retryable_summaries() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
             }
-            std::thread::sleep(Duration::from_millis(500));
         }
         print_snapshot(&app);
         return Ok(());
@@ -41,7 +48,7 @@ fn main() -> io::Result<()> {
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let app_result = run_app(&mut terminal);
+    let app_result = run_app(&mut terminal, demo_mode);
 
     // Always attempt both cleanup steps regardless of app result
     let r1 = disable_raw_mode();
@@ -51,9 +58,13 @@ fn main() -> io::Result<()> {
     app_result.and(r1).and(r2)
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, demo_mode: bool) -> io::Result<()> {
     let mut app = App::new();
-    app.tick();
+    if demo_mode {
+        demo::populate_demo(&mut app);
+    } else {
+        app.tick();
+    }
 
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
@@ -64,12 +75,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 if key.kind == KeyEventKind::Press {
                     match key.code {
                         KeyCode::Char('q') => app.quit(),
-                        KeyCode::Char('r') => app.tick(),
+                        KeyCode::Char('r') if !demo_mode => app.tick(),
                         KeyCode::Down | KeyCode::Char('j') => app.select_next(),
                         KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
-                        KeyCode::Char('x') => app.kill_selected(),
-                        KeyCode::Char('X') => app.kill_orphan_ports(),
-                        KeyCode::Enter => {
+                        KeyCode::Char('x') if !demo_mode => app.kill_selected(),
+                        KeyCode::Char('X') if !demo_mode => app.kill_orphan_ports(),
+                        KeyCode::Enter if !demo_mode => {
                             if let Some(msg) = app.jump_to_session() {
                                 app.set_status(msg);
                             }
@@ -77,6 +88,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         _ => {}
                     }
                 }
+            }
+        } else if demo_mode {
+            // Rotate token rates to animate the sparkline
+            if let Some(front) = app.token_rates.pop_front() {
+                app.token_rates.push_back(front);
             }
         } else {
             // Timeout = tick

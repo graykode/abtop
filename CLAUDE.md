@@ -2,86 +2,86 @@
 
 AI agent monitor for your terminal. Like btop++, but for AI coding agents.
 
-Currently supports Claude Code. Codex planned for v0.2.
+Supports Claude Code and Codex CLI.
 
 ## Architecture
 
 ```
 src/
-├── main.rs                 # Entry, terminal setup, event loop
-├── app.rs                  # App state, tick logic, key handling
+├── main.rs                 # Entry, terminal setup, event loop, --setup/--demo flags
+├── app.rs                  # App state, tick logic, key handling, summary generation
+├── demo.rs                 # Demo data population for --demo mode
+├── setup.rs                # StatusLine hook installation (abtop --setup)
 ├── ui/
-│   ├── mod.rs              # btop-style 6-panel layout
-│   ├── rate_limit.rs       # Panel ¹: rate limit sparkline + context bars
-│   ├── tokens.rs           # Panel ²: token stats + sparkline
-│   ├── projects.rs         # Panel  : project git status
-│   ├── ports.rs            # Panel ³: open ports + conflict detection
-│   └── sessions.rs         # Panel ⁴: session list + children + detail
+│   └── mod.rs              # All panels in single file: header, context, quota,
+│                           # tokens, projects, ports, sessions, footer
 ├── collector/
-│   ├── mod.rs              # Collector trait, 2s polling loop
-│   ├── claude.rs           # Claude Code: sessions, transcripts, processes
-│   ├── process.rs          # Child process tree + open ports (lsof)
-│   └── git.rs              # Git branch/status per cwd
-├── model/
-│   ├── session.rs          # AgentSession, SessionStatus
-│   ├── transcript.rs       # TranscriptEntry, Usage, ToolUse
-│   └── process.rs          # ChildProcess, OpenPort
-└── utils.rs                # Token formatting, path encoding, time helpers
+│   ├── mod.rs              # MultiCollector orchestration, orphan port detection
+│   ├── claude.rs           # Claude Code: session discovery, transcript parsing
+│   ├── codex.rs            # Codex CLI: session discovery via ps+lsof, JSONL parsing
+│   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
+│   └── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
+└── model/
+    ├── mod.rs              # Re-exports
+    └── session.rs          # AgentSession, SessionStatus, RateLimitInfo,
+                            # ChildProcess, OrphanPort, SubAgent
 ```
 
-## Layout (btop 1:1 mapping)
+## Layout
 
 ```
-┌─ ¹rate limit + context ──────────────────────────────────────────────┐
-│                                                                      │
-│  5h usage sparkline (history)              SESSION CONTEXT            │
-│  ░░▒▒▓▓██████████░░░░                      S1 abtop       ████████ 82%│
-│                                            S2 prediction  █████████91%⚠│
-│                                            S3 api-server  ███      22%│
-│  5h ████████░░ 72%  resets 1h23m           sessions: 3               │
+┌─ ¹context (token rate sparkline + per-session context bars) ─────────┐
+│  ▁▃▅▇█▇▅▃▁▃▅▇██                       S1 abtop       ████████ 82%  │
+│  token rate (200pt history)            S2 prediction  █████████91%⚠ │
+│                                        S3 api-server  ███      22%  │
 └──────────────────────────────────────────────────────────────────────┘
-┌─ ²tokens ────┐┌─ projects ───┐┌─ ⁴sessions (tall, right half) ─────┐
-│ Total  1.2M  ││ abtop        ││ Pid  Project    Status Model CTX Tok│
-│ Input  402k  ││  main +3 ~18 ││►7336 abtop     ● Work opus  82% 45k│
-│ Output  89k  ││              ││      └─ Edit src/collector/claude.rs │
-│ Cache  710k  ││ prediction   ││ 8840 prediction ◌ Wait sonn  91% 120k│
-│              ││  feat/x +1~2 ││      └─ waiting for input            │
-│ ▁▃▅▇█▇▅▃▁▃▅ ││              ││ 9102 api-server ● Work haiku 42% 8k │
-│ tokens/turn  ││ api-server   ││      └─ Bash npm run dev             │
-│              ││  main ✓clean ││                                      │
-│ Turns: 48    ││              ││ CHILDREN (►7336 · abtop)             │
-│ Avg: 25k/t   ││              ││  7401 cargo build        342M       │
-└──────────────┘└──────────────┘│  7455 cargo test          28M       │
-┌─ ³ports ─────────────────────┐│                                      │
-│ PORT  SESSION      CMD   PID ││ SUBAGENTS                            │
-│ :3000 api-server   node 9150 ││  Agent explore-data  ✓ 12k          │
-│ :3001 api-server   node 9178 ││  Agent run-tests     ● 8k           │
-│ :5433 api-server   pg   9203 ││                                      │
-│ :8080 prediction   cargo 8901││ MEM 4 files · 12/200 lines          │
-│ :8080 abtop        cargo 7401││ v2.1.86 · 47m · 12 turns            │
-│                    ⚠ conflict││                                      │
-└──────────────────────────────┘└──────────────────────────────────────┘
+┌─ ²quota ─────┐┌─ tokens ────┐┌─ projects ───┐┌─ ⁴sessions ────────┐
+│ CLAUDE       ││ Total  1.2M ││ abtop        ││►7336 abtop  ● opus │
+│ 5h ████ 35%  ││ Input  402k ││  main +3 ~18 ││  Stripe payment... │
+│   resets 2h  ││ Output  89k ││              ││  └─ Edit src/pay.rs│
+│ 7d ██ 12%    ││ Cache  710k ││ prediction   ││ 8840 pred  ◌ sonn  │
+│              ││ ▁▃▅▇█▇▅▃▁▃▅││  feat/x +1~2 ││  ML pipeline opt..│
+│ CODEX        ││ Turns: 48   ││              ││  └─ waiting        │
+│ 5h █ 9%     ││ Avg: 25k/t  ││ api-server   ││                    │
+│ 7d ██ 14%    ││             ││  main ✓clean ││ CHILDREN           │
+└──────────────┘└─────────────┘└──────────────┘│  7401 cargo build  │
+┌─ ³ports ─────────────────────────────────────┐│                    │
+│ PORT  SESSION      CMD   PID                 ││ SUBAGENTS          │
+│ :3000 api-server   node 9150                 ││  explore-data ✓12k │
+│ :8080 prediction   cargo 8901                ││  run-tests    ●8k  │
+│                                              ││                    │
+│ ORPHAN PORTS                                 ││ MEM 4f · 12/200   │
+│ :4000 old-project  node 1234                 ││ v2.1.86 · 47m     │
+└──────────────────────────────────────────────┘└────────────────────┘
 ```
 
-Panel mapping:
-- **¹cpu → ¹rate limit + context**: Left = 5h/7d sparkline history. Right = per-session context % bars with compact warning.
-- **²mem → ²tokens**: Total token breakdown (in/out/cache) + per-turn sparkline.
-- **disks → projects**: Per-project git branch + change summary.
-- **³net → ³ports**: Agent-spawned open ports + conflict detection.
-- **⁴proc → ⁴sessions**: Session list with inline current task, children, subagents, memory status.
+Panel rendering priority (top to bottom):
+1. **Sessions** — always visible, gets priority allocation (min 5 rows, ideal = 2/session + 7)
+2. **Mid-tier** (quota, tokens, projects, ports) — split equally, shown if space allows
+3. **Context** — only renders when sessions have ideal height AND surplus >= 5 rows
+4. **Header** (1 row) + **Footer** (1 row) — always present
 
-## Data Sources (Claude Code)
+Panel descriptions:
+- **¹context**: Left = token rate braille sparkline (200-point history). Right = per-session context % bars with yellow/red warning.
+- **²quota**: Claude + Codex rate limit gauges side-by-side (5h and 7d windows with reset countdown).
+- **tokens**: Total token breakdown (in/out/cache) + per-turn sparkline for selected session.
+- **projects**: Per-project git branch + added/modified file counts.
+- **³ports**: Agent-spawned open ports + orphan ports (from dead sessions). Conflict detection.
+- **⁴sessions**: Session list with summary title, current task, children, subagents, memory status.
+
+## Data Sources
 
 All read-only from local filesystem + `ps` + `lsof`. No API calls, no auth.
 
-### 1. Session discovery: `~/.claude/sessions/{PID}.json`
+### 1. Claude Code session discovery: `~/.claude/sessions/{PID}.json`
 ```json
 { "pid": 7336, "sessionId": "2f029acc-...", "cwd": "/Users/graykode/abtop", "startedAt": 1774715116826, "kind": "interactive", "entrypoint": "cli" }
 ```
 - ~170 bytes. Created on start, deleted on exit.
-- Scan all files, verify PID alive with `kill(pid, 0)`.
+- Scan all files, verify PID alive with `ps -p {pid} -o command=` containing `/claude`.
+- Skip `--print` sessions (abtop's own LLM calls for summary generation).
 
-### 2. Transcript: `~/.claude/projects/{encoded-path}/{sessionId}.jsonl`
+### 2. Claude Code transcript: `~/.claude/projects/{encoded-path}/{sessionId}.jsonl`
 Path encoding: `/Users/foo/bar` → `-Users-foo-bar`
 
 Key line types:
@@ -123,62 +123,15 @@ Key line types:
 - **Partial line handling**: new bytes may end mid-JSON-line. Buffer incomplete lines until next read.
 - **File rotation**: if file shrinks (session restart), reset offset to 0 and re-scan.
 
-### 3. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
-- `agent-{hash}.jsonl` — same JSONL format as main transcript
-- `agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
+### 3. Codex CLI sessions: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
 
-### 4. Process tree: `ps` + `lsof`
-```bash
-# Find Claude sessions
-ps aux | grep '/claude --session-id'
-# Extract: PID, RSS, CPU%, --session-id UUID
-# Filter out: Claude.app, cmux claude-hook
+Discovery strategy:
+1. Find running `codex` processes via `ps`
+2. Map PID → open `rollout-*.jsonl` file via `lsof`
+3. Parse JSONL for `session_meta`, `token_count` (includes rate_limits), `agent_message` events
+4. Detect finished sessions: scan today's directory for JSONL < 5 min old not owned by running process
 
-# Child processes of a Claude session
-pgrep -P {claude_pid}
-ps -o pid,ppid,rss,command -p {child_pids}
-
-# Open ports by child processes
-lsof -i -P -n | grep LISTEN
-# Map listening PID → parent Claude PID → session
-```
-
-### 5. Git status per project
-```bash
-git -C {cwd} branch --show-current    # branch name
-git -C {cwd} diff --stat HEAD         # changed files summary
-git -C {cwd} status --porcelain       # clean/dirty check
-```
-
-### 6. Memory status
-- Path: `~/.claude/projects/{encoded-path}/memory/`
-- Count files in directory
-- Count lines in `MEMORY.md` (200 line limit, truncation = memory loss)
-
-### 7. Rate limit
-
-**Claude Code**: NOT in transcript JSONL (verified — `message.usage` has no `rate_limits` field).
-Only available via StatusLine mechanism: a shell command configured in `settings.json` that receives JSON on stdin (not an env var) after each assistant message (debounced 300ms).
-
-StatusLine JSON includes:
-```json
-{
-  "rate_limits": {
-    "five_hour": { "used_percentage": 23.5, "resets_at": 1738425600 },
-    "seven_day": { "used_percentage": 41.2, "resets_at": 1738857600 }
-  }
-}
-```
-
-To collect: user must configure a StatusLine script that writes to a file abtop reads.
-**Planned**: `abtop --setup` could automate this (writes script + updates `~/.claude/settings.json`). Not yet implemented.
-- `rate_limits` is optional — only present for Pro/Max subscribers after first API response.
-- Per-model breakdown (e.g. "Sonnet only") is NOT available.
-- Account-level metric, shared across all sessions.
-- Show "—" when StatusLine not configured or data unavailable.
-
-**Codex CLI** (planned v0.2): Available in session JSONL without any setup.
-`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` `token_count` events include:
+Rate limits extracted from `token_count` events:
 ```json
 {
   "rate_limits": {
@@ -189,13 +142,51 @@ To collect: user must configure a StatusLine script that writes to a file abtop 
   }
 }
 ```
-- Included in every `token_count` event (every assistant turn).
-- Read via same tail-follow strategy as transcript parsing.
-- `plan_type` may affect field presence (verified on `plus` plan only, as of 2026-03-29).
 
-### 8. Other files
+### 4. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
+- `agent-{hash}.jsonl` — same JSONL format as main transcript
+- `agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
+
+### 5. Process tree: `ps` + `lsof`
+```bash
+ps -eo pid,ppid,rss,%cpu,command    # All processes
+lsof -i -P -n -sTCP:LISTEN         # Open ports
+```
+- Build parent→children map from ppid
+- Map listening PID → parent agent PID → session
+
+### 6. Git status per project
+```bash
+git -C {cwd} status --porcelain     # added/modified file counts
+```
+
+### 7. Memory status
+- Path: `~/.claude/projects/{encoded-path}/memory/`
+- Count files in directory + lines in `MEMORY.md`
+
+### 8. Rate limit (Claude Code)
+
+NOT in transcript JSONL. Collected via StatusLine mechanism.
+
+`abtop --setup` automates this: creates a script at `~/.claude/abtop-statusline.sh` that writes rate limit JSON to `~/.claude/abtop-rate-limits.json`, and registers it in `~/.claude/settings.json`.
+
+File format read by abtop:
+```json
+{
+  "source": "claude",
+  "five_hour": { "used_percentage": 35.0, "resets_at": 1774715000 },
+  "seven_day": { "used_percentage": 12.0, "resets_at": 1775320000 },
+  "updated_at": 1774714400
+}
+```
+- Rejects stale data (> 10 minutes old).
+- `rate_limits` only present for Pro/Max subscribers.
+- Account-level metric, shared across all sessions.
+- Show "—" when not configured or data unavailable.
+
+### 9. Other files
 - `~/.claude/stats-cache.json` — daily aggregates. Only updated on `/stats`, NOT real-time.
-- `~/.claude/history.jsonl` — prompt history with sessionId. Can get last prompt for each session.
+- `~/.claude/history.jsonl` — prompt history with sessionId.
 
 ## Session Status Detection
 
@@ -206,9 +197,9 @@ To collect: user must configure a StatusLine script that writes to a file abtop 
 ✓ Done     = PID dead (detected via kill(pid, 0) failure)
 ```
 
-**Done detection**: session files are deleted on normal exit, but may linger briefly or survive crashes. When PID is dead but file exists, show as Done and clean up on next tick. When file is gone, remove from list entirely.
+**Done detection**: session files are deleted on normal exit, but may linger briefly or survive crashes. When PID is dead but file exists, show as Done and clean up on next tick.
 
-**PID reuse risk**: verify PID is still a claude process by checking `/proc/{pid}/cmdline` (Linux) or `ps -p {pid} -o command=` (macOS) contains `/claude`. Don't trust PID alone.
+**PID reuse risk**: verify PID is still a claude/codex process by checking `ps -p {pid} -o command=`. Don't trust PID alone.
 
 Current task (2nd line under each session):
 - Working → last `tool_use` name + first arg (e.g. `Edit src/main.rs`)
@@ -216,10 +207,18 @@ Current task (2nd line under each session):
 - Error → last error message (truncated)
 - Done → "finished {duration} ago"
 
-**Known limitations** (all heuristic, document in UI):
+**Known limitations** (all heuristic):
 - Cannot distinguish model-thinking vs tool-executing vs rate-limit-waiting vs permission-prompt
 - "Waiting" may be wrong if a long-running tool (cargo build, npm test) is running
 - Status is best-effort, not authoritative
+
+## Session Summary Generation
+
+Each session gets a one-line summary title generated via `claude --print`:
+- Spawned as background process with 10s timeout
+- Rejects generic/empty output; falls back to sanitized first prompt (28 chars)
+- Cached to `~/.cache/abtop/summaries.json` (persists across runs)
+- Max 3 concurrent summary jobs, max 2 retries per session
 
 ## Context Window Calculation
 
@@ -233,20 +232,21 @@ Not provided in data files. Derive:
 - **Percentage**: current_usage / window_size * 100
 - **Warning**: yellow at 80%, red at 90%, ⚠ icon at 90%+
 
-## Port Conflict Detection
+## Orphan Port Detection
 
-When two child processes (from different sessions) listen on the same port:
-- Mark both with `⚠ conflict` in ports panel
-- Highlight in red
+Tracks child processes that have open ports. When a parent session dies but the child process remains alive and listening:
+- Added to `orphan_ports` list automatically
+- Displayed in ports panel under "ORPHAN PORTS" section
+- Can be killed via `X` (Shift+X) with safety checks (fresh port scan + PID command verification before SIGKILL)
 
 ## Key Bindings
 
 | Key | Action |
 |-----|--------|
 | `↑`/`↓` or `k`/`j` | Select session in list |
-| `Enter` | Jump to session terminal (tmux only, see below) |
-| `Tab` | Cycle focus between panels |
-| `1`–`4` | Toggle panel visibility (like btop) |
+| `Enter` | Jump to session terminal (tmux only) |
+| `x` | Kill selected session (SIGKILL) |
+| `X` | Kill all orphan ports |
 | `q` | Quit |
 | `r` | Force refresh |
 
@@ -255,13 +255,13 @@ When two child processes (from different sessions) listen on the same port:
 - **Rust** (2021 edition)
 - **ratatui** + **crossterm** for TUI
 - **serde** + **serde_json** for JSON/JSONL parsing
-- **tokio** for async runtime — `ps`, `lsof`, `git` commands must not block the UI thread
+- **tokio** — included but currently sync I/O; summary generation uses `std::thread::spawn`
+- **chrono** for timestamp formatting
+- **dirs** for home directory resolution
 - **Polling intervals** (staggered to avoid freezes):
-  - Session scan (sessions/*.json): every 2s
-  - Transcript tail: every 2s
-  - Process tree (ps): every 5s
-  - Port scan (lsof): every 10s (lsof is slow on macOS)
-  - Git status: every 10s (git can be slow on large repos)
+  - Session scan + transcript tail: every 2s
+  - Process tree (ps): every 2s
+  - Port scan (lsof) + git status + rate limits: every 10s (5 ticks)
 
 ## Commit Convention
 
@@ -275,27 +275,28 @@ Types: `feat`, `fix`, `refactor`, `docs`, `chore`
 ```bash
 cargo build                    # Build
 cargo run                      # Run TUI
-cargo run -- --once            # Print snapshot and exit (debug mode)
+cargo run -- --once            # Print snapshot and exit
+cargo run -- --demo            # TUI with demo data (no live sessions needed)
+cargo run -- --demo --once     # Snapshot with demo data
+cargo run -- --setup           # Install StatusLine hook for rate limit collection
 cargo test                     # Tests
 cargo clippy                   # Lint
 ```
 
 ## Non-Goals (v0.1)
 
-- Codex/Gemini/Cursor support
+- Gemini/Cursor support
 - Cost estimation
 - Remote/SSH monitoring
 - Notifications/alerts
-- Session control (attach, kill, send input)
-- Rate limit history persistence (no disk writes)
 
 ## tmux Integration
 
 Session jump (`Enter`) only works when abtop runs inside tmux:
-1. On startup, detect if `$TMUX` is set. If not, disable Enter key and show "(no tmux)" in footer.
-2. To map PID → tmux pane: `tmux list-panes -a -F '#{pane_pid} #{session_name}:#{window_index}.#{pane_index}'` then walk process tree to find which pane owns the Claude PID.
+1. On startup, detect if `$TMUX` is set. If not, disable Enter key.
+2. To map PID → tmux pane: `tmux list-panes -a -F '#{pane_pid} #{session_name}:#{window_index}.#{pane_index}'` then walk process tree to find which pane owns the agent PID.
 3. Jump: `tmux select-pane -t {target}`
-4. If mapping fails (PID not in any pane), show "pane not found" and do nothing.
+4. If mapping fails (PID not in any pane), show transient "pane not found" status message.
 
 ## Privacy
 
@@ -303,19 +304,22 @@ abtop reads transcripts, prompts, tool inputs, and memory files. These may conta
 - **`--once` output**: redact file contents from tool_use inputs. Show tool name + file path only, not content.
 - **TUI mode**: show tool name + first arg (file path), never show file contents or prompt text in session list.
 - **No network**: abtop never sends data anywhere. All local reads.
+- **Exception**: summary generation calls `claude --print` locally (no network by abtop itself, but claude may use its API).
 
 ## Gotchas
 
 - **Transcript size**: 1KB–18MB. On first load, full scan for totals. After that, track file offset and read only new bytes. Buffer partial lines.
 - **Session file deletion**: files disappear when Claude exits. Handle `NotFound` between scan and read.
 - **stats-cache.json is stale**: only updated on `/stats` command. Don't use for live data.
-- **Context window not in data**: must hardcode per model. Will break if Anthropic adds new models.
+- **Context window not in data**: must hardcode per model. Will break if Anthropic/OpenAI add new models.
 - **Rate limit is account-level**: shared across all sessions. Don't show per-session.
 - **Path encoding**: `/Users/foo/bar` → `-Users-foo-bar`. Used for transcript directory names.
-- **lsof can be slow**: on macOS with many open files. Cache results, don't call every tick.
-- **Child process tree**: `pgrep -P` only gets direct children. For deep trees, recurse or use `ps -o ppid`.
+- **Path encoding collision**: `-Users-foo-bar-baz` could be `/Users/foo/bar-baz` or `/Users/foo-bar/baz`. Use session JSON's `cwd` as source of truth.
+- **lsof can be slow**: on macOS with many open files. Cache results, poll every 10s.
+- **Child process tree**: `pgrep -P` only gets direct children. Build full tree from `ps -eo ppid`.
 - **Port detection race**: a port can close between lsof and display. Show stale data gracefully.
 - **Subagent directory may not exist**: only created when Agent tool is used. Check existence before scanning.
-- **Undocumented internals**: all data sources are Claude Code implementation details, not stable APIs. Schema may change without notice. Defensive parsing with `serde(default)` everywhere. Log unknown fields, don't crash.
-- **Terminal size**: minimum 80x24. Below that, hide panels progressively (ports → projects → tokens). Sessions panel always visible.
-- **Path encoding collision**: `-Users-foo-bar-baz` could be `/Users/foo/bar-baz` or `/Users/foo-bar/baz`. Use session JSON's `cwd` as source of truth, not directory name.
+- **Undocumented internals**: all data sources are Claude Code/Codex implementation details, not stable APIs. Schema may change without notice. Defensive parsing with `serde(default)` everywhere.
+- **Terminal size**: minimum 80x24. Panels degrade gracefully when small (context panel hidden first).
+- **PID reuse in port cache**: invalidate cached ports when the set of tracked PIDs changes.
+- **Rate limit staleness**: reject rate limit data older than 10 minutes.
