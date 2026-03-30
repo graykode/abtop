@@ -43,6 +43,17 @@ abtop --setup  # Install rate limit collection hook
 
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 
+### Windows
+
+abtop requires Unix tools (`ps`, `lsof`) and is not supported natively on Windows. Use [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) instead:
+
+```bash
+wsl --install
+# Inside WSL:
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/graykode/abtop/releases/latest/download/abtop-installer.sh | sh
+abtop
+```
+
 ### tmux
 
 abtop works standalone, but running inside tmux unlocks session jumping — press `Enter` to switch directly to the pane running that agent.
