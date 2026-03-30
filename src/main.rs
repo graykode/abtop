@@ -14,6 +14,17 @@ use std::io::{self, stdout};
 use std::time::Duration;
 
 fn main() -> io::Result<()> {
+    // --version / -V flag: print version and exit
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("abtop {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    // --update flag: self-update via GitHub releases installer
+    if std::env::args().any(|a| a == "--update") {
+        return run_update();
+    }
+
     // --setup flag: configure StatusLine hook and exit
     if std::env::args().any(|a| a == "--setup") {
         setup::run_setup();
@@ -149,6 +160,24 @@ fn print_snapshot(app: &App) {
             );
         }
     }
+}
+
+fn run_update() -> io::Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("abtop v{current} — checking for updates...\n");
+
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("curl --proto '=https' --tlsv1.2 -LsSf https://github.com/graykode/abtop/releases/latest/download/abtop-installer.sh | sh")
+        .status()?;
+
+    if !status.success() {
+        eprintln!("\nUpdate failed. You can also update manually:");
+        eprintln!("  cargo install abtop --force");
+        std::process::exit(1);
+    }
+
+    Ok(())
 }
 
 fn fmt_tok(n: u64) -> String {
