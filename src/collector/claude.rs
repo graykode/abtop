@@ -246,13 +246,19 @@ impl ClaudeCollector {
         // Git stats: populated by MultiCollector on slow ticks
         let (git_added, git_modified) = (0, 0);
 
+        // Derive the project directory from the transcript path (handles --workspace),
+        // falling back to the encoded cwd.
+        let project_dir = transcript_path
+            .as_ref()
+            .and_then(|tp| tp.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| self.projects_dir.join(encode_cwd_path(&sf.cwd)));
+
         // Subagent discovery
-        let encoded_path = encode_cwd_path(&sf.cwd);
-        let subagents_dir = self.projects_dir.join(&encoded_path).join(&sf.session_id).join("subagents");
+        let subagents_dir = project_dir.join(&sf.session_id).join("subagents");
         let subagents = Self::collect_subagents(&subagents_dir);
 
         // Memory status
-        let memory_dir = self.projects_dir.join(&encoded_path).join("memory");
+        let memory_dir = project_dir.join("memory");
         let (mem_file_count, mem_line_count) = Self::collect_memory_status(&memory_dir);
 
         Some(AgentSession {
@@ -288,14 +294,31 @@ impl ClaudeCollector {
     }
 
     fn find_transcript(&self, cwd: &str, session_id: &str) -> Option<PathBuf> {
+        let jsonl_name = format!("{}.jsonl", session_id);
+
+        // Primary: look up by encoded cwd
         let encoded = encode_cwd_path(cwd);
-        let dir = self.projects_dir.join(&encoded);
-        let path = dir.join(format!("{}.jsonl", session_id));
+        let path = self.projects_dir.join(&encoded).join(&jsonl_name);
         if path.exists() {
-            Some(path)
-        } else {
-            None
+            return Some(path);
         }
+
+        // Fallback: scan all project directories for the session file.
+        // Handles --workspace sessions where the transcript directory
+        // may not match the encoded cwd from the session file.
+        if let Ok(entries) = fs::read_dir(&self.projects_dir) {
+            for entry in entries.flatten() {
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                let candidate = entry.path().join(&jsonl_name);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+
+        None
     }
 
 
