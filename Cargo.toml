@@ -1,6 +1,6 @@
 [package]
 name = "abtop"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 rust-version = "1.88"
 description = "AI agent monitor for your terminal"
