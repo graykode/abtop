@@ -1046,7 +1046,8 @@ fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect) {
             crate::model::SessionStatus::Done => ("✓ Done", INACTIVE_FG),
         };
 
-        let model_short = shorten_model(&session.model);
+        let is_1m = session.total_tokens() > 200_000 || session.model.contains("[1m]");
+        let model_short = shorten_model(&session.model, is_1m);
         let ctx_color = grad_at(&proc_grad, session.context_percent);
 
         let is_done = matches!(session.status, crate::model::SessionStatus::Done);
@@ -1538,19 +1539,24 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 
 // ── utility functions ────────────────────────────────────────────────────────
 
-fn shorten_model(model: &str) -> String {
+fn shorten_model(model: &str, is_1m: bool) -> String {
     // "claude-opus-4-6" → "opus4.6", "claude-sonnet-4-6" → "sonnet4.6", "claude-haiku-4-5" → "haiku4.5"
     let s = model
         .strip_prefix("claude-")
         .unwrap_or(model);
     let s = s.trim_end_matches("[1m]");
     // Extract name and version: "opus-4-6" → ("opus", "4.6")
-    if let Some(pos) = s.find(|c: char| c.is_ascii_digit()) {
+    let base = if let Some(pos) = s.find(|c: char| c.is_ascii_digit()) {
         let name = s[..pos].trim_end_matches('-');
         let ver = s[pos..].replace('-', ".");
         format!("{}{}", name, ver)
     } else {
         s.to_string()
+    };
+    if is_1m {
+        format!("{}[1m]", base)
+    } else {
+        base
     }
 }
 
