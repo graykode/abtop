@@ -5,7 +5,7 @@ use std::path::PathBuf;
 const STATUSLINE_SCRIPT: &str = r#"#!/bin/bash
 # abtop StatusLine hook — writes rate limit data for abtop to read.
 # Installed by: abtop --setup
-INPUT=$(cat)
+INPUT=$(timeout 5 cat)
 python3 -c "
 import sys, json, time, os
 data = json.loads(sys.argv[1])
