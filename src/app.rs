@@ -112,10 +112,8 @@ impl App {
         if self.rate_limits.is_empty() || self.rate_limit_counter >= 5 {
             self.rate_limit_counter = 0;
             self.rate_limits = read_rate_limits();
-            // Merge Codex rate limits from JSONL parsing (no extra I/O needed)
-            if let Some(codex_rl) = self.collector.codex_rate_limit() {
-                self.rate_limits.push(codex_rl.clone());
-            }
+            // Merge live rate limits from agent collectors (e.g. Codex JSONL parsing)
+            self.rate_limits.extend(self.collector.agent_rate_limits());
         } else {
             self.rate_limit_counter += 1;
         }

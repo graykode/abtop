@@ -7,8 +7,24 @@ pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
 pub use rate_limit::read_rate_limits;
 
-use crate::model::{AgentSession, OrphanPort, SessionStatus};
+use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
 use std::collections::HashMap;
+
+/// Trait for agent-specific session collectors.
+/// Implement this to add support for a new AI coding agent.
+pub trait AgentCollector {
+    /// Return all live sessions for this agent type.
+    fn collect(&mut self, shared: &SharedProcessData) -> Vec<AgentSession>;
+
+    /// Agent name for display/logging (e.g., "claude", "codex").
+    #[allow(dead_code)]
+    fn name(&self) -> &'static str;
+
+    /// Return agent-specific rate limit info, if available from session data.
+    fn live_rate_limit(&self) -> Option<RateLimitInfo> {
+        None
+    }
+}
 
 /// Process data fetched once per tick and shared across all collectors.
 /// Avoids duplicate ps/lsof calls.
@@ -41,8 +57,7 @@ struct TrackedPortChild {
 
 /// Aggregates sessions from multiple collectors (Claude, Codex, etc.)
 pub struct MultiCollector {
-    claude: ClaudeCollector,
-    codex: CodexCollector,
+    collectors: Vec<Box<dyn AgentCollector>>,
     tick_count: u32,
     cached_ports: HashMap<u32, Vec<u16>>,
     /// PID set snapshot from last port scan — invalidate cache when PIDs change.
@@ -61,8 +76,10 @@ const SLOW_POLL_INTERVAL: u32 = 5;
 impl MultiCollector {
     pub fn new() -> Self {
         Self {
-            claude: ClaudeCollector::new(),
-            codex: CodexCollector::new(),
+            collectors: vec![
+                Box::new(ClaudeCollector::new()),
+                Box::new(CodexCollector::new()),
+            ],
             tick_count: SLOW_POLL_INTERVAL, // trigger on first tick
             cached_ports: HashMap::new(),
             cached_port_pids: Vec::new(),
@@ -72,13 +89,9 @@ impl MultiCollector {
         }
     }
 
-    /// Get the latest Codex rate limit info.
-    /// Prefers live data from active sessions; falls back to cached file.
-    pub fn codex_rate_limit(&self) -> Option<crate::model::RateLimitInfo> {
-        if let Some(live) = &self.codex.last_rate_limit {
-            return Some(live.clone());
-        }
-        rate_limit::read_codex_cache()
+    /// Collect rate limit info from all registered collectors.
+    pub fn agent_rate_limits(&self) -> Vec<RateLimitInfo> {
+        self.collectors.iter().filter_map(|c| c.live_rate_limit()).collect()
     }
 
     pub fn collect(&mut self) -> Vec<AgentSession> {
@@ -104,8 +117,9 @@ impl MultiCollector {
         };
 
         let mut all = Vec::new();
-        all.extend(self.claude.collect(&shared));
-        all.extend(self.codex.collect(&shared));
+        for collector in &mut self.collectors {
+            all.extend(collector.collect(&shared));
+        }
 
         // Git stats: refresh only on slow tick
         if slow_tick {

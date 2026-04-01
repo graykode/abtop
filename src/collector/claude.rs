@@ -27,7 +27,7 @@ impl ClaudeCollector {
         }
     }
 
-    pub fn collect(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
+    fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         let session_files = match fs::read_dir(&self.sessions_dir) {
             Ok(entries) => entries,
             Err(_) => return vec![],
@@ -433,6 +433,15 @@ impl ClaudeCollector {
     }
 }
 
+impl super::AgentCollector for ClaudeCollector {
+    fn collect(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
+        self.collect_sessions(shared)
+    }
+
+    fn name(&self) -> &'static str {
+        "claude"
+    }
+}
 
 struct TranscriptResult {
     model: String,
