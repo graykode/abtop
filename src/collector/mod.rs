@@ -16,10 +16,6 @@ pub trait AgentCollector {
     /// Return all live sessions for this agent type.
     fn collect(&mut self, shared: &SharedProcessData) -> Vec<AgentSession>;
 
-    /// Agent name for display/logging (e.g., "claude", "codex").
-    #[allow(dead_code)]
-    fn name(&self) -> &'static str;
-
     /// Return agent-specific rate limit info, if available from session data.
     fn live_rate_limit(&self) -> Option<RateLimitInfo> {
         None

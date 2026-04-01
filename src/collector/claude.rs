@@ -437,10 +437,6 @@ impl super::AgentCollector for ClaudeCollector {
     fn collect(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)
     }
-
-    fn name(&self) -> &'static str {
-        "claude"
-    }
 }
 
 struct TranscriptResult {

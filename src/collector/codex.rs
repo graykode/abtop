@@ -325,10 +325,6 @@ impl super::AgentCollector for CodexCollector {
         self.collect_sessions(shared)
     }
 
-    fn name(&self) -> &'static str {
-        "codex"
-    }
-
     fn live_rate_limit(&self) -> Option<RateLimitInfo> {
         self.last_rate_limit.clone().or_else(super::rate_limit::read_codex_cache)
     }
