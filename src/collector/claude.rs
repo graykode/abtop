@@ -885,4 +885,70 @@ mod tests {
         assert_eq!(shorten_path("src/collector/claude.rs"), "collector/claude.rs");
         assert_eq!(shorten_path("main.rs"), "main.rs");
     }
+
+    #[test]
+    fn test_parse_transcript_skips_malformed_json() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"THIS IS NOT VALID JSON"#,
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"response"}]}}"#,
+        ]);
+        let result = parse_transcript(file.path(), 0);
+        // Bad line should be skipped, assistant line still parsed
+        assert_eq!(result.turn_count, 1);
+        assert_eq!(result.total_input, 100);
+        assert_eq!(result.initial_prompt, "hi");
+    }
+
+    #[test]
+    fn test_parse_transcript_file_shrunk_resets() {
+        use std::io::Seek;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"first"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"resp"}]}}"#,
+        ]);
+        let first = parse_transcript(file.path(), 0);
+        let old_offset = first.new_offset;
+        assert!(old_offset > 0);
+
+        // Simulate file rotation: truncate and write shorter content
+        file.as_file().set_len(0).unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        write_lines(&mut file, &[
+            r#"{"type":"assistant","timestamp":"2026-03-28T16:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"new session"}]}}"#,
+        ]);
+        // Pass old offset that is now beyond file length
+        let result = parse_transcript(file.path(), old_offset);
+        // Should reset to 0 and parse the new content
+        assert_eq!(result.turn_count, 1);
+        assert_eq!(result.total_input, 10);
+    }
+
+    #[test]
+    fn test_parse_transcript_current_task_cleared_between_turns() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            // Turn 1: has tool_use
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/main.rs"}}]}}"#,
+            // Turn 2: text only, no tool_use
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:01:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Done, all changes applied."}]}}"#,
+        ]);
+        let result = parse_transcript(file.path(), 0);
+        assert_eq!(result.turn_count, 2);
+        // current_task should be empty because last turn had no tool_use
+        assert_eq!(result.current_task, "");
+    }
+
+    #[test]
+    fn test_parse_transcript_version_and_git_branch() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","version":"2.1.90","gitBranch":"feat/payments","message":{"role":"user","content":"add stripe"}}"#,
+        ]);
+        let result = parse_transcript(file.path(), 0);
+        assert_eq!(result.version, "2.1.90");
+        assert_eq!(result.git_branch, "feat/payments");
+    }
 }

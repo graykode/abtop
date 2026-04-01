@@ -617,6 +617,32 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_codex_cache_read_fallback_field_name() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            SESSION_META,
+            // Uses cache_read_input_tokens instead of cached_input_tokens
+            r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":30},"last_token_usage":{"input_tokens":20,"output_tokens":10,"cache_read_input_tokens":5},"model_context_window":200000}}}"#,
+        ]);
+        let result = parse_codex_jsonl(file.path()).unwrap();
+        assert_eq!(result.total_cache_read, 30);
+        assert_eq!(result.last_context_tokens, 25); // 20 + 5
+    }
+
+    #[test]
+    fn test_parse_codex_skips_malformed_lines() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            SESSION_META,
+            r#"NOT VALID JSON AT ALL"#,
+            r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"agent_message"}}"#,
+        ]);
+        let result = parse_codex_jsonl(file.path()).unwrap();
+        // Bad line skipped, agent_message still counted
+        assert_eq!(result.turn_count, 1);
+    }
+
+    #[test]
     fn test_parse_codex_empty_returns_none() {
         let file = tempfile::NamedTempFile::new().unwrap();
         assert!(parse_codex_jsonl(file.path()).is_none());
