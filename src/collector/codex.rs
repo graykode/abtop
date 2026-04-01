@@ -560,3 +560,65 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
 
     Some(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const SESSION_META: &str = r#"{"type":"session_meta","timestamp":"2026-03-28T15:00:00Z","payload":{"id":"sess-123","cwd":"/home/user/project","cli_version":"0.1.5","timestamp":"2026-03-28T15:00:00Z","git":{"branch":"feature/x"}}}"#;
+
+    fn write_lines(file: &mut tempfile::NamedTempFile, lines: &[&str]) {
+        for line in lines {
+            writeln!(file, "{}", line).unwrap();
+        }
+        file.flush().unwrap();
+    }
+
+    #[test]
+    fn test_parse_codex_session_meta() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[SESSION_META]);
+        let result = parse_codex_jsonl(file.path()).unwrap();
+        assert_eq!(result.session_id, "sess-123");
+        assert_eq!(result.cwd, "/home/user/project");
+        assert_eq!(result.version, "0.1.5");
+        assert_eq!(result.git_branch, "feature/x");
+    }
+
+    #[test]
+    fn test_parse_codex_token_count() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            SESSION_META,
+            r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"output_tokens":200,"cached_input_tokens":100},"last_token_usage":{"input_tokens":50,"output_tokens":20,"cached_input_tokens":10},"model_context_window":128000}}}"#,
+        ]);
+        let result = parse_codex_jsonl(file.path()).unwrap();
+        assert_eq!(result.total_input, 500);
+        assert_eq!(result.total_output, 200);
+        assert_eq!(result.total_cache_read, 100);
+        assert_eq!(result.last_context_tokens, 60); // 50 + 10
+        assert_eq!(result.context_window, 128000);
+        assert_eq!(result.token_history.len(), 1);
+        assert_eq!(result.token_history[0], 80); // 50 + 20 + 10
+    }
+
+    #[test]
+    fn test_parse_codex_rate_limits() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            SESSION_META,
+            r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"output_tokens":1},"last_token_usage":{"input_tokens":1,"output_tokens":1}},"rate_limits":{"limit_id":"codex","primary":{"used_percent":9.0,"window_minutes":300,"resets_at":1774686045},"secondary":{"used_percent":14.0,"window_minutes":10080,"resets_at":1775186466},"plan_type":"plus"}}}"#,
+        ]);
+        let result = parse_codex_jsonl(file.path()).unwrap();
+        let rl = result.rate_limit.expect("rate_limit should be Some");
+        assert_eq!(rl.five_hour_pct, Some(9.0));
+        assert_eq!(rl.seven_day_pct, Some(14.0));
+    }
+
+    #[test]
+    fn test_parse_codex_empty_returns_none() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(parse_codex_jsonl(file.path()).is_none());
+    }
+}

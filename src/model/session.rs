@@ -134,3 +134,53 @@ pub struct SessionFile {
     #[allow(dead_code)]
     pub kind: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_session(input: u64, output: u64, cache_read: u64, cache_create: u64) -> AgentSession {
+        AgentSession {
+            agent_cli: "claude",
+            pid: 0,
+            session_id: String::new(),
+            cwd: String::new(),
+            project_name: String::new(),
+            started_at: 0,
+            status: SessionStatus::Waiting,
+            model: String::new(),
+            context_percent: 0.0,
+            total_input_tokens: input,
+            total_output_tokens: output,
+            total_cache_read: cache_read,
+            total_cache_create: cache_create,
+            turn_count: 0,
+            current_tasks: Vec::new(),
+            mem_mb: 0,
+            version: String::new(),
+            git_branch: String::new(),
+            git_added: 0,
+            git_modified: 0,
+            token_history: Vec::new(),
+            subagents: Vec::new(),
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: Vec::new(),
+            transcript_offset: 0,
+            initial_prompt: String::new(),
+            first_assistant_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_total_tokens() {
+        let session = make_session(100, 50, 200, 30);
+        assert_eq!(session.total_tokens(), 380); // 100 + 50 + 200 + 30
+    }
+
+    #[test]
+    fn test_active_tokens() {
+        let session = make_session(100, 50, 200, 30);
+        assert_eq!(session.active_tokens(), 180); // 100 + 50 + 30, excludes cache_read
+    }
+}
