@@ -51,6 +51,8 @@ pub struct App {
     pub orphan_ports: Vec<OrphanPort>,
     /// Transient status message shown in the footer (auto-clears after 3s).
     pub status_msg: Option<(String, Instant)>,
+    /// Kill confirmation: (selected_index, timestamp). Expires after 2s.
+    kill_confirm: Option<(usize, Instant)>,
 }
 
 impl App {
@@ -74,6 +76,7 @@ impl App {
             summary_tx: tx,
             orphan_ports: Vec::new(),
             status_msg: None,
+            kill_confirm: None,
         }
     }
 
@@ -200,11 +203,26 @@ impl App {
         if session.status == SessionStatus::Done {
             return;
         }
-        let pid = session.pid;
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .output();
-        self.tick();
+
+        // Check if we have a pending confirmation for this exact session
+        if let Some((idx, ts)) = self.kill_confirm.take() {
+            if idx == self.selected && ts.elapsed().as_secs() < 2 {
+                // Confirmed — actually kill
+                let pid = session.pid;
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .output();
+                self.tick();
+                return;
+            }
+        }
+
+        // First press — ask for confirmation
+        let name = self.summaries.get(&session.session_id)
+            .cloned()
+            .unwrap_or_else(|| format!("PID {}", session.pid));
+        self.kill_confirm = Some((self.selected, Instant::now()));
+        self.set_status(format!("Press x again to kill: {}", name));
     }
 
     /// Kill all orphan port processes (Shift+X).

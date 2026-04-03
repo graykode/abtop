@@ -275,8 +275,8 @@ fn styled_label(text: &str) -> Span<'static> {
 
 // ── main draw ────────────────────────────────────────────────────────────────
 
-const MIN_WIDTH: u16 = 121;
-const MIN_HEIGHT: u16 = 36;
+const MIN_WIDTH: u16 = 100;
+const MIN_HEIGHT: u16 = 24;
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
