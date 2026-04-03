@@ -752,16 +752,9 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn context_window_for_model(model: &str, last_context_tokens: u64) -> u64 {
     if model.contains("[1m]") || last_context_tokens > 200_000 {
-        return 1_000_000;
-    }
-
-    let lower = model.to_ascii_lowercase();
-    if lower.contains("gpt") || lower.contains("o1") || lower.contains("o3") || lower.contains("o4") {
-        128_000
-    } else if lower.contains("gemini") {
         1_000_000
     } else {
-        200_000 // claude (all variants) and unknown models
+        200_000
     }
 }
 
@@ -869,20 +862,14 @@ mod tests {
 
     #[test]
     fn test_context_window_for_model() {
-        // Claude models default to 200K
+        // Base model with low token usage → 200K
         assert_eq!(context_window_for_model("claude-opus-4-6", 50_000), 200_000);
-        assert_eq!(context_window_for_model("claude-sonnet-4-6", 100_000), 200_000);
-        assert_eq!(context_window_for_model("claude-haiku-4-5", 10_000), 200_000);
-        // Explicit [1m] suffix → 1M
+        // Explicit [1m] suffix → 1M regardless of token count
         assert_eq!(context_window_for_model("claude-opus-4-6[1m]", 0), 1_000_000);
+        assert_eq!(context_window_for_model("claude-sonnet-4-6", 100_000), 200_000);
+        assert_eq!(context_window_for_model("unknown-model", 0), 200_000);
         // Token usage exceeds 200K → must be 1M window
         assert_eq!(context_window_for_model("claude-opus-4-6", 250_000), 1_000_000);
-        // Non-Claude models
-        assert_eq!(context_window_for_model("gpt-4o", 0), 128_000);
-        assert_eq!(context_window_for_model("o3-mini", 0), 128_000);
-        assert_eq!(context_window_for_model("gemini-2.5-pro", 0), 1_000_000);
-        // Unknown falls back to 200K
-        assert_eq!(context_window_for_model("unknown-model", 0), 200_000);
     }
 
     #[test]
