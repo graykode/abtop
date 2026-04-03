@@ -288,24 +288,38 @@ pub fn draw(f: &mut Frame, app: &App) {
     const CONTEXT_MIN: u16 = 5;
     const FIXED: u16 = 2; // header + footer
 
-    let mid_h_ideal: u16 = 8;
+    // Check which mid panels are visible
+    let any_mid = app.show_quota || app.show_tokens || app.show_ports;
+
+    let mid_h_ideal: u16 = if any_mid { 8 } else { 0 };
     // Sessions: border(2) + header(1) + 2 rows/session + detail area
-    let sessions_ideal: u16 = (app.sessions.len() as u16 * 2 + 7).max(8);
+    let sessions_ideal: u16 = if app.show_sessions {
+        (app.sessions.len() as u16 * 2 + 7).max(8)
+    } else {
+        0
+    };
     let context_ideal: u16 = (app.sessions.len() as u16 + 4).clamp(5, 10);
 
     let available = h.saturating_sub(FIXED);
     const MID_MIN: u16 = 6;
-    // 1) Reserve mid minimum first, then sessions get the rest
-    let mid_reserved = MID_MIN.min(available);
+    let mid_reserved = if any_mid { MID_MIN.min(available) } else { 0 };
     let sessions_budget = available.saturating_sub(mid_reserved);
-    let sessions_h = sessions_ideal.min(sessions_budget).max(5.min(sessions_budget));
-    // 2) Mid gets ideal from remaining (at least the reserved minimum)
+    let sessions_h = if app.show_sessions {
+        sessions_ideal.min(sessions_budget).max(5.min(sessions_budget))
+    } else {
+        0
+    };
     let after_sessions = available.saturating_sub(sessions_h);
-    let mid_h = mid_h_ideal.min(after_sessions).max(mid_reserved.min(after_sessions));
-    // 3) Context only if sessions are fully satisfied and surplus >= CONTEXT_MIN
+    let mid_h = if any_mid {
+        mid_h_ideal.min(after_sessions).max(mid_reserved.min(after_sessions))
+    } else {
+        0
+    };
     let surplus = available.saturating_sub(sessions_h + mid_h);
-    let context_h = if sessions_h >= sessions_ideal && surplus >= CONTEXT_MIN {
+    let context_h = if app.show_context && sessions_h >= sessions_ideal && surplus >= CONTEXT_MIN {
         context_ideal.min(surplus)
+    } else if app.show_context && !app.show_sessions && surplus >= CONTEXT_MIN {
+        context_ideal.min(available.saturating_sub(mid_h))
     } else {
         0
     };
@@ -319,7 +333,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     if mid_h > 0 {
         constraints[n] = Constraint::Length(mid_h); n += 1;
     }
-    constraints[n] = Constraint::Min(sessions_h); n += 1;
+    if sessions_h > 0 {
+        constraints[n] = Constraint::Min(sessions_h); n += 1;
+    }
     constraints[n] = Constraint::Length(1); // footer
     n += 1;
 
@@ -338,25 +354,35 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 
     if mid_h > 0 {
+        // Build constraints for visible mid panels only
+        let mut mid_constraints: Vec<Constraint> = Vec::new();
+        if app.show_quota { mid_constraints.push(Constraint::Ratio(1, mid_constraints.len() as u32 + 1)); }
+        if app.show_tokens { mid_constraints.push(Constraint::Ratio(1, mid_constraints.len() as u32 + 1)); }
+        // projects always visible when mid row is shown
+        mid_constraints.push(Constraint::Ratio(1, mid_constraints.len() as u32 + 1));
+        if app.show_ports { mid_constraints.push(Constraint::Ratio(1, mid_constraints.len() as u32 + 1)); }
+
+        // Recalculate even distribution
+        let count = mid_constraints.len() as u32;
+        mid_constraints = mid_constraints.iter().map(|_| Constraint::Ratio(1, count)).collect();
+
         let mid_panels = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(25), // quota (rate limit)
-                Constraint::Percentage(25), // tokens
-                Constraint::Percentage(25), // projects
-                Constraint::Percentage(25), // ports
-            ])
+            .constraints(mid_constraints)
             .split(chunks[idx]);
 
-        quota::draw_quota_panel(f, app, mid_panels[0], theme);
-        tokens::draw_tokens_panel(f, app, mid_panels[1], theme);
-        projects::draw_projects_panel(f, app, mid_panels[2], theme);
-        ports::draw_ports_panel(f, app, mid_panels[3], theme);
+        let mut mi = 0;
+        if app.show_quota { quota::draw_quota_panel(f, app, mid_panels[mi], theme); mi += 1; }
+        if app.show_tokens { tokens::draw_tokens_panel(f, app, mid_panels[mi], theme); mi += 1; }
+        projects::draw_projects_panel(f, app, mid_panels[mi], theme); mi += 1;
+        if app.show_ports { ports::draw_ports_panel(f, app, mid_panels[mi], theme); }
         idx += 1;
     }
 
-    sessions::draw_sessions_panel(f, app, chunks[idx], theme);
-    idx += 1;
+    if sessions_h > 0 {
+        sessions::draw_sessions_panel(f, app, chunks[idx], theme);
+        idx += 1;
+    }
     footer::draw_footer(f, app, chunks[idx], theme);
 }
 

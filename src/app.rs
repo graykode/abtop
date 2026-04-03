@@ -55,6 +55,12 @@ pub struct App {
     /// Kill confirmation: (selected_index, timestamp). Expires after 2s.
     kill_confirm: Option<(usize, Instant)>,
     pub theme: Theme,
+    /// Panel visibility toggles (1-5 keys, btop-style)
+    pub show_context: bool,
+    pub show_quota: bool,
+    pub show_tokens: bool,
+    pub show_ports: bool,
+    pub show_sessions: bool,
 }
 
 impl App {
@@ -79,6 +85,22 @@ impl App {
             status_msg: None,
             kill_confirm: None,
             theme,
+            show_context: true,
+            show_quota: true,
+            show_tokens: true,
+            show_ports: true,
+            show_sessions: true,
+        }
+    }
+
+    pub fn toggle_panel(&mut self, panel: u8) {
+        match panel {
+            1 => self.show_context = !self.show_context,
+            2 => self.show_quota = !self.show_quota,
+            3 => self.show_tokens = !self.show_tokens,
+            4 => self.show_ports = !self.show_ports,
+            5 => self.show_sessions = !self.show_sessions,
+            _ => {}
         }
     }
 
