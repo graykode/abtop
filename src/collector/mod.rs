@@ -1,12 +1,14 @@
 pub mod claude;
 pub mod codex;
 pub mod mcp;
+pub mod opencode;
 pub mod process;
 pub mod rate_limit;
 
 pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
 pub use mcp::McpServer;
+pub use opencode::OpenCodeCollector;
 pub use rate_limit::read_rate_limits;
 
 /// Redact common secret patterns to avoid displaying credentials in the TUI.
@@ -169,6 +171,9 @@ impl MultiCollector {
         }
         if !is_hidden("codex") {
             collectors.push(Box::new(CodexCollector::new()));
+        }
+        if !is_hidden("opencode") {
+            collectors.push(Box::new(OpenCodeCollector::new()));
         }
         Self {
             collectors,
