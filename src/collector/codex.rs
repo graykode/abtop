@@ -450,11 +450,9 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                             result.context_window = cw;
                         }
                     }
-                    Some("user_message") => {
-                        if result.initial_prompt.is_empty() {
-                            if let Some(msg) = payload["message"].as_str() {
-                                result.initial_prompt = msg.chars().take(120).collect();
-                            }
+                    Some("user_message") if result.initial_prompt.is_empty() => {
+                        if let Some(msg) = payload["message"].as_str() {
+                            result.initial_prompt = msg.chars().take(120).collect();
                         }
                     }
                     Some("token_count") => {
