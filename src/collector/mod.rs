@@ -1,10 +1,12 @@
 pub mod claude;
 pub mod codex;
+pub mod gemini;
 pub mod process;
 pub mod rate_limit;
 
 pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
+pub use gemini::GeminiCollector;
 pub use rate_limit::read_rate_limits;
 
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
@@ -75,6 +77,7 @@ impl MultiCollector {
             collectors: vec![
                 Box::new(ClaudeCollector::new()),
                 Box::new(CodexCollector::new()),
+                Box::new(GeminiCollector::new()),
             ],
             tick_count: SLOW_POLL_INTERVAL, // trigger on first tick
             cached_ports: HashMap::new(),

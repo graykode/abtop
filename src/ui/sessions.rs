@@ -74,6 +74,7 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         let (agent_label, agent_color) = match session.agent_cli {
             "claude" => ("*CC", Color::Rgb(217, 119, 87)),  // #D97757 terracotta
             "codex"  => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
+            "gemini" => ("#GM", Color::Rgb(136, 176, 255)), // #88B0FF cornflower blue
             other => {
                 let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
                 (Box::leak(fallback.into_boxed_str()) as &str, theme.inactive_fg)

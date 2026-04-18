@@ -210,6 +210,38 @@ pub fn populate_demo(app: &mut App) {
             first_assistant_text: String::new(),
             initial_prompt: "Create interactive heatmap component with D3.js".into(),
         },
+        AgentSession {
+            agent_cli: "gemini",
+            pid: 6903,
+            session_id: "e5f6a7b8-9abc-def0-1234-555555555555".into(),
+            cwd: "/Users/demo/life-jarvis/frontend".into(),
+            project_name: "frontend".into(),
+            started_at: now - 25 * 60 * 1000, // 25m ago
+            status: SessionStatus::Working,
+            model: "gemini-3-flash-preview".into(),
+            effort: String::new(),
+            context_percent: 42.0,
+            total_input_tokens: 25_583_957,
+            total_output_tokens: 77_500,
+            total_cache_read: 22_736_746,
+            total_cache_create: 23_218, // thought tokens
+            turn_count: 242,
+            current_tasks: vec!["Deep analysis".into()],
+            mem_mb: 334,
+            version: "0.38.1".into(),
+            git_branch: "master".into(),
+            git_added: 1,
+            git_modified: 0,
+            token_history: vec![
+                50000, 80000, 120000, 180000, 150000, 220000, 95000, 140000,
+            ],
+            subagents: vec![],
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: vec![],
+            first_assistant_text: String::new(),
+            initial_prompt: "Read the file GEMINI-STRESS-TEST.md and complete all 7 tasks".into(),
+        },
     ];
 
     // --- Summaries (pre-populated, no LLM calls) ---
@@ -228,6 +260,10 @@ pub fn populate_demo(app: &mut App) {
     app.summaries.insert(
         "d4e5f6a7-89ab-cdef-0123-444444444444".into(),
         "D3 heatmap component".into(),
+    );
+    app.summaries.insert(
+        "e5f6a7b8-9abc-def0-1234-555555555555".into(),
+        "Gemini stress test tasks".into(),
     );
 
     // --- Rate limits ---
