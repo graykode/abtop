@@ -422,7 +422,7 @@ pub fn populate_demo(app: &mut App) {
             cwd: "/Users/demo/infra".into(),
             project_name: "infra".into(),
             started_at: now - 8 * 60 * 1000, // 8m ago
-            status: SessionStatus::Working,
+            status: SessionStatus::Thinking,
             model: "ollama/qwen3:14b".into(),
             effort: String::new(),
             context_percent: 35.0,
@@ -440,6 +440,9 @@ pub fn populate_demo(app: &mut App) {
             token_history: vec![
                 3000, 5000, 8000, 6000, 9000, 7000, 11000, 8000, 10000,
             ],
+            context_history: vec![],
+            compaction_count: 0,
+            context_window: 200_000,
             subagents: vec![],
             mem_file_count: 0,
             mem_line_count: 0,
@@ -447,6 +450,10 @@ pub fn populate_demo(app: &mut App) {
 
             first_assistant_text: String::new(),
             initial_prompt: "Refactor Terraform modules for multi-region".into(),
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            file_accesses: vec![],
         },
     ];
 
