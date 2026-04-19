@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::model::{AgentSession, ChildProcess, OrphanPort, RateLimitInfo, SessionStatus, SubAgent};
+use crate::model::{AgentSession, ChildProcess, FileAccess, FileOp, OrphanPort, RateLimitInfo, SessionStatus, SubAgent};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> u64 {
@@ -93,6 +93,18 @@ pub fn populate_demo(app: &mut App) {
 
             first_assistant_text: String::new(),
             initial_prompt: "Implement Stripe payment integration for checkout flow".into(),
+            file_accesses: vec![
+                FileAccess { path: "src/checkout/payment.rs".into(), operation: FileOp::Read, turn_index: 1 },
+                FileAccess { path: "src/checkout/payment.rs".into(), operation: FileOp::Edit, turn_index: 2 },
+                FileAccess { path: "src/checkout/stripe.rs".into(), operation: FileOp::Write, turn_index: 3 },
+                FileAccess { path: "src/models/order.rs".into(), operation: FileOp::Read, turn_index: 4 },
+                FileAccess { path: "src/models/order.rs".into(), operation: FileOp::Edit, turn_index: 5 },
+                FileAccess { path: "tests/checkout_test.rs".into(), operation: FileOp::Write, turn_index: 6 },
+                FileAccess { path: "src/checkout/stripe.rs".into(), operation: FileOp::Edit, turn_index: 7 },
+                FileAccess { path: "Cargo.toml".into(), operation: FileOp::Read, turn_index: 8 },
+                FileAccess { path: "Cargo.toml".into(), operation: FileOp::Edit, turn_index: 9 },
+                FileAccess { path: "src/config.rs".into(), operation: FileOp::Read, turn_index: 10 },
+            ],
         },
         AgentSession {
             agent_cli: "claude",
@@ -138,6 +150,7 @@ pub fn populate_demo(app: &mut App) {
 
             first_assistant_text: String::new(),
             initial_prompt: "Add batch inference endpoint with GPU scheduling".into(),
+            file_accesses: vec![],
         },
         AgentSession {
             agent_cli: "claude",
@@ -194,6 +207,7 @@ pub fn populate_demo(app: &mut App) {
 
             first_assistant_text: String::new(),
             initial_prompt: "Fix CORS headers and add rate limiting middleware".into(),
+            file_accesses: vec![],
         },
         AgentSession {
             agent_cli: "codex",
@@ -237,6 +251,7 @@ pub fn populate_demo(app: &mut App) {
 
             first_assistant_text: String::new(),
             initial_prompt: "Create interactive heatmap component with D3.js".into(),
+            file_accesses: vec![],
         },
     ];
 

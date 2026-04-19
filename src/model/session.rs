@@ -33,6 +33,20 @@ pub struct ChildProcess {
     pub port: Option<u16>,
 }
 
+#[derive(Debug, Clone)]
+pub enum FileOp {
+    Read,
+    Write,
+    Edit,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileAccess {
+    pub path: String,
+    pub operation: FileOp,
+    pub turn_index: u32,
+}
+
 /// A port left open by a process whose parent session has ended.
 #[derive(Debug, Clone)]
 pub struct OrphanPort {
@@ -90,6 +104,8 @@ pub struct AgentSession {
     pub initial_prompt: String,
     /// First assistant response text (text blocks only) — used as summary fallback
     pub first_assistant_text: String,
+    /// File operations performed during the session (Read/Write/Edit with paths)
+    pub file_accesses: Vec<FileAccess>,
 }
 
 impl AgentSession {
@@ -190,6 +206,7 @@ mod tests {
             children: Vec::new(),
             initial_prompt: String::new(),
             first_assistant_text: String::new(),
+            file_accesses: Vec::new(),
         }
     }
 

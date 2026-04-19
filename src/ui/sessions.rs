@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::model::FileOp;
 use crate::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -27,7 +28,14 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         if app.tree_view { base + app.sessions[i].subagents.len() as u16 } else { base }
     }).sum();
     // Fixed detail height: keeps the detail panel stable regardless of content
-    let detail_reserve: u16 = 10.min(inner.height / 2);
+    // Expand to 2/3 height when file audit is active
+    let has_file_audit = app.show_file_audit
+        && app.sessions.get(app.selected).is_some_and(|s| !s.file_accesses.is_empty());
+    let detail_reserve: u16 = if has_file_audit {
+        (inner.height * 2 / 3).max(10)
+    } else {
+        10.min(inner.height / 2)
+    };
     let max_table = inner.height.saturating_sub(detail_reserve);
     let table_h = (1 + session_rows).min(max_table);
 
@@ -380,6 +388,7 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
 
         let has_children = !session.children.is_empty();
         let has_subagents = !session.subagents.is_empty();
+        let has_file_audit_data = app.show_file_audit && !session.file_accesses.is_empty();
 
         // Always show SESSION header (task) at top, then children/subagents below
         let session_header_h: u16 = {
@@ -387,7 +396,18 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
             if !session.initial_prompt.is_empty() { h += 1; }
             h
         };
-        let (header_area, lower_area) = if has_children || has_subagents {
+        let has_lower = has_children || has_subagents;
+        let (header_area, lower_area, file_audit_area) = if has_lower && has_file_audit_data {
+            let parts = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(session_header_h),
+                    Constraint::Length(4.min(detail_body_h.saturating_sub(session_header_h) / 2)),
+                    Constraint::Min(1),
+                ])
+                .split(detail_body);
+            (parts[0], Some(parts[1]), Some(parts[2]))
+        } else if has_file_audit_data {
             let parts = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -395,9 +415,18 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                     Constraint::Min(1),
                 ])
                 .split(detail_body);
-            (parts[0], Some(parts[1]))
+            (parts[0], None, Some(parts[1]))
+        } else if has_lower {
+            let parts = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(session_header_h),
+                    Constraint::Min(1),
+                ])
+                .split(detail_body);
+            (parts[0], Some(parts[1]), None)
         } else {
-            (detail_body, None)
+            (detail_body, None, None)
         };
 
         // SESSION header — always rendered
@@ -542,6 +571,40 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                 }
                 f.render_widget(Paragraph::new(lines), sa_area);
             }
+        }
+
+        // File audit panel
+        if let Some(fa_area) = file_audit_area {
+            let accesses = &session.file_accesses;
+            let unique_files: std::collections::HashSet<&str> =
+                accesses.iter().map(|a| a.path.as_str()).collect();
+            let mut lines = Vec::new();
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " FILE AUDIT ({} accesses, {} unique files)",
+                    accesses.len(),
+                    unique_files.len()
+                ),
+                Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+            )));
+            let max_rows = fa_area.height.saturating_sub(1) as usize;
+            let max_path_w = (fa_area.width as usize).saturating_sub(6);
+            for access in accesses.iter().rev().take(max_rows) {
+                let (prefix, color) = match access.operation {
+                    FileOp::Read => ("R", Color::Rgb(120, 180, 255)),  // blue
+                    FileOp::Write => ("W", Color::Rgb(255, 140, 100)), // orange
+                    FileOp::Edit => ("E", Color::Rgb(180, 220, 120)),  // green
+                };
+                let turn_label = format!("t{}", access.turn_index);
+                let path_max = max_path_w.saturating_sub(turn_label.len() + 1);
+                let short_path = truncate_str(&access.path, path_max);
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", prefix), Style::default().fg(color)),
+                    Span::styled(short_path, Style::default().fg(theme.graph_text)),
+                    Span::styled(format!(" {}", turn_label), Style::default().fg(theme.inactive_fg)),
+                ]));
+            }
+            f.render_widget(Paragraph::new(lines), fa_area);
         }
 
         // Footer: MEM + version (full width)

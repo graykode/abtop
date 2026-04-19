@@ -202,6 +202,8 @@ impl ClaudeCollector {
                         prev.last_activity = delta.last_activity;
                     }
                     prev.token_history.extend(delta.token_history);
+                    prev.file_accesses.extend(delta.file_accesses);
+                    prev.file_accesses.truncate(1000);
                     if prev.initial_prompt.is_empty() && !delta.initial_prompt.is_empty() {
                         prev.initial_prompt = delta.initial_prompt;
                     }
@@ -215,6 +217,7 @@ impl ClaudeCollector {
         }
 
         let empty_result = TranscriptResult {
+            file_accesses: Vec::new(),
             model: "-".to_string(),
             total_input: 0, total_output: 0, total_cache_read: 0, total_cache_create: 0,
             last_context_tokens: 0, max_context_tokens: 0, context_history: Vec::new(), compaction_count: 0, turn_count: 0, current_task: String::new(),
@@ -243,6 +246,7 @@ impl ClaudeCollector {
         let compaction_count = cached.compaction_count;
         let initial_prompt = cached.initial_prompt.clone();
         let first_assistant_text = cached.first_assistant_text.clone();
+        let file_accesses = cached.file_accesses.clone();
 
         if !pid_alive {
             return None;
@@ -379,6 +383,7 @@ impl ClaudeCollector {
             children,
             initial_prompt,
             first_assistant_text,
+            file_accesses,
         })
     }
 
@@ -542,6 +547,7 @@ impl super::AgentCollector for ClaudeCollector {
 }
 
 struct TranscriptResult {
+    file_accesses: Vec<crate::model::FileAccess>,
     model: String,
     total_input: u64,
     total_output: u64,
@@ -597,6 +603,7 @@ fn file_identity(path: &Path) -> (u64, u64) {
 fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
     let identity = file_identity(path);
     let mut result = TranscriptResult {
+        file_accesses: Vec::new(),
         model: "-".to_string(),
         total_input: 0,
         total_output: 0,
@@ -754,7 +761,37 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                     }
                                 }
                                 // Extract last tool_use from latest turn (= most recently running)
+                                // Also collect FileAccess entries for Read/Write/Edit tools
                                 if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+                                    // Forward pass: collect all file accesses
+                                    for item in content {
+                                        if item.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                                            continue;
+                                        }
+                                        let tool = item.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                                        if let Some(file_path) = item
+                                            .get("input")
+                                            .and_then(|inp| inp.get("file_path"))
+                                            .and_then(|fp| fp.as_str())
+                                        {
+                                            let op = match tool {
+                                                "Read" => Some(crate::model::FileOp::Read),
+                                                "Write" => Some(crate::model::FileOp::Write),
+                                                "Edit" => Some(crate::model::FileOp::Edit),
+                                                _ => None,
+                                            };
+                                            if let Some(op) = op {
+                                                if result.file_accesses.len() < 1000 {
+                                                    result.file_accesses.push(crate::model::FileAccess {
+                                                        path: file_path.to_string(),
+                                                        operation: op,
+                                                        turn_index: result.turn_count,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Reverse pass: extract last tool_use for current_task
                                     for item in content.iter().rev() {
                                         if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                                             let tool = item.get("name").and_then(|n| n.as_str()).unwrap_or("?");

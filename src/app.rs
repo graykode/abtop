@@ -72,6 +72,7 @@ pub struct App {
     pub show_tokens: bool,
     pub show_ports: bool,
     pub show_sessions: bool,
+    pub show_file_audit: bool,
     pub config_open: bool,
     pub config_selected: usize,
     /// When true, subagents are shown as indented tree rows under their parent session.
@@ -109,6 +110,7 @@ impl App {
             show_tokens: true,
             show_ports: true,
             show_sessions: true,
+            show_file_audit: false,
             config_open: false,
             config_selected: 0,
             tree_view: false,
@@ -126,6 +128,10 @@ impl App {
             5 => self.show_sessions = !self.show_sessions,
             _ => {}
         }
+    }
+
+    pub fn toggle_file_audit(&mut self) {
+        self.show_file_audit = !self.show_file_audit;
     }
 
     pub fn toggle_config(&mut self) {
