@@ -2,7 +2,8 @@ use super::process;
 use crate::model::{AgentSession, ChildProcess, SessionStatus};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Maximum sessions to fetch from the DB per query.
@@ -45,7 +46,8 @@ impl OpenCodeCollector {
     }
 
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
-        if !self.db_path.exists() || !self.check_sqlite3() {
+        // Security: skip if db_path is a symlink (fail-closed)
+        if is_symlink(&self.db_path) || !self.db_path.exists() || !self.check_sqlite3() {
             return vec![];
         }
 
@@ -190,16 +192,15 @@ impl OpenCodeCollector {
             .collect()
     }
 
-    /// Match a running PID to a session by checking /proc/pid/cwd,
+    /// Match a running PID to a session by checking its working directory,
     /// falling back to command-line substring match, then single-process match.
     fn match_pid_to_session(
         pid_commands: &HashMap<u32, &str>,
         session_dir: &str,
     ) -> Option<u32> {
         for (&pid, &cmd) in pid_commands {
-            // Primary: check actual working directory via /proc
-            if let Ok(cwd) = std::fs::read_link(format!("/proc/{}/cwd", pid)) {
-                if cwd.to_string_lossy() == session_dir {
+            if let Some(cwd) = get_process_cwd(pid) {
+                if cwd == session_dir {
                     return Some(pid);
                 }
             }
@@ -215,8 +216,26 @@ impl OpenCodeCollector {
         None
     }
 
+    /// Run a single sqlite3 query and parse the JSON output.
+    fn run_query(&self, sql: &str) -> Option<Vec<Value>> {
+        let db = self.db_path.to_str()?;
+        let output = Command::new("sqlite3")
+            .args(["-readonly", "-json", db])
+            .arg(sql)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().is_empty() {
+            return Some(vec![]);
+        }
+        serde_json::from_str(stdout.trim()).ok()
+    }
+
     fn query_sessions(&self) -> Option<Vec<DbSession>> {
-        let query = format!(r#"
+        let session_sql = format!(r#"
 SELECT
   s.id, s.title, s.directory, s.version, s.time_created, s.time_updated,
   COALESCE(p.name, '') as project_name,
@@ -231,11 +250,9 @@ LEFT JOIN message m ON m.session_id = s.id
   AND json_extract(m.data, '$.role') = 'assistant'
 GROUP BY s.id
 ORDER BY s.time_updated DESC
-LIMIT {};
-"#, MAX_SESSIONS);
+LIMIT {};"#, MAX_SESSIONS);
 
-        // Model/provider require a separate correlated subquery (latest assistant msg)
-        let model_query = format!(r#"
+        let model_sql = format!(r#"
 SELECT
   s.id,
   COALESCE((SELECT json_extract(m2.data, '$.modelID')
@@ -248,46 +265,11 @@ SELECT
     ORDER BY m2.time_created DESC LIMIT 1), '') as provider
 FROM session s
 ORDER BY s.time_updated DESC
-LIMIT {};
-"#, MAX_SESSIONS);
+LIMIT {};"#, MAX_SESSIONS);
 
-        // Run both queries in one sqlite3 invocation
-        let combined = format!("{}\n{}", query, model_query);
-        let output = Command::new("sqlite3")
-            .args(["-readonly", "-json", self.db_path.to_str()?])
-            .arg(&combined)
-            .output()
-            .ok()?;
-
-        if !output.status.success() {
-            return None;
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.trim().is_empty() {
-            return Some(vec![]);
-        }
-
-        // sqlite3 -json outputs one JSON array per query, concatenated
-        // Parse the first array (session data) and second (model data)
-        let arrays: Vec<&str> = stdout.trim().split("][").collect();
-        let sessions_json = if arrays.len() > 1 {
-            format!("{}]", arrays[0])
-        } else {
-            stdout.trim().to_string()
-        };
-        let models_json = if arrays.len() > 1 {
-            format!("[{}", arrays[1])
-        } else {
-            String::new()
-        };
-
-        let rows: Vec<Value> = serde_json::from_str(&sessions_json).ok()?;
-        let model_rows: Vec<Value> = if !models_json.is_empty() {
-            serde_json::from_str(&models_json).unwrap_or_default()
-        } else {
-            vec![]
-        };
+        // Two separate invocations to avoid fragile concatenated JSON parsing
+        let rows = self.run_query(&session_sql)?;
+        let model_rows = self.run_query(&model_sql).unwrap_or_default();
 
         // Build model lookup by session id
         let mut model_map: HashMap<String, (String, String)> = HashMap::new();
@@ -307,14 +289,27 @@ LIMIT {};
         for row in rows {
             let id = row["id"].as_str().unwrap_or("").to_string();
             let (model, provider) = model_map.remove(&id).unwrap_or_default();
+
+            // Sanitize DB-sourced strings: truncate, redact secrets in title
+            let mut title = row["title"].as_str().unwrap_or("").to_string();
+            let mut directory = row["directory"].as_str().unwrap_or("").to_string();
+            let mut version = row["version"].as_str().unwrap_or("").to_string();
+            let mut project_name = row["project_name"].as_str().unwrap_or("").to_string();
+            truncate_field(&mut title, 512);
+            truncate_field(&mut directory, 4096);
+            truncate_field(&mut version, 64);
+            truncate_field(&mut project_name, 256);
+            let title = super::redact_secrets(&title);
+
             sessions.push(DbSession {
                 id,
-                title: row["title"].as_str().unwrap_or("").to_string(),
-                directory: row["directory"].as_str().unwrap_or("").to_string(),
-                version: row["version"].as_str().unwrap_or("").to_string(),
+                title,
+                directory,
+                version,
+                // time_created and time_updated are in milliseconds since epoch
                 time_created: row["time_created"].as_u64().unwrap_or(0),
                 time_updated: row["time_updated"].as_u64().unwrap_or(0),
-                project_name: row["project_name"].as_str().unwrap_or("").to_string(),
+                project_name,
                 turn_count: row["turn_count"].as_u64().unwrap_or(0) as u32,
                 total_input: row["total_input"].as_u64().unwrap_or(0),
                 total_output: row["total_output"].as_u64().unwrap_or(0),
@@ -350,6 +345,49 @@ struct DbSession {
     total_cache_write: u64,
     model: String,
     provider: String,
+}
+
+/// Check if a path is a symlink (fail-closed: returns true on error).
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(true)
+}
+
+/// Truncate a string at a char boundary to avoid panics on multi-byte UTF-8.
+fn truncate_field(s: &mut String, max_bytes: usize) {
+    if s.len() > max_bytes {
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+}
+
+/// Get the current working directory of a process.
+/// Uses /proc on Linux, lsof on macOS/other Unix.
+#[cfg(target_os = "linux")]
+fn get_process_cwd(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{}/cwd", pid))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_process_cwd(pid: u32) -> Option<String> {
+    let output = Command::new("lsof")
+        .args(["-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // lsof -Fn output: lines starting with 'n' contain the path
+    stdout.lines()
+        .find(|l| l.starts_with('n') && l.len() > 1)
+        .map(|l| l[1..].to_string())
 }
 
 fn current_time_ms() -> u64 {
