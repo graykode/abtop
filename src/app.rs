@@ -129,7 +129,8 @@ impl App {
         // Poll rate limits: first tick immediately, then every 5 ticks ≈ 10s
         if self.rate_limits.is_empty() || self.rate_limit_counter >= 5 {
             self.rate_limit_counter = 0;
-            self.rate_limits = read_rate_limits();
+            let extra_dirs = self.collector.all_config_dirs();
+            self.rate_limits = read_rate_limits(&extra_dirs);
             // Merge live rate limits from agent collectors (e.g. Codex JSONL parsing)
             self.rate_limits.extend(self.collector.agent_rate_limits());
         } else {

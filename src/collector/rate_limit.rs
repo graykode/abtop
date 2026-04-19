@@ -29,18 +29,28 @@ struct WindowInfo {
     resets_at: u64,
 }
 
-/// Read rate limit info from all known sources.
-pub fn read_rate_limits() -> Vec<RateLimitInfo> {
+/// Read rate limit info from all known Claude config directories.
+/// Checks the default ~/.claude, CLAUDE_CONFIG_DIR if set, and any
+/// additional directories discovered from running Claude processes.
+pub fn read_rate_limits(extra_dirs: &[PathBuf]) -> Vec<RateLimitInfo> {
     let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
 
-    // Claude Code: read from StatusLine hook output file
-    if let Some(claude_dir) = std::env::var("CLAUDE_CONFIG_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
-    {
-        let path = claude_dir.join(CLAUDE_RATE_FILE);
+    // Collect candidate directories: defaults + discovered
+    let mut dirs = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".claude"));
+    }
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        dirs.push(PathBuf::from(dir));
+    }
+    dirs.extend_from_slice(extra_dirs);
+
+    for dir in dirs {
+        if !dir.is_dir() || !seen.insert(dir.clone()) {
+            continue;
+        }
+        let path = dir.join(CLAUDE_RATE_FILE);
         if let Some(info) = read_rate_file(&path, "claude") {
             results.push(info);
         }

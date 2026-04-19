@@ -8,9 +8,15 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-pub struct ClaudeCollector {
+/// A single Claude config directory (sessions + projects + transcripts).
+struct ConfigDir {
     sessions_dir: PathBuf,
     projects_dir: PathBuf,
+}
+
+pub struct ClaudeCollector {
+    /// All known config directories to scan for sessions.
+    config_dirs: Vec<ConfigDir>,
     /// Cached transcript parse results keyed by session_id.
     /// On each tick, only new bytes since `new_offset` are parsed.
     transcript_cache: HashMap<String, TranscriptResult>,
@@ -18,37 +24,86 @@ pub struct ClaudeCollector {
 
 impl ClaudeCollector {
     pub fn new() -> Self {
-        let base = std::env::var("CLAUDE_CONFIG_DIR")
-            .ok()
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir())
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".claude"));
         Self {
-            sessions_dir: base.join("sessions"),
-            projects_dir: base.join("projects"),
+            config_dirs: Vec::new(),
             transcript_cache: HashMap::new(),
         }
     }
 
+    /// Discover all unique Claude config directories by reading
+    /// /proc/<pid>/environ for each running Claude process.
+    /// Always includes the default (~/.claude) and CLAUDE_CONFIG_DIR if set.
+    fn refresh_config_dirs(&mut self, process_info: &HashMap<u32, process::ProcInfo>) {
+        // BTreeSet for deterministic iteration order across runs.
+        let mut seen = std::collections::BTreeSet::new();
+
+        // Always include the default directory
+        let default = dirs::home_dir().unwrap_or_default().join(".claude");
+        seen.insert(default);
+
+        // Include CLAUDE_CONFIG_DIR from abtop's own environment
+        if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+            let p = PathBuf::from(dir);
+            if p.is_dir() {
+                seen.insert(p);
+            }
+        }
+
+        // Discover from running Claude processes via /proc/<pid>/environ
+        for (pid, info) in process_info {
+            if !process::cmd_has_binary(&info.command, "claude") {
+                continue;
+            }
+            if let Some(dir) = read_env_var_from_proc(*pid, "CLAUDE_CONFIG_DIR") {
+                let p = PathBuf::from(dir);
+                if p.is_dir() {
+                    seen.insert(p);
+                }
+            }
+        }
+
+        self.config_dirs = seen
+            .into_iter()
+            .map(|base| ConfigDir {
+                sessions_dir: base.join("sessions"),
+                projects_dir: base.join("projects"),
+            })
+            .collect();
+    }
+
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
-        let session_files = match fs::read_dir(&self.sessions_dir) {
-            Ok(entries) => entries,
-            Err(_) => return vec![],
-        };
+        // Refresh config dirs on slow ticks only (every ~10s) or on first run.
+        // Scanning /proc/<pid>/environ for every Claude process is expensive
+        // to do every 2s; config dirs change rarely.
+        if shared.slow_tick || self.config_dirs.is_empty() {
+            self.refresh_config_dirs(&shared.process_info);
+        }
+
+        // Collect all session file paths first to avoid borrowing self
+        // immutably (config_dirs) and mutably (load_session) at the same time.
+        let mut session_paths = Vec::new();
+        for config in &self.config_dirs {
+            let session_files = match fs::read_dir(&config.sessions_dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+
+            for entry in session_files.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                session_paths.push(path);
+            }
+        }
 
         let mut sessions = Vec::new();
-        for entry in session_files.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            // Skip symlinks to avoid reading unintended files
-            if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
-                continue;
-            }
-
-            if let Some(session) = self.load_session(&path, &shared.process_info, &shared.children_map, &shared.ports) {
-                sessions.push(session);
+        let mut seen_ids = std::collections::HashSet::new();
+        for path in &session_paths {
+            if let Some(session) = self.load_session(path, &shared.process_info, &shared.children_map, &shared.ports) {
+                if seen_ids.insert(session.session_id.clone()) {
+                    sessions.push(session);
+                }
             }
         }
 
@@ -266,7 +321,16 @@ impl ClaudeCollector {
         let project_dir = transcript_path
             .as_ref()
             .and_then(|tp| tp.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| self.projects_dir.join(encode_cwd_path(&sf.cwd)));
+            .unwrap_or_else(|| {
+                // Fallback to the default (~/.claude) projects dir.
+                // config_dirs is sorted (BTreeSet), so ~/.claude is always
+                // first when it exists.
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_cwd_path(&sf.cwd))
+            });
 
         // Subagent discovery
         let subagents_dir = project_dir.join(&sf.session_id).join("subagents");
@@ -315,28 +379,33 @@ impl ClaudeCollector {
 
     fn find_transcript(&self, cwd: &str, session_id: &str) -> Option<PathBuf> {
         let jsonl_name = format!("{}.jsonl", session_id);
-
-        // Primary: look up by encoded cwd
         let encoded = encode_cwd_path(cwd);
-        let path = self.projects_dir.join(&encoded).join(&jsonl_name);
-        if path.exists() && !is_symlink(&path) {
-            return Some(path);
+
+        // Pass 1: try the exact encoded-cwd path across all config dirs first.
+        // This avoids a worktree-fallback match in one dir shadowing the
+        // correct exact match in another dir.
+        for config in &self.config_dirs {
+            let path = config.projects_dir.join(&encoded).join(&jsonl_name);
+            if path.exists() && !is_symlink(&path) {
+                return Some(path);
+            }
         }
 
-        // Fallback: scan all project directories for the session file.
-        // Handles worktree (-w) sessions where the transcript directory
-        // may not match the encoded cwd from the session file.
-        if let Ok(entries) = fs::read_dir(&self.projects_dir) {
-            for entry in entries.flatten() {
-                if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
-                    continue;
-                }
-                if !entry.path().is_dir() {
-                    continue;
-                }
-                let candidate = entry.path().join(&jsonl_name);
-                if candidate.exists() && !is_symlink(&candidate) {
-                    return Some(candidate);
+        // Pass 2: scan all project subdirectories for worktree sessions
+        // where the transcript directory may not match the encoded cwd.
+        for config in &self.config_dirs {
+            if let Ok(entries) = fs::read_dir(&config.projects_dir) {
+                for entry in entries.flatten() {
+                    if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
+                        continue;
+                    }
+                    if !entry.path().is_dir() {
+                        continue;
+                    }
+                    let candidate = entry.path().join(&jsonl_name);
+                    if candidate.exists() && !is_symlink(&candidate) {
+                        return Some(candidate);
+                    }
                 }
             }
         }
@@ -458,6 +527,12 @@ impl ClaudeCollector {
 impl super::AgentCollector for ClaudeCollector {
     fn collect(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)
+    }
+
+    fn discovered_config_dirs(&self) -> Vec<PathBuf> {
+        self.config_dirs.iter()
+            .map(|c| c.sessions_dir.parent().unwrap_or(Path::new(".")).to_path_buf())
+            .collect()
     }
 }
 
@@ -850,6 +925,32 @@ fn read_effort_from_settings(path: &Path) -> Option<String> {
     }
 }
 
+/// Parse a NUL-separated environ blob to extract a single variable's value.
+/// Only invoked from the Linux-gated `read_env_var_from_proc`; kept available
+/// to unit tests on all platforms, so suppress dead_code on non-Linux.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_environ_var(data: &[u8], var_name: &str) -> Option<String> {
+    let prefix = format!("{}=", var_name);
+    data.split(|&b| b == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .find(|entry| entry.starts_with(&prefix))
+        .map(|entry| entry[prefix.len()..].to_string())
+}
+
+/// Read a single environment variable from a running process via /proc/<pid>/environ.
+/// Returns None if the process is inaccessible or the variable is not set.
+#[cfg(target_os = "linux")]
+fn read_env_var_from_proc(pid: u32, var_name: &str) -> Option<String> {
+    let data = fs::read(format!("/proc/{}/environ", pid)).ok()?;
+    parse_environ_var(&data, var_name)
+}
+
+/// Stub for non-Linux platforms where /proc is not available.
+#[cfg(not(target_os = "linux"))]
+fn read_env_var_from_proc(_pid: u32, _var_name: &str) -> Option<String> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1069,5 +1170,36 @@ mod tests {
     #[test]
     fn test_read_effort_from_settings_nonexistent_file() {
         assert!(read_effort_from_settings(Path::new("/nonexistent/nowhere.json")).is_none());
+    }
+
+    #[test]
+    fn test_parse_environ_var_found() {
+        let data = b"HOME=/root\0CLAUDE_CONFIG_DIR=/home/user/.claude-pro\0SHELL=/bin/bash\0";
+        assert_eq!(
+            parse_environ_var(data, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some("/home/user/.claude-pro"),
+        );
+    }
+
+    #[test]
+    fn test_parse_environ_var_not_set() {
+        let data = b"HOME=/root\0SHELL=/bin/bash\0";
+        assert!(parse_environ_var(data, "CLAUDE_CONFIG_DIR").is_none());
+    }
+
+    #[test]
+    fn test_parse_environ_var_empty_value() {
+        let data = b"CLAUDE_CONFIG_DIR=\0OTHER=val\0";
+        assert_eq!(
+            parse_environ_var(data, "CLAUDE_CONFIG_DIR").as_deref(),
+            Some(""),
+        );
+    }
+
+    #[test]
+    fn test_parse_environ_var_no_partial_match() {
+        // CLAUDE_CONFIG_DIR_EXTRA should not match CLAUDE_CONFIG_DIR
+        let data = b"CLAUDE_CONFIG_DIR_EXTRA=/wrong\0";
+        assert!(parse_environ_var(data, "CLAUDE_CONFIG_DIR").is_none());
     }
 }
