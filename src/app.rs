@@ -112,12 +112,16 @@ impl App {
         // Update prev_tokens in place; stale entries are harmless (bounded by
         // total unique sessions ever seen) and keeping them avoids false spikes
         // when a session transiently disappears from one poll.
+        // Only real-token agents contribute to the rate — mixing kiro credits
+        // (stored x100 in total_input_tokens) would produce a meaningless unit.
         let mut rate: f64 = 0.0;
         for s in &self.sessions {
             let key = (s.agent_cli.to_string(), s.session_id.clone());
             let total = s.active_tokens();
             let prev = self.prev_tokens.get(&key).copied().unwrap_or(total);
-            rate += total.saturating_sub(prev) as f64;
+            if s.reports_real_tokens() {
+                rate += total.saturating_sub(prev) as f64;
+            }
             self.prev_tokens.insert(key, total);
         }
 

@@ -382,6 +382,17 @@ pub(crate) fn fmt_tokens(n: u64) -> String {
     }
 }
 
+/// Format a cumulative activity count using the agent's native unit.
+/// Kiro stores credits (×100) in total_input_tokens; everything else stores real tokens.
+pub(crate) fn fmt_tokens_for_agent(n: u64, agent_cli: &str) -> String {
+    if agent_cli == "kiro" {
+        // credits are stored ×100 for two-decimal precision
+        format!("{:.1}cr", n as f64 / 100.0)
+    } else {
+        fmt_tokens(n)
+    }
+}
+
 pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -391,5 +402,26 @@ pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max - 1).collect();
         format!("{}…", truncated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_tokens_for_agent_kiro_shows_credits() {
+        assert_eq!(fmt_tokens_for_agent(0, "kiro"), "0.0cr");
+        assert_eq!(fmt_tokens_for_agent(890, "kiro"), "8.9cr");
+        assert_eq!(fmt_tokens_for_agent(11530, "kiro"), "115.3cr");
+    }
+
+    #[test]
+    fn fmt_tokens_for_agent_non_kiro_uses_fmt_tokens() {
+        assert_eq!(fmt_tokens_for_agent(0, "claude"), "0");
+        assert_eq!(fmt_tokens_for_agent(1_200, "claude"), "1.2k");
+        assert_eq!(fmt_tokens_for_agent(1_500_000, "codex"), "1.5M");
+        // Unknown agent falls through to fmt_tokens as well.
+        assert_eq!(fmt_tokens_for_agent(42, "unknown"), "42");
     }
 }

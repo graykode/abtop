@@ -23,8 +23,9 @@ pub(crate) fn draw_quota_panel(f: &mut Frame, app: &App, area: Rect, theme: &The
 
     let avail_h = inner.height as usize;
 
-    // Bottom summary: total tokens + rate
-    let total_tokens: u64 = app.sessions.iter().map(|s| s.total_tokens()).sum();
+    // Bottom summary: total tokens + rate (real-token agents only — keep units
+    // consistent across aggregation).
+    let total_tokens: u64 = app.sessions.iter().filter(|s| s.reports_real_tokens()).map(|s| s.total_tokens()).sum();
     let rates = &app.token_rates;
     let ticks_per_min = 30usize;
     let tokens_per_min: f64 = rates.iter().rev().take(ticks_per_min).sum();

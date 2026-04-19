@@ -2,7 +2,7 @@
 
 **Like htop, but for your AI coding agents.**
 
-See every Claude Code and Codex CLI session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
+See every Claude Code, Codex CLI, and Kiro CLI session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
 
 ![demo](assets/demo.gif)
 
@@ -69,18 +69,20 @@ tmux new -s work
 
 ## Supported Agents
 
-| Feature           | Claude Code | Codex CLI |
-| ----------------- | :---------: | :-------: |
-| Session Discovery |     ✅      |    ✅     |
-| Token Tracking    |     ✅      |    ✅     |
-| Context Window %  |     ✅      |    ✅     |
-| Status Detection  |     ✅      |    ✅     |
-| Current Task      |     ✅      |    ✅     |
-| Rate Limit        |     ✅      |    ✅     |
-| Git Status        |     ✅      |    ✅     |
-| Children / Ports  |     ✅      |    ✅     |
-| Subagents         |     ✅      |    ❌     |
-| Memory Status     |     ✅      |    ❌     |
+| Feature           | Claude Code | Codex CLI | Kiro CLI |
+| ----------------- | :---------: | :-------: | :------: |
+| Session Discovery |     ✅      |    ✅     |    ✅    |
+| Token Tracking    |     ✅      |    ✅     |    ⚠️¹   |
+| Context Window %  |     ✅      |    ✅     |    ✅    |
+| Status Detection  |     ✅      |    ✅     |    ✅    |
+| Current Task      |     ✅      |    ✅     |    ✅    |
+| Rate Limit        |     ✅      |    ✅     |    ❌    |
+| Git Status        |     ✅      |    ✅     |    ✅    |
+| Children / Ports  |     ✅      |    ✅     |    ✅    |
+| Subagents         |     ✅      |    ❌     |    ❌    |
+| Memory Status     |     ✅      |    ❌     |    ❌    |
+
+¹ Kiro CLI persists per-turn input/output token counts as 0 in session metadata. abtop falls back to Kiro's authoritative per-turn `metering_usage` credit values and displays them with a `cr` suffix (e.g. `115.3cr`) — matching Kiro's own billing UI.
 
 ## Themes
 
