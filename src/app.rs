@@ -55,6 +55,8 @@ pub struct App {
     /// Kill confirmation: (selected_index, timestamp). Expires after 2s.
     kill_confirm: Option<(usize, Instant)>,
     pub theme: Theme,
+    /// When true, subagents are shown as indented tree rows under their parent session.
+    pub tree_view: bool,
 }
 
 impl App {
@@ -80,6 +82,7 @@ impl App {
             status_msg: None,
             kill_confirm: None,
             theme,
+            tree_view: false,
         }
     }
 

@@ -21,7 +21,11 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     };
 
     // Session list: 1 header + 2 rows per session (main + 1 task line)
-    let session_rows: u16 = app.sessions.len() as u16 * 2;
+    // In tree view, add subagent rows
+    let session_rows: u16 = app.sessions.iter().map(|s| {
+        let base = 2u16;
+        if app.tree_view { base + s.subagents.len() as u16 } else { base }
+    }).sum();
     // Fixed detail height: keeps the detail panel stable regardless of content
     let detail_reserve: u16 = 10.min(inner.height / 2);
     let max_table = inner.height.saturating_sub(detail_reserve);
@@ -180,6 +184,42 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
             }
         }).collect();
         rows.push(Row::new(task_cells).height(1));
+
+        // Tree view: show subagents as indented rows
+        if app.tree_view && !session.subagents.is_empty() {
+            for (sa_idx, sa) in session.subagents.iter().enumerate() {
+                let is_last = sa_idx == session.subagents.len() - 1;
+                let prefix = if is_last { "    └─" } else { "    ├─" };
+                let icon = if sa.status == "working" { "●" } else { "✓" };
+                let sa_fg = if sa.status == "working" { theme.proc_misc } else { theme.inactive_fg };
+
+                let mut sa_cells: Vec<Cell> = vec![
+                    Cell::from(""),
+                    Cell::from(Span::styled(prefix, Style::default().fg(theme.div_line))),
+                ];
+                if show_pid {
+                    sa_cells.push(Cell::from(""));
+                }
+                sa_cells.extend([
+                    Cell::from(Span::styled(
+                        truncate_str(&sa.name, project_w as usize),
+                        Style::default().fg(theme.graph_text),
+                    )),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(Span::styled(icon, Style::default().fg(sa_fg))),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(Span::styled(
+                        fmt_tokens(sa.tokens),
+                        Style::default().fg(theme.graph_text),
+                    )),
+                ]);
+                if show_memory { sa_cells.push(Cell::from("")); }
+                if show_turn { sa_cells.push(Cell::from("")); }
+                rows.push(Row::new(sa_cells).height(1));
+            }
+        }
     }
 
     let header_style = Style::default()
@@ -232,8 +272,8 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         widths_vec.push(Constraint::Length(4));   // turn
     }
 
-    // Scroll: each session = 2 rows. Ensure selected session is visible.
-    let total_rows = app.sessions.len() * 2;
+    // Scroll: rows per session varies with tree view
+    let total_rows = rows.len();
     let needs_scroll = total_rows > panel_chunks[0].height.saturating_sub(1) as usize;
 
     // Split table area into [table | scrollbar(1)] when scrollable
@@ -252,8 +292,15 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     }
 
     let visible_rows = table_area.height.saturating_sub(1) as usize; // -1 for header
-    let selected_row_start = app.selected * 2;
-    let selected_row_end = selected_row_start + 2;
+    // Calculate row offset for selected session (accounts for tree view subagent rows)
+    let selected_row_start: usize = app.sessions.iter().take(app.selected).map(|s| {
+        let base = 2;
+        if app.tree_view { base + s.subagents.len() } else { base }
+    }).sum();
+    let selected_session_rows = if app.tree_view {
+        2 + app.sessions.get(app.selected).map_or(0, |s| s.subagents.len())
+    } else { 2 };
+    let selected_row_end = selected_row_start + selected_session_rows;
     let scroll_offset = selected_row_end.saturating_sub(visible_rows);
     let visible = if scroll_offset < rows.len() {
         rows.into_iter().skip(scroll_offset).collect::<Vec<_>>()
