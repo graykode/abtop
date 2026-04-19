@@ -926,6 +926,9 @@ fn read_effort_from_settings(path: &Path) -> Option<String> {
 }
 
 /// Parse a NUL-separated environ blob to extract a single variable's value.
+/// Only invoked from the Linux-gated `read_env_var_from_proc`; kept available
+/// to unit tests on all platforms, so suppress dead_code on non-Linux.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_environ_var(data: &[u8], var_name: &str) -> Option<String> {
     let prefix = format!("{}=", var_name);
     data.split(|&b| b == 0)
