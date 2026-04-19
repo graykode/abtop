@@ -257,7 +257,6 @@ Tracks child processes that have open ports. When a parent session dies but the 
 - **Rust** (2021 edition)
 - **ratatui** + **crossterm** for TUI
 - **serde** + **serde_json** for JSON/JSONL parsing
-- **tokio** — included but currently sync I/O; summary generation uses `std::thread::spawn`
 - **chrono** for timestamp formatting
 - **dirs** for home directory resolution
 - **Polling intervals** (staggered to avoid freezes):

@@ -7,6 +7,39 @@ pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
 pub use rate_limit::read_rate_limits;
 
+/// Redact common secret patterns to avoid displaying credentials in the TUI.
+/// Replaces the prefix and all following non-whitespace chars with [REDACTED].
+/// Best-effort: covers well-known prefixed tokens, not arbitrary high-entropy strings.
+pub(crate) fn redact_secrets(s: &str) -> String {
+    const PATTERNS: &[&str] = &[
+        // Anthropic / OpenAI / OpenRouter
+        "sk-ant-", "sk-proj-", "sk-or-",
+        // Stripe
+        "sk_live_", "sk_test_", "rk_live_", "rk_test_",
+        // GitHub
+        "ghp_", "gho_", "ghs_", "ghr_", "ghu_", "github_pat_",
+        // GitLab
+        "glpat-",
+        // Slack
+        "xoxb-", "xoxp-", "xoxa-", "xoxs-",
+        // AWS access key id
+        "AKIA", "ASIA",
+        // Bearer-prefixed headers
+        "Bearer ",
+    ];
+    let mut result = s.to_string();
+    for pat in PATTERNS {
+        while let Some(pos) = result.find(pat) {
+            let end = result[pos..]
+                .find(char::is_whitespace)
+                .map(|i| pos + i)
+                .unwrap_or(result.len());
+            result.replace_range(pos..end, "[REDACTED]");
+        }
+    }
+    result
+}
+
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
 use std::collections::HashMap;
 
@@ -20,6 +53,12 @@ pub trait AgentCollector {
     fn live_rate_limit(&self) -> Option<RateLimitInfo> {
         None
     }
+
+    /// Return config directories discovered from running agent processes.
+    /// Used to feed rate limit lookups across all active config dirs.
+    fn discovered_config_dirs(&self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
 }
 
 /// Process data fetched once per tick and shared across all collectors.
@@ -28,18 +67,21 @@ pub struct SharedProcessData {
     pub process_info: HashMap<u32, process::ProcInfo>,
     pub children_map: HashMap<u32, Vec<u32>>,
     pub ports: HashMap<u32, Vec<u16>>,
+    /// True on slow poll ticks (every 5 ticks ≈ 10s). Collectors should
+    /// defer expensive discovery (e.g. /proc reads) to slow ticks.
+    pub slow_tick: bool,
 }
 
 impl SharedProcessData {
     /// Fetch process info every tick, but reuse cached ports when `cached_ports` is provided.
-    pub fn fetch(cached_ports: Option<&HashMap<u32, Vec<u16>>>) -> Self {
+    pub fn fetch(cached_ports: Option<&HashMap<u32, Vec<u16>>>, slow_tick: bool) -> Self {
         let process_info = process::get_process_info();
         let children_map = process::get_children_map(&process_info);
         let ports = match cached_ports {
             Some(p) => p.clone(),
             None => process::get_listening_ports(),
         };
-        Self { process_info, children_map, ports }
+        Self { process_info, children_map, ports, slow_tick }
     }
 }
 
@@ -90,6 +132,11 @@ impl MultiCollector {
         self.collectors.iter().filter_map(|c| c.live_rate_limit()).collect()
     }
 
+    /// Return all config directories discovered across all collectors.
+    pub fn all_config_dirs(&self) -> Vec<std::path::PathBuf> {
+        self.collectors.iter().flat_map(|c| c.discovered_config_dirs()).collect()
+    }
+
     pub fn collect(&mut self) -> Vec<AgentSession> {
         let slow_tick = self.tick_count >= SLOW_POLL_INTERVAL;
         if slow_tick {
@@ -98,13 +145,13 @@ impl MultiCollector {
         self.tick_count += 1;
 
         // Ports: refresh on slow tick or when the PID set changes (PID reuse safety)
-        let fresh_process = SharedProcessData::fetch(Some(&self.cached_ports));
+        let fresh_process = SharedProcessData::fetch(Some(&self.cached_ports), slow_tick);
         let mut current_pids: Vec<u32> = fresh_process.process_info.keys().copied().collect();
         current_pids.sort_unstable();
         let pids_changed = current_pids != self.cached_port_pids;
 
         let shared = if slow_tick || pids_changed {
-            let s = SharedProcessData::fetch(None);
+            let s = SharedProcessData::fetch(None, slow_tick);
             self.cached_ports = s.ports.clone();
             self.cached_port_pids = current_pids;
             s

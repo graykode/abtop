@@ -34,8 +34,10 @@ with open(os.path.join(config_dir, 'abtop-rate-limits.json'), 'w') as f:
 
 fn claude_dir() -> PathBuf {
     std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".claude"))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".claude"))
 }
 
 fn script_path() -> PathBuf {
@@ -64,7 +66,7 @@ pub fn run_setup() {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o755));
+                let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o700));
             }
             println!("  ✓ wrote {}", script.display());
         }
@@ -99,11 +101,12 @@ pub fn run_setup() {
     let obj = settings.as_object_mut().unwrap();
 
     // Check if statusLine is already configured
+    let expected_cmd = script.display().to_string();
     if let Some(existing) = obj.get("statusLine") {
         if let Some(existing_obj) = existing.as_object() {
             if let Some(cmd) = existing_obj.get("command") {
                 let cmd_str = cmd.as_str().unwrap_or("");
-                if !cmd_str.contains("abtop") {
+                if cmd_str != expected_cmd && !cmd_str.is_empty() {
                     eprintln!("  ⚠ statusLine already configured: {}", cmd_str);
                     eprintln!("    to override, remove the existing statusLine key from:");
                     eprintln!("    {}", settings_file.display());

@@ -127,6 +127,26 @@ pub struct SessionFile {
     pub started_at: u64,
 }
 
+impl SessionFile {
+    /// Truncate string fields to sane limits after deserialization.
+    pub fn sanitize(&mut self) {
+        truncate_string(&mut self.session_id, 256);
+        truncate_string(&mut self.cwd, 4096);
+    }
+}
+
+/// Truncate a string at a char boundary to avoid panics on multi-byte UTF-8.
+fn truncate_string(s: &mut String, max_bytes: usize) {
+    if s.len() > max_bytes {
+        // Find the last char boundary at or before max_bytes
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -177,6 +177,20 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, demo_mode: boo
     Ok(())
 }
 
+/// Strip control characters (including ANSI escapes) and Unicode bidi
+/// overrides from a string for safe terminal output. Defeats CVE-2021-42574
+/// (Trojan Source) style attacks via RTLO/LRO/PDF/isolate characters.
+fn sanitize_output(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control()
+            && !matches!(*c,
+                '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200E}'
+                | '\u{200F}'))
+        .collect()
+}
+
 fn print_snapshot(app: &App) {
     println!("abtop — {} sessions\n", app.sessions.len());
     for session in &app.sessions {
@@ -191,11 +205,11 @@ fn print_snapshot(app: &App) {
             &session.session_id
         };
         let project_label = format!("{}({})", session.project_name, sid_short);
-        let summary = app.session_summary(session);
+        let summary = sanitize_output(&app.session_summary(session));
         println!(
             "  {} {:<20} {} {} {:<10} CTX:{:>3.0}% Tok:{} Mem:{}M {}",
             session.pid,
-            project_label,
+            sanitize_output(&project_label),
             summary,
             status,
             session.model.replace("claude-", ""),
@@ -205,14 +219,14 @@ fn print_snapshot(app: &App) {
             session.elapsed_display(),
         );
         if let Some(task) = session.current_tasks.last() {
-            println!("       └─ {}", task);
+            println!("       └─ {}", sanitize_output(task));
         }
         for child in &session.children {
             let port = child.port.map(|p| format!(":{}", p)).unwrap_or_default();
             println!(
                 "       {} {} {}K {}",
                 child.pid,
-                child.command.split_whitespace().take(3).collect::<Vec<_>>().join(" "),
+                sanitize_output(&child.command.split_whitespace().take(3).collect::<Vec<_>>().join(" ")),
                 child.mem_kb / 1024,
                 port,
             );
@@ -224,10 +238,52 @@ fn run_update() -> io::Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     println!("abtop v{current} — checking for updates...\n");
 
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("curl --proto '=https' --tlsv1.2 -LsSf https://github.com/graykode/abtop/releases/latest/download/abtop-installer.sh | sh")
+    // Download to a private temp file (O_EXCL + random suffix) so a local
+    // attacker can't pre-place a symlink or swap the file mid-run.
+    let tmp = tempfile::Builder::new()
+        .prefix("abtop-installer-")
+        .suffix(".sh")
+        .tempfile()?;
+    let installer_path = tmp.path().to_path_buf();
+
+    let dl_status = std::process::Command::new("curl")
+        .args([
+            "--proto", "=https",
+            "--tlsv1.2",
+            "-LsSf",
+            "https://github.com/graykode/abtop/releases/latest/download/abtop-installer.sh",
+            "-o",
+        ])
+        .arg(&installer_path)
         .status()?;
+
+    if !dl_status.success() {
+        eprintln!("\nDownload failed. You can also update manually:");
+        eprintln!("  cargo install abtop --force");
+        std::process::exit(1);
+    }
+
+    // Show checksum so the user can verify if desired.
+    // macOS ships `shasum` (Perl) by default, Linux ships `sha256sum` (coreutils).
+    let checksum_shown = std::process::Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(&installer_path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !checksum_shown {
+        let _ = std::process::Command::new("sha256sum")
+            .arg(&installer_path)
+            .status();
+    }
+
+    let status = std::process::Command::new("sh")
+        .arg(&installer_path)
+        .status()?;
+
+    // NamedTempFile::drop removes the file; explicit drop to sequence it
+    // after sh exits.
+    drop(tmp);
 
     if !status.success() {
         eprintln!("\nUpdate failed. You can also update manually:");

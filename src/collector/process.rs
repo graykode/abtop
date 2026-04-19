@@ -58,7 +58,11 @@ pub fn has_active_descendant(
     cpu_threshold: f64,
 ) -> bool {
     let mut stack = vec![pid];
+    let mut visited = std::collections::HashSet::new();
     while let Some(p) = stack.pop() {
+        if !visited.insert(p) {
+            continue;
+        }
         if let Some(kids) = children_map.get(&p) {
             for &kid in kids {
                 if process_info.get(&kid).is_some_and(|p| p.cpu_pct > cpu_threshold) {
@@ -113,6 +117,10 @@ pub fn cmd_has_binary(cmd: &str, name: &str) -> bool {
 }
 
 pub fn collect_git_stats(cwd: &str) -> (u32, u32) {
+    // Validate cwd is an existing directory before running git
+    if !std::path::Path::new(cwd).is_dir() {
+        return (0, 0);
+    }
     let output = Command::new("git")
         .args(["-C", cwd, "status", "--porcelain"])
         .output()
