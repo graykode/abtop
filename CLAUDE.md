@@ -2,7 +2,7 @@
 
 AI agent monitor for your terminal. Like btop++, but for AI coding agents.
 
-Supports Claude Code and Codex CLI.
+Supports Claude Code, Codex CLI, and Kiro CLI.
 
 ## Architecture
 
@@ -18,6 +18,7 @@ src/
 │   ├── mod.rs              # MultiCollector orchestration, orphan port detection
 │   ├── claude.rs           # Claude Code: session discovery, transcript parsing
 │   ├── codex.rs            # Codex CLI: session discovery via ps+lsof, JSONL parsing
+│   ├── kiro.rs             # Kiro CLI: live-lock discovery, metadata tokens, JSONL tail for current task
 │   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
 │   └── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
 └── model/

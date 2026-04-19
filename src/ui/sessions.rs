@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use super::{btop_block, fmt_mem_kb, fmt_tokens, grad_at, make_gradient, truncate_str};
+use super::{btop_block, fmt_mem_kb, fmt_tokens, fmt_tokens_for_agent, grad_at, make_gradient, truncate_str};
 
 pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     // Render the outer block
@@ -74,10 +74,10 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         let (agent_label, agent_color) = match session.agent_cli {
             "claude" => ("*CC", Color::Rgb(217, 119, 87)),  // #D97757 terracotta
             "codex"  => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
-            other => {
-                let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
-                (Box::leak(fallback.into_boxed_str()) as &str, theme.inactive_fg)
-            }
+            "kiro"   => ("*KC", Color::Rgb(167, 139, 250)), // #A78BFA purple
+            // Unknown agent: show a static placeholder. Any new agent_cli value
+            // must add an explicit arm above.
+            _ => ("*??", theme.inactive_fg),
         };
 
         let (status_icon, status_color) = match &session.status {
@@ -146,7 +146,7 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                 Style::default().fg(ctx_color),
             )),
             Cell::from(Span::styled(
-                fmt_tokens(session.total_tokens()),
+                fmt_tokens_for_agent(session.total_tokens(), session.agent_cli),
                 Style::default().fg(theme.main_fg),
             )),
         ]);

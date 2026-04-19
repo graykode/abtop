@@ -29,7 +29,7 @@ pub(crate) fn draw_context_panel(f: &mut Frame, app: &App, area: Rect, theme: &T
         let ticks_per_min = 30usize;
         let rates: Vec<f64> = app.token_rates.iter().copied().collect();
         let tokens_per_min: f64 = rates.iter().rev().take(ticks_per_min).sum();
-        let total: u64 = app.sessions.iter().map(|s| s.total_tokens()).sum();
+        let total: u64 = app.sessions.iter().filter(|s| s.reports_real_tokens()).map(|s| s.total_tokens()).sum();
         let active = app.sessions.iter()
             .filter(|s| matches!(s.status, crate::model::SessionStatus::Working))
             .count();
@@ -93,8 +93,9 @@ fn draw_context_sparkline(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Colo
         lines.push(Line::from(line_spans));
     }
 
-    // Summary line: total tokens
-    let total_tokens: u64 = app.sessions.iter().map(|s| s.total_tokens()).sum();
+    // Summary line: total tokens (real-token agents only — kiro credits are a
+    // different unit and would corrupt the aggregation).
+    let total_tokens: u64 = app.sessions.iter().filter(|s| s.reports_real_tokens()).map(|s| s.total_tokens()).sum();
     lines.push(Line::from(vec![
         Span::styled(format!(" {}", fmt_tokens(total_tokens)), Style::default().fg(theme.main_fg)),
         Span::styled(" total", Style::default().fg(theme.graph_text)),
