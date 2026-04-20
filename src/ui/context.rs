@@ -106,7 +106,7 @@ fn draw_context_sparkline(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Colo
 fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 101], theme: &Theme) {
     let header_style = Style::default().fg(theme.main_fg).add_modifier(Modifier::BOLD);
 
-    // bar width = remaining space after Project(10) + pct(5) + info(12) + padding
+    // bar width = remaining space after Project(10) + pct(5) + info(10) + padding
     let bar_width = (area.width as usize).saturating_sub(30).clamp(4, 20);
 
     let mut rows = Vec::new();
@@ -117,18 +117,12 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
         let warn = if raw_pct >= 90.0 { "⚠" } else if raw_pct >= 75.0 { "!" } else { "" };
         let pct_color = grad_at(cpu_grad, bar_pct);
 
-        // Context info: window size + compaction count
-        let ctx_info = if session.context_window > 0 {
-            let window_label = fmt_tokens(session.context_window);
-            if session.compaction_count > 0 {
-                format!("{}  {}x{}", window_label, "C", session.compaction_count)
-            } else {
-                window_label
-            }
-        } else if session.compaction_count > 0 {
-            format!("C{}", session.compaction_count)
-        } else {
-            String::new()
+        // Context info: window size + compaction count (e.g. "200k C2")
+        let ctx_info = match (session.context_window > 0, session.compaction_count) {
+            (true, 0) => fmt_tokens(session.context_window),
+            (true, n) => format!("{} C{}", fmt_tokens(session.context_window), n),
+            (false, 0) => String::new(),
+            (false, n) => format!("C{}", n),
         };
 
         rows.push(Row::new(vec![
