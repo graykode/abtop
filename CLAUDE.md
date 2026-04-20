@@ -2,7 +2,7 @@
 
 AI agent monitor for your terminal. Like btop++, but for AI coding agents.
 
-Supports Claude Code and Codex CLI.
+Supports Claude Code, Codex CLI, and `pi-coding-agent`.
 
 ## Architecture
 
@@ -18,6 +18,7 @@ src/
 │   ├── mod.rs              # MultiCollector orchestration, orphan port detection
 │   ├── claude.rs           # Claude Code: session discovery, transcript parsing
 │   ├── codex.rs            # Codex CLI: session discovery via ps+lsof, JSONL parsing
+│   ├── pi.rs               # pi-coding-agent: session discovery via ps+lsof, JSONL parsing
 │   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
 │   └── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
 └── model/
@@ -186,7 +187,32 @@ File format read by abtop:
 - Account-level metric, shared across all sessions.
 - Show "—" when not configured or data unavailable.
 
-### 9. Other files
+### 9. pi-coding-agent sessions: `~/.pi/agent/sessions/--<cwd-encoded>--/<timestamp>_<uuid>.jsonl`
+
+Path encoding: cwd with leading slash stripped, remaining slashes replaced with `-`,
+wrapped in `--...--`. Example: `/Users/demo/proj` → `--Users-demo-proj--`.
+
+Discovery strategy:
+1. Find running `pi` processes via `ps` (matches `pi-coding-agent` in argv path, or
+   `pi` binary — pi sets `process.title = "pi"` in cli.ts)
+2. Map PID → open `*.jsonl` under `.pi/agent/sessions/` via `lsof`
+3. Parse JSONL: first line is `{"type":"session",...}` header, subsequent lines are
+   tree-structured entries with `id` / `parentId`
+
+Key line types (pi session v3):
+- `type:"session"` — header with `id`, `cwd`, `timestamp`
+- `type:"message"` — wraps an `AgentMessage` in `message` field. Role-dispatch:
+  - `role:"user"` — increments turn count, first occurrence becomes `initial_prompt`
+  - `role:"assistant"` — carries `model`, `provider`, `usage.{input,output,cacheRead,cacheWrite,totalTokens}`, and `content[]` with text / thinking / toolCall blocks
+  - `role:"toolResult"` / `"bashExecution"` — not used for UI fields
+- `type:"model_change"` — user switched models mid-session (`modelId` field)
+- `type:"thinking_level_change"` — user changed reasoning level (maps to `effort`)
+
+Pi is provider-agnostic (Anthropic, OpenAI, Google, Groq, local) so there is
+**no rate-limit telemetry**. Context window is inferred from model name via the
+same table abtop uses for Claude.
+
+### 10. Other files
 - `~/.claude/stats-cache.json` — daily aggregates. Only updated on `/stats`, NOT real-time.
 - `~/.claude/history.jsonl` — prompt history with sessionId.
 
@@ -302,7 +328,7 @@ cargo clippy                   # Lint
 
 ## Non-Goals (v0.1)
 
-- Gemini/Cursor support
+- Gemini/Cursor support (tracked in #45)
 - Cost estimation
 - Remote/SSH monitoring
 - Notifications/alerts

@@ -47,7 +47,11 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     }
 
     // ── Session list table ──
-    let proc_grad = make_gradient(theme.proc_grad.start, theme.proc_grad.mid, theme.proc_grad.end);
+    let proc_grad = make_gradient(
+        theme.proc_grad.start,
+        theme.proc_grad.mid,
+        theme.proc_grad.end,
+    );
     let mut rows = Vec::new();
 
     // Responsive columns — 9 core columns always visible, widths shrink at narrow terminals.
@@ -58,7 +62,13 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     let show_turn = w >= 100;
 
     // Responsive widths — all 9 core columns always visible, widths adapt
-    let project_w: u16 = if w >= 120 { 14 } else if w >= 100 { 10 } else { 7 };
+    let project_w: u16 = if w >= 120 {
+        14
+    } else if w >= 100 {
+        10
+    } else {
+        7
+    };
     let session_w: u16 = if w >= 110 { 9 } else { 5 };
     let session_label = if w >= 110 { "Session" } else { "Sess" };
     let status_w: u16 = if w >= 100 { 8 } else { 6 };
@@ -72,19 +82,21 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         let marker = if selected { "►" } else { " " };
 
         let (agent_label, agent_color) = match session.agent_cli {
-            "claude" => ("*CC", Color::Rgb(217, 119, 87)),  // #D97757 terracotta
-            "codex"  => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
+            "claude" => ("*CC", Color::Rgb(217, 119, 87)), // #D97757 terracotta
+            "codex" => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
+            "pi" => ("#PI", Color::Rgb(167, 139, 250)),    // #A78BFA muted violet
             other => {
                 let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
-                (Box::leak(fallback.into_boxed_str()) as &str, theme.inactive_fg)
+                (
+                    Box::leak(fallback.into_boxed_str()) as &str,
+                    theme.inactive_fg,
+                )
             }
         };
 
         let (status_icon, status_color) = match &session.status {
             crate::model::SessionStatus::Working => ("● Work", theme.proc_misc),
-            crate::model::SessionStatus::Waiting => {
-                ("◌ Wait", grad_at(&proc_grad, 50.0))
-            }
+            crate::model::SessionStatus::Waiting => ("◌ Wait", grad_at(&proc_grad, 50.0)),
             crate::model::SessionStatus::Done => ("✓ Done", theme.inactive_fg),
         };
 
@@ -132,14 +144,21 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                 truncate_str(sid_short, session_w as usize),
                 Style::default().fg(theme.session_id),
             )),
-            Cell::from(Span::styled(summary_col, Style::default().fg(theme.main_fg))),
+            Cell::from(Span::styled(
+                summary_col,
+                Style::default().fg(theme.main_fg),
+            )),
             Cell::from(Span::styled(
                 truncate_str(status_icon, status_w as usize),
                 Style::default().fg(status_color),
             )),
             Cell::from(Span::styled(
                 truncate_str(&model_short, model_w as usize),
-                Style::default().fg(if model_short == "-" { theme.inactive_fg } else { theme.graph_text }),
+                Style::default().fg(if model_short == "-" {
+                    theme.inactive_fg
+                } else {
+                    theme.graph_text
+                }),
             )),
             Cell::from(Span::styled(
                 format!("{:.0}%", session.context_percent),
@@ -152,7 +171,11 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         ]);
         if show_memory {
             cells.push(Cell::from(Span::styled(
-                if session.mem_mb > 0 { format!("{}M", session.mem_mb) } else { "—".into() },
+                if session.mem_mb > 0 {
+                    format!("{}M", session.mem_mb)
+                } else {
+                    "—".into()
+                },
                 Style::default().fg(theme.graph_text),
             )));
         }
@@ -168,27 +191,30 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         // 2nd line: task text in Summary column
         let summary_idx = if show_pid { 5 } else { 4 };
         let total_cols = 9 + show_pid as usize + show_memory as usize + show_turn as usize;
-        let task_cells: Vec<Cell> = (0..total_cols).map(|j| {
-            if j == summary_idx {
-                let task_text = session.current_tasks.last().map(|s| s.as_str()).unwrap_or("");
-                Cell::from(Span::styled(
-                    format!("└─ {}", task_text),
-                    Style::default().fg(theme.graph_text),
-                ))
-            } else {
-                Cell::from("")
-            }
-        }).collect();
+        let task_cells: Vec<Cell> = (0..total_cols)
+            .map(|j| {
+                if j == summary_idx {
+                    let task_text = session
+                        .current_tasks
+                        .last()
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    Cell::from(Span::styled(
+                        format!("└─ {}", task_text),
+                        Style::default().fg(theme.graph_text),
+                    ))
+                } else {
+                    Cell::from("")
+                }
+            })
+            .collect();
         rows.push(Row::new(task_cells).height(1));
     }
 
     let header_style = Style::default()
         .fg(theme.main_fg)
         .add_modifier(Modifier::BOLD);
-    let mut header_cells = vec![
-        Cell::from(""),
-        Cell::from(Span::styled("AI", header_style)),
-    ];
+    let mut header_cells = vec![Cell::from(""), Cell::from(Span::styled("AI", header_style))];
     if show_pid {
         header_cells.push(Cell::from(Span::styled("Pid", header_style)));
     }
@@ -210,26 +236,26 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     let header = Row::new(header_cells).height(1);
 
     let mut widths_vec: Vec<Constraint> = vec![
-        Constraint::Length(1),   // marker
-        Constraint::Length(3),   // agent label
+        Constraint::Length(1), // marker
+        Constraint::Length(3), // agent label
     ];
     if show_pid {
-        widths_vec.push(Constraint::Length(6));   // pid
+        widths_vec.push(Constraint::Length(6)); // pid
     }
     widths_vec.extend([
-        Constraint::Length(project_w),   // project
-        Constraint::Length(session_w),   // session id
-        Constraint::Min(6),              // summary (fills remaining)
-        Constraint::Length(status_w),    // status
-        Constraint::Length(model_w),     // model
-        Constraint::Length(context_w),   // context
-        Constraint::Length(tokens_w),    // tokens
+        Constraint::Length(project_w), // project
+        Constraint::Length(session_w), // session id
+        Constraint::Min(6),            // summary (fills remaining)
+        Constraint::Length(status_w),  // status
+        Constraint::Length(model_w),   // model
+        Constraint::Length(context_w), // context
+        Constraint::Length(tokens_w),  // tokens
     ]);
     if show_memory {
-        widths_vec.push(Constraint::Length(8));   // memory
+        widths_vec.push(Constraint::Length(8)); // memory
     }
     if show_turn {
-        widths_vec.push(Constraint::Length(4));   // turn
+        widths_vec.push(Constraint::Length(4)); // turn
     }
 
     // Scroll: each session = 2 rows. Ensure selected session is visible.
@@ -269,7 +295,8 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         let bar_h = sb.height as usize;
         if bar_h > 0 {
             let thumb_size = ((visible_rows as f64 / total_rows as f64) * bar_h as f64)
-                .ceil().max(1.0) as usize;
+                .ceil()
+                .max(1.0) as usize;
             let thumb_size = thumb_size.min(bar_h);
             let thumb_pos = if total_rows > visible_rows {
                 ((scroll_offset as f64 / (total_rows - visible_rows) as f64)
@@ -295,7 +322,9 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                 buf[(sb.x, sb.y)].set_symbol("↑").set_fg(theme.proc_box);
             }
             if scroll_offset + visible_rows < total_rows {
-                buf[(sb.x, sb.y + sb.height - 1)].set_symbol("↓").set_fg(theme.proc_box);
+                buf[(sb.x, sb.y + sb.height - 1)]
+                    .set_symbol("↓")
+                    .set_fg(theme.proc_box);
             }
         }
     }
@@ -329,16 +358,15 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         // Always show SESSION header (task) at top, then children/subagents below
         let session_header_h: u16 = {
             let mut h = 1u16; // SESSION title
-            if !session.initial_prompt.is_empty() { h += 1; }
+            if !session.initial_prompt.is_empty() {
+                h += 1;
+            }
             h
         };
         let (header_area, lower_area) = if has_children || has_subagents {
             let parts = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(session_header_h),
-                    Constraint::Min(1),
-                ])
+                .constraints([Constraint::Length(session_header_h), Constraint::Min(1)])
                 .split(detail_body);
             (parts[0], Some(parts[1]))
         } else {
@@ -350,7 +378,9 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
             let mut lines = Vec::new();
             lines.push(Line::from(Span::styled(
                 format!(" SESSION (►{} · {})", &session.session_id, &session.cwd),
-                Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
             )));
             if !session.initial_prompt.is_empty() {
                 let max_w = (header_area.width as usize).saturating_sub(9);
@@ -385,7 +415,9 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                 let mut lines = Vec::new();
                 lines.push(Line::from(Span::styled(
                     " CHILDREN",
-                    Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.title)
+                        .add_modifier(Modifier::BOLD),
                 )));
                 for child in &session.children {
                     let cmd_short = child
@@ -426,7 +458,9 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                 let mut lines = Vec::new();
                 lines.push(Line::from(Span::styled(
                     " SUBAGENTS",
-                    Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.title)
+                        .add_modifier(Modifier::BOLD),
                 )));
 
                 let col_w = sa_area.width as usize;
@@ -443,9 +477,18 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                         let mut spans = Vec::new();
                         // Left column
                         let icon = if sa.status == "working" { "●" } else { "✓" };
-                        let fg = if sa.status == "working" { theme.main_fg } else { theme.graph_text };
+                        let fg = if sa.status == "working" {
+                            theme.main_fg
+                        } else {
+                            theme.graph_text
+                        };
                         spans.push(Span::styled(
-                            format!("  {} {:<w$}", icon, truncate_str(&sa.name, name_w), w = name_w),
+                            format!(
+                                "  {} {:<w$}",
+                                icon,
+                                truncate_str(&sa.name, name_w),
+                                w = name_w
+                            ),
                             Style::default().fg(fg),
                         ));
                         spans.push(Span::styled(
@@ -455,10 +498,23 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
 
                         // Right column
                         if let Some(sa_r) = right_agents.get(row_idx) {
-                            let icon_r = if sa_r.status == "working" { "●" } else { "✓" };
-                            let fg_r = if sa_r.status == "working" { theme.main_fg } else { theme.graph_text };
+                            let icon_r = if sa_r.status == "working" {
+                                "●"
+                            } else {
+                                "✓"
+                            };
+                            let fg_r = if sa_r.status == "working" {
+                                theme.main_fg
+                            } else {
+                                theme.graph_text
+                            };
                             spans.push(Span::styled(
-                                format!("  {} {:<w$}", icon_r, truncate_str(&sa_r.name, name_w), w = name_w),
+                                format!(
+                                    "  {} {:<w$}",
+                                    icon_r,
+                                    truncate_str(&sa_r.name, name_w),
+                                    w = name_w
+                                ),
                                 Style::default().fg(fg_r),
                             ));
                             spans.push(Span::styled(
@@ -472,10 +528,19 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                     let name_w = col_w.saturating_sub(12);
                     for sa in &session.subagents {
                         let icon = if sa.status == "working" { "●" } else { "✓" };
-                        let fg = if sa.status == "working" { theme.main_fg } else { theme.graph_text };
+                        let fg = if sa.status == "working" {
+                            theme.main_fg
+                        } else {
+                            theme.graph_text
+                        };
                         lines.push(Line::from(vec![
                             Span::styled(
-                                format!("  {} {:<w$}", icon, truncate_str(&sa.name, name_w), w = name_w),
+                                format!(
+                                    "  {} {:<w$}",
+                                    icon,
+                                    truncate_str(&sa.name, name_w),
+                                    w = name_w
+                                ),
                                 Style::default().fg(fg),
                             ),
                             Span::styled(
@@ -491,7 +556,8 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
 
         // Footer: MEM + version (full width)
         {
-            let cpu_grad = make_gradient(theme.cpu_grad.start, theme.cpu_grad.mid, theme.cpu_grad.end);
+            let cpu_grad =
+                make_gradient(theme.cpu_grad.start, theme.cpu_grad.mid, theme.cpu_grad.end);
             let mem_color = if session.mem_line_count >= 180 {
                 grad_at(&cpu_grad, 100.0)
             } else {
@@ -530,9 +596,7 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
 
 pub(crate) fn shorten_model(model: &str, is_1m: bool) -> String {
     // "claude-opus-4-6" → "opus4.6", "claude-sonnet-4-6" → "sonnet4.6", "claude-haiku-4-5" → "haiku4.5"
-    let s = model
-        .strip_prefix("claude-")
-        .unwrap_or(model);
+    let s = model.strip_prefix("claude-").unwrap_or(model);
     let s = s.trim_end_matches("[1m]");
     // Extract name and version: "opus-4-6" → ("opus", "4.6")
     let base = if let Some(pos) = s.find(|c: char| c.is_ascii_digit()) {

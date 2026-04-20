@@ -2,7 +2,7 @@
 
 **Like htop, but for your AI coding agents.**
 
-See every Claude Code and Codex CLI session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
+See every Claude Code, Codex CLI, and pi session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
 
 ![demo](assets/demo.gif)
 
@@ -69,18 +69,21 @@ tmux new -s work
 
 ## Supported Agents
 
-| Feature           | Claude Code | Codex CLI |
-| ----------------- | :---------: | :-------: |
-| Session Discovery |     ✅      |    ✅     |
-| Token Tracking    |     ✅      |    ✅     |
-| Context Window %  |     ✅      |    ✅     |
-| Status Detection  |     ✅      |    ✅     |
-| Current Task      |     ✅      |    ✅     |
-| Rate Limit        |     ✅      |    ✅     |
-| Git Status        |     ✅      |    ✅     |
-| Children / Ports  |     ✅      |    ✅     |
-| Subagents         |     ✅      |    ❌     |
-| Memory Status     |     ✅      |    ❌     |
+| Feature           | Claude Code | Codex CLI |  pi  |
+| ----------------- | :---------: | :-------: | :--: |
+| Session Discovery |     ✅      |    ✅     |  ✅  |
+| Token Tracking    |     ✅      |    ✅     |  ✅  |
+| Context Window %  |     ✅      |    ✅     |  ✅  |
+| Status Detection  |     ✅      |    ✅     |  ✅  |
+| Current Task      |     ✅      |    ✅     |  ✅  |
+| Rate Limit        |     ✅      |    ✅     |  —   |
+| Git Status        |     ✅      |    ✅     |  ✅  |
+| Children / Ports  |     ✅      |    ✅     |  ✅  |
+| Subagents         |     ✅      |    ❌     |  ❌  |
+| Memory Status     |     ✅      |    ❌     |  ❌  |
+
+`pi` = [`@mariozechner/pi-coding-agent`](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent).
+Rate limit is `—` because pi is provider-agnostic — users bring their own API keys, so there's no account-level quota to surface.
 
 ## Themes
 

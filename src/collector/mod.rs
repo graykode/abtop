@@ -1,10 +1,12 @@
 pub mod claude;
 pub mod codex;
+pub mod pi;
 pub mod process;
 pub mod rate_limit;
 
 pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
+pub use pi::PiCollector;
 pub use rate_limit::read_rate_limits;
 
 /// Redact common secret patterns to avoid displaying credentials in the TUI.
@@ -13,17 +15,31 @@ pub use rate_limit::read_rate_limits;
 pub(crate) fn redact_secrets(s: &str) -> String {
     const PATTERNS: &[&str] = &[
         // Anthropic / OpenAI / OpenRouter
-        "sk-ant-", "sk-proj-", "sk-or-",
+        "sk-ant-",
+        "sk-proj-",
+        "sk-or-",
         // Stripe
-        "sk_live_", "sk_test_", "rk_live_", "rk_test_",
+        "sk_live_",
+        "sk_test_",
+        "rk_live_",
+        "rk_test_",
         // GitHub
-        "ghp_", "gho_", "ghs_", "ghr_", "ghu_", "github_pat_",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghr_",
+        "ghu_",
+        "github_pat_",
         // GitLab
         "glpat-",
         // Slack
-        "xoxb-", "xoxp-", "xoxa-", "xoxs-",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xoxs-",
         // AWS access key id
-        "AKIA", "ASIA",
+        "AKIA",
+        "ASIA",
         // Bearer-prefixed headers
         "Bearer ",
     ];
@@ -81,7 +97,12 @@ impl SharedProcessData {
             Some(p) => p.clone(),
             None => process::get_listening_ports(),
         };
-        Self { process_info, children_map, ports, slow_tick }
+        Self {
+            process_info,
+            children_map,
+            ports,
+            slow_tick,
+        }
     }
 }
 
@@ -117,6 +138,7 @@ impl MultiCollector {
             collectors: vec![
                 Box::new(ClaudeCollector::new()),
                 Box::new(CodexCollector::new()),
+                Box::new(PiCollector::new()),
             ],
             tick_count: SLOW_POLL_INTERVAL, // trigger on first tick
             cached_ports: HashMap::new(),
@@ -129,12 +151,18 @@ impl MultiCollector {
 
     /// Collect rate limit info from all registered collectors.
     pub fn agent_rate_limits(&self) -> Vec<RateLimitInfo> {
-        self.collectors.iter().filter_map(|c| c.live_rate_limit()).collect()
+        self.collectors
+            .iter()
+            .filter_map(|c| c.live_rate_limit())
+            .collect()
     }
 
     /// Return all config directories discovered across all collectors.
     pub fn all_config_dirs(&self) -> Vec<std::path::PathBuf> {
-        self.collectors.iter().flat_map(|c| c.discovered_config_dirs()).collect()
+        self.collectors
+            .iter()
+            .flat_map(|c| c.discovered_config_dirs())
+            .collect()
     }
 
     pub fn collect(&mut self) -> Vec<AgentSession> {
@@ -200,11 +228,14 @@ impl MultiCollector {
                 for child in &s.children {
                     live_child_pids.insert(child.pid);
                     if let Some(port) = child.port {
-                        self.tracked_port_children.insert(child.pid, TrackedPortChild {
-                            port,
-                            command: child.command.clone(),
-                            project_name: s.project_name.clone(),
-                        });
+                        self.tracked_port_children.insert(
+                            child.pid,
+                            TrackedPortChild {
+                                port,
+                                command: child.command.clone(),
+                                project_name: s.project_name.clone(),
+                            },
+                        );
                     }
                 }
             }
@@ -219,7 +250,9 @@ impl MultiCollector {
                 continue; // still owned by a live session
             }
             // Check if process is still alive and still has the port open
-            let still_listening = shared.ports.get(pid)
+            let still_listening = shared
+                .ports
+                .get(pid)
                 .is_some_and(|ports| ports.contains(&tracked.port));
             let still_alive = shared.process_info.contains_key(pid);
             if still_alive && still_listening {
