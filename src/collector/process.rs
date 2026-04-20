@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::fs;
 use std::process::Command;
 
 #[derive(Debug)]
@@ -10,6 +12,78 @@ pub struct ProcInfo {
     pub command: String,
 }
 
+#[cfg(target_os = "linux")]
+pub fn get_process_info() -> HashMap<u32, ProcInfo> {
+    let mut map = HashMap::new();
+
+    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+
+    let uptime_secs: f64 = fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0.0);
+
+    let entries = match fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return map,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid: u32 = match name.to_str().and_then(|s| s.parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // /proc/{pid}/stat - parse fields after (comm)
+        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // comm can contain spaces/parens, so find last ')'
+        let after_comm = match stat.rfind(')') {
+            Some(pos) if pos + 2 < stat.len() => &stat[pos + 2..],
+            _ => continue,
+        };
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        // fields[0]=state, [1]=ppid, [11]=utime, [12]=stime, [19]=starttime, [21]=rss
+        if fields.len() < 22 {
+            continue;
+        }
+        let ppid: u32 = fields[1].parse().unwrap_or(0);
+        let utime: u64 = fields[11].parse().unwrap_or(0);
+        let stime: u64 = fields[12].parse().unwrap_or(0);
+        let starttime: u64 = fields[19].parse().unwrap_or(0);
+        let rss_pages: u64 = fields[21].parse().unwrap_or(0);
+
+        let rss_kb = rss_pages * page_size / 1024;
+
+        // CPU%: lifetime average
+        let uptime_ticks = (uptime_secs * clk_tck) as u64;
+        let elapsed_ticks = uptime_ticks.saturating_sub(starttime);
+        let cpu_pct = if elapsed_ticks > 0 {
+            ((utime + stime) as f64 / elapsed_ticks as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        // /proc/{pid}/cmdline: NUL-separated
+        let command = fs::read_to_string(format!("/proc/{pid}/cmdline"))
+            .unwrap_or_default()
+            .replace('\0', " ")
+            .trim()
+            .to_string();
+        if command.is_empty() {
+            continue; // kernel thread, skip
+        }
+
+        map.insert(pid, ProcInfo { pid, ppid, rss_kb, cpu_pct, command });
+    }
+    map
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn get_process_info() -> HashMap<u32, ProcInfo> {
     let mut map = HashMap::new();
     let output = Command::new("ps")
