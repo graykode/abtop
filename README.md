@@ -1,6 +1,6 @@
 # abtop
 
-**Like htop, but for your AI coding agents.**
+**Like [btop](https://github.com/aristocratos/btop), but for your AI coding agents.**
 
 See every Claude Code and Codex CLI session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
 
