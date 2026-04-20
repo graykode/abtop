@@ -706,9 +706,13 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                     result.total_output += out;
                                     result.total_cache_read += cr;
                                     result.total_cache_create += cc;
-                                    // Context = last turn's total input (this is what the model "sees")
+                                    // Context = what the model actually "sees" in its window:
+                                    // input_tokens (fresh) + cache_read (reused from cache).
+                                    // cache_creation is excluded — it's a write-side cost for
+                                    // future requests, not content in the current context window.
+                                    // Including it caused context_percent > 100% (#54).
                                     let prev_context = result.last_context_tokens;
-                                    result.last_context_tokens = inp + cr + cc;
+                                    result.last_context_tokens = inp + cr;
                                     if result.last_context_tokens > result.max_context_tokens {
                                         result.max_context_tokens = result.last_context_tokens;
                                     }
@@ -997,7 +1001,7 @@ mod tests {
         assert_eq!(result.total_cache_create, 30);
         assert_eq!(result.model, "claude-sonnet-4-6");
         assert_eq!(result.turn_count, 1);
-        assert_eq!(result.last_context_tokens, 330); // 100 + 200 + 30
+        assert_eq!(result.last_context_tokens, 300); // 100 + 200 (cache_creation excluded)
     }
 
     #[test]
