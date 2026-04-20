@@ -84,6 +84,7 @@ tmux new -s work
 
 `pi` = [`@mariozechner/pi-coding-agent`](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent).
 Rate limit is `—` because pi is provider-agnostic — users bring their own API keys, so there's no account-level quota to surface.
+If a pi process has started but hasn't persisted its first assistant response yet, abtop shows a temporary pending session row with zero tokens until the real JSONL session file appears.
 
 ## Themes
 

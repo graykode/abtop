@@ -195,8 +195,10 @@ wrapped in `--...--`. Example: `/Users/demo/proj` → `--Users-demo-proj--`.
 Discovery strategy:
 1. Find running `pi` processes via `ps` (matches `pi-coding-agent` in argv path, or
    `pi` binary — pi sets `process.title = "pi"` in cli.ts)
-2. Map PID → open `*.jsonl` under `.pi/agent/sessions/` via `lsof`
-3. Parse JSONL: first line is `{"type":"session",...}` header, subsequent lines are
+2. Prefer PID → open `*.jsonl` under `.pi/agent/sessions/` via `lsof`
+3. If no JSONL fd is open (idle session), use process cwd → inferred session dir → newest matching JSONL
+4. If the session dir exists but no JSONL exists yet, synthesize a **pending** pi session from process metadata
+5. Parse JSONL: first line is `{"type":"session",...}` header, subsequent lines are
    tree-structured entries with `id` / `parentId`
 
 Key line types (pi session v3):
@@ -211,6 +213,10 @@ Key line types (pi session v3):
 Pi is provider-agnostic (Anthropic, OpenAI, Google, Groq, local) so there is
 **no rate-limit telemetry**. Context window is inferred from model name via the
 same table abtop uses for Claude.
+
+Pi persistence nuance:
+- Pi creates the per-cwd session directory immediately, but may not create the JSONL file until the first assistant response is persisted.
+- abtop therefore shows a synthetic pending pi session (`pending-pi-{pid}`) before the real JSONL exists.
 
 ### 10. Other files
 - `~/.claude/stats-cache.json` — daily aggregates. Only updated on `/stats`, NOT real-time.
@@ -232,12 +238,15 @@ same table abtop uses for Claude.
 Current task (2nd line under each session):
 - Working → last `tool_use` name + first arg (e.g. `Edit src/main.rs`)
 - Waiting → "waiting for user input"
+- Pending pi (working) → "starting session"
+- Pending pi (waiting) → "waiting for first assistant response"
 - Error → last error message (truncated)
 - Done → "finished {duration} ago"
 
 **Known limitations** (all heuristic):
 - Cannot distinguish model-thinking vs tool-executing vs rate-limit-waiting vs permission-prompt
 - "Waiting" may be wrong if a long-running tool (cargo build, npm test) is running
+- Pending pi sessions before the first assistant response are synthetic placeholders, so model / prompt / token totals are unknown until the real JSONL appears
 - Status is best-effort, not authoritative
 
 ## Session Summary Generation

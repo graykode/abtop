@@ -14,7 +14,8 @@ use std::process::Command;
 /// 1. `ps` → find running `pi` processes (binary sets `process.title = "pi"`,
 ///    installs as `node .../pi-coding-agent/dist/cli.js`)
 /// 2. `lsof` → map PID → open `~/.pi/agent/sessions/--<cwd-encoded>--/<ts>_<uuid>.jsonl`
-/// 3. Parse JSONL: SessionHeader + tree-structured entries
+/// 3. Fallback for idle sessions: use process cwd → inferred session dir → newest JSONL
+/// 4. Parse JSONL: SessionHeader + tree-structured entries
 ///
 /// JSONL schema (pi session v3, docs/session.md):
 /// - Line 1: `{"type":"session","version":3,"id":"uuid","timestamp":"...","cwd":"..."}`
@@ -29,6 +30,11 @@ use std::process::Command;
 /// users bring their own Anthropic/OpenAI/Gemini keys. `live_rate_limit()` returns None.
 pub struct PiCollector {
     sessions_root: PathBuf,
+}
+
+struct PiProcessState {
+    cwd: Option<PathBuf>,
+    session_jsonl: Option<PathBuf>,
 }
 
 impl PiCollector {
@@ -50,14 +56,30 @@ impl PiCollector {
             return vec![];
         }
 
-        // Step 2: map PID → open session JSONL file via lsof
-        let pid_to_jsonl = Self::map_pid_to_jsonl(&pi_pids);
+        // Step 2: inspect per-process cwd + session JSONL. Prefer a real JSONL,
+        // but keep cwd so we can synthesize a pending session before the first
+        // assistant response has been persisted to disk.
+        let proc_states = self.inspect_pi_processes(&pi_pids);
 
         let mut sessions = Vec::new();
-        for (pid, jsonl_path) in &pid_to_jsonl {
-            if let Some(session) = self.load_session(
-                *pid,
-                jsonl_path,
+        for pid in pi_pids {
+            let state = proc_states.get(&pid);
+            if let Some(jsonl_path) = state.and_then(|s| s.session_jsonl.as_ref()) {
+                if let Some(session) = self.load_session(
+                    pid,
+                    jsonl_path,
+                    &shared.process_info,
+                    &shared.children_map,
+                    &shared.ports,
+                ) {
+                    sessions.push(session);
+                    continue;
+                }
+            }
+
+            if let Some(session) = self.build_pending_session(
+                pid,
+                state.and_then(|s| s.cwd.as_deref()),
                 &shared.process_info,
                 &shared.children_map,
                 &shared.ports,
@@ -91,18 +113,31 @@ impl PiCollector {
         pids
     }
 
-    /// Map pi PIDs to their open session JSONL files via lsof.
+    /// Inspect running pi processes and gather both cwd and session JSONL.
     ///
-    /// Pi writes to `~/.pi/agent/sessions/--<cwd>--/<ts>_<uuid>.jsonl`.
-    /// Match on `.pi/agent/sessions/` as the disambiguator.
-    fn map_pid_to_jsonl(pids: &[u32]) -> HashMap<u32, PathBuf> {
-        let mut map = HashMap::new();
+    /// Preferred path: use `lsof` to find an actually-open session JSONL.
+    /// Fallback: if pi is idle and has closed the JSONL fd, use the process cwd
+    /// to infer the session dir and pick the newest matching JSONL in it.
+    fn inspect_pi_processes(&self, pids: &[u32]) -> HashMap<u32, PiProcessState> {
+        let mut states: HashMap<u32, PiProcessState> = pids
+            .iter()
+            .copied()
+            .map(|pid| {
+                (
+                    pid,
+                    PiProcessState {
+                        cwd: None,
+                        session_jsonl: None,
+                    },
+                )
+            })
+            .collect();
         if pids.is_empty() {
-            return map;
+            return states;
         }
 
         let pid_args: Vec<String> = pids.iter().map(|p| format!("-p{}", p)).collect();
-        let mut args = vec!["-F", "pn"];
+        let mut args = vec!["-F", "pfn"];
         for pa in &pid_args {
             args.push(pa);
         }
@@ -112,21 +147,147 @@ impl PiCollector {
         if let Some(output) = output {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut current_pid: Option<u32> = None;
+            let mut current_fd: Option<String> = None;
             for line in stdout.lines() {
                 if let Some(pid_str) = line.strip_prefix('p') {
                     current_pid = pid_str.parse::<u32>().ok();
+                    current_fd = None;
+                } else if let Some(fd) = line.strip_prefix('f') {
+                    current_fd = Some(fd.to_string());
                 } else if let Some(name) = line.strip_prefix('n') {
-                    if let Some(pid) = current_pid {
-                        // Match pi session files specifically — avoid catching
-                        // unrelated .jsonl files the process might have open.
-                        if name.contains("/.pi/agent/sessions/") && name.ends_with(".jsonl") {
-                            map.insert(pid, PathBuf::from(name));
+                    let Some(pid) = current_pid else { continue };
+                    let Some(state) = states.get_mut(&pid) else {
+                        continue;
+                    };
+                    let path = PathBuf::from(name);
+
+                    if current_fd.as_deref() == Some("cwd") {
+                        state.cwd = Some(path);
+                        continue;
+                    }
+
+                    // Match pi session files specifically — avoid catching unrelated
+                    // .jsonl files the process might have open.
+                    if name.contains("/.pi/agent/sessions/")
+                        && name.ends_with(".jsonl")
+                        && !is_symlink(&path)
+                    {
+                        let replace = state
+                            .session_jsonl
+                            .as_ref()
+                            .is_none_or(|old| file_rank(&path) > file_rank(old));
+                        if replace {
+                            state.session_jsonl = Some(path);
                         }
                     }
                 }
             }
         }
-        map
+
+        // Fallback: idle pi processes may not keep their session JSONL open.
+        for state in states.values_mut() {
+            if state.session_jsonl.is_some() {
+                continue;
+            }
+            if let Some(cwd) = state.cwd.as_deref() {
+                state.session_jsonl = self.latest_session_for_cwd(cwd);
+            }
+        }
+
+        states
+    }
+
+    /// Find the newest session JSONL for a process cwd by reproducing pi's
+    /// session-dir naming convention and validating the header cwd.
+    fn latest_session_for_cwd(&self, cwd: &Path) -> Option<PathBuf> {
+        let dir_name = encode_session_dir(cwd)?;
+        let dir = self.sessions_root.join(dir_name);
+        let entries = fs::read_dir(&dir).ok()?;
+
+        let cwd_str = cwd.to_str()?;
+        let mut best: Option<PathBuf> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_symlink(&path) || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if read_session_header_cwd(&path).as_deref() != Some(cwd_str) {
+                continue;
+            }
+            let replace = best.as_ref().is_none_or(|old| file_rank(&path) > file_rank(old));
+            if replace {
+                best = Some(path);
+            }
+        }
+
+        best
+    }
+
+    fn build_pending_session(
+        &self,
+        pid: u32,
+        cwd: Option<&Path>,
+        process_info: &HashMap<u32, ProcInfo>,
+        children_map: &HashMap<u32, Vec<u32>>,
+        ports: &HashMap<u32, Vec<u16>>,
+    ) -> Option<AgentSession> {
+        let proc = process_info.get(&pid)?;
+        let cwd = cwd?;
+        let dir_name = encode_session_dir(cwd)?;
+        let session_dir = self.sessions_root.join(dir_name);
+        if !session_dir.is_dir() {
+            return None;
+        }
+
+        let cwd_str = cwd.to_str()?;
+        let project_name = cwd_str
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .unwrap_or("?")
+            .to_string();
+        let mem_mb = proc.rss_kb / 1024;
+        let status = session_status_for_pid(pid, process_info, children_map, None);
+        let current_tasks = if matches!(status, SessionStatus::Working) {
+            vec!["starting session".to_string()]
+        } else {
+            vec!["waiting for first assistant response".to_string()]
+        };
+        let children = collect_descendant_children(pid, process_info, children_map, ports);
+
+        Some(AgentSession {
+            agent_cli: "pi",
+            pid,
+            session_id: format!("pending-pi-{}", pid),
+            cwd: truncate_field(cwd_str, 4096),
+            project_name: truncate_field(&project_name, 256),
+            started_at: if proc.started_at_ms > 0 {
+                proc.started_at_ms
+            } else {
+                now_ms()
+            },
+            status,
+            model: "-".to_string(),
+            effort: String::new(),
+            context_percent: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_read: 0,
+            total_cache_create: 0,
+            turn_count: 0,
+            current_tasks,
+            mem_mb,
+            version: String::new(),
+            git_branch: String::new(),
+            git_added: 0,
+            git_modified: 0,
+            token_history: Vec::new(),
+            subagents: vec![],
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children,
+            initial_prompt: String::new(),
+            first_assistant_text: String::new(),
+        })
     }
 
     fn load_session(
@@ -156,21 +317,7 @@ impl PiCollector {
 
         // Status: pid is alive by construction (we found it via ps). Distinguish
         // Working (recent activity OR active descendant) vs Waiting.
-        let since_activity = std::time::SystemTime::now()
-            .duration_since(result.last_activity)
-            .unwrap_or_default();
-        let status = if since_activity.as_secs() < 30 {
-            SessionStatus::Working
-        } else {
-            let cpu_active = proc.is_some_and(|p| p.cpu_pct > 1.0);
-            let has_active_child =
-                process::has_active_descendant(pid, children_map, process_info, 5.0);
-            if cpu_active || has_active_child {
-                SessionStatus::Working
-            } else {
-                SessionStatus::Waiting
-            }
-        };
+        let status = session_status_for_pid(pid, process_info, children_map, Some(result.last_activity));
 
         let current_tasks = if !result.current_task.is_empty() {
             vec![result.current_task]
@@ -191,27 +338,7 @@ impl PiCollector {
             0.0
         };
 
-        // Collect descendant children (same pattern as Codex).
-        let mut children = Vec::new();
-        let mut stack: Vec<u32> = children_map.get(&pid).cloned().unwrap_or_default();
-        let mut visited = std::collections::HashSet::new();
-        while let Some(cpid) = stack.pop() {
-            if !visited.insert(cpid) {
-                continue;
-            }
-            if let Some(cproc) = process_info.get(&cpid) {
-                let port = ports.get(&cpid).and_then(|v| v.first().copied());
-                children.push(ChildProcess {
-                    pid: cpid,
-                    command: cproc.command.clone(),
-                    mem_kb: cproc.rss_kb,
-                    port,
-                });
-            }
-            if let Some(grandchildren) = children_map.get(&cpid) {
-                stack.extend(grandchildren);
-            }
-        }
+        let children = collect_descendant_children(pid, process_info, children_map, ports);
 
         // Redact + truncate the initial prompt before it reaches the TUI.
         let initial_prompt = super::redact_secrets(&truncate_field(&result.initial_prompt, 1024));
@@ -244,7 +371,7 @@ impl PiCollector {
             mem_line_count: 0,
             children,
             initial_prompt,
-            first_assistant_text: String::new(),
+            first_assistant_text: truncate_field(&result.first_assistant_text, 200),
         })
     }
 }
@@ -267,6 +394,7 @@ struct PiJSONLResult {
     current_task: String,
     last_activity: std::time::SystemTime,
     initial_prompt: String,
+    first_assistant_text: String,
     total_input: u64,
     total_output: u64,
     total_cache_read: u64,
@@ -321,6 +449,7 @@ fn parse_pi_jsonl(path: &Path) -> Option<PiJSONLResult> {
         current_task: String::new(),
         last_activity: std::time::UNIX_EPOCH,
         initial_prompt: String::new(),
+        first_assistant_text: String::new(),
         total_input: 0,
         total_output: 0,
         total_cache_read: 0,
@@ -409,6 +538,13 @@ fn parse_pi_jsonl(path: &Path) -> Option<PiJSONLResult> {
                                 }
                             }
                         }
+                        // Extract first assistant text (text blocks only) for the
+                        // shared summary-generation path used by Claude/Codex.
+                        if result.first_assistant_text.is_empty() {
+                            if let Some(text) = extract_assistant_text(msg) {
+                                result.first_assistant_text = truncate_field(&text, 200);
+                            }
+                        }
                         // Current task: latest toolCall in content array, if any.
                         if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
                             for block in content {
@@ -469,6 +605,36 @@ fn extract_user_text(msg: &Value) -> String {
     String::new()
 }
 
+/// Extract normalized assistant text from text blocks only.
+fn extract_assistant_text(msg: &Value) -> Option<String> {
+    let content = msg.get("content")?.as_array()?;
+    let texts: Vec<&str> = content
+        .iter()
+        .filter_map(|block| {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                block.get("text").and_then(|t| t.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if texts.is_empty() {
+        return None;
+    }
+    let normalized = texts
+        .join(" ")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
 /// Summarise a toolCall block for the "current task" line: `{name} {first-path-arg}`.
 fn format_tool_summary(name: &str, args: Option<&Value>) -> String {
     let arg_str = args
@@ -524,6 +690,66 @@ fn context_window_for_model(model: &str) -> u64 {
     200_000 // safe default
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn session_status_for_pid(
+    pid: u32,
+    process_info: &HashMap<u32, ProcInfo>,
+    children_map: &HashMap<u32, Vec<u32>>,
+    last_activity: Option<std::time::SystemTime>,
+) -> SessionStatus {
+    if let Some(last_activity) = last_activity {
+        let since_activity = std::time::SystemTime::now()
+            .duration_since(last_activity)
+            .unwrap_or_default();
+        if since_activity.as_secs() < 30 {
+            return SessionStatus::Working;
+        }
+    }
+
+    let cpu_active = process_info.get(&pid).is_some_and(|p| p.cpu_pct > 1.0);
+    let has_active_child = process::has_active_descendant(pid, children_map, process_info, 5.0);
+    if cpu_active || has_active_child {
+        SessionStatus::Working
+    } else {
+        SessionStatus::Waiting
+    }
+}
+
+fn collect_descendant_children(
+    pid: u32,
+    process_info: &HashMap<u32, ProcInfo>,
+    children_map: &HashMap<u32, Vec<u32>>,
+    ports: &HashMap<u32, Vec<u16>>,
+) -> Vec<ChildProcess> {
+    let mut children = Vec::new();
+    let mut stack: Vec<u32> = children_map.get(&pid).cloned().unwrap_or_default();
+    let mut visited = std::collections::HashSet::new();
+    while let Some(cpid) = stack.pop() {
+        if !visited.insert(cpid) {
+            continue;
+        }
+        if let Some(cproc) = process_info.get(&cpid) {
+            let port = ports.get(&cpid).and_then(|v| v.first().copied());
+            children.push(ChildProcess {
+                pid: cpid,
+                command: cproc.command.clone(),
+                mem_kb: cproc.rss_kb,
+                port,
+            });
+        }
+        if let Some(grandchildren) = children_map.get(&cpid) {
+            stack.extend(grandchildren);
+        }
+    }
+    children
+}
+
 /// Truncate a string at a UTF-8 char boundary to `max_bytes` bytes.
 /// Matches the hardening pattern in `model/session.rs::truncate_string` and
 /// `opencode.rs`.
@@ -536,6 +762,40 @@ fn truncate_field(s: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     s[..end].to_string()
+}
+
+/// Pi encodes `/Users/foo/bar` as `--Users-foo-bar--` for its session dirs.
+fn encode_session_dir(cwd: &Path) -> Option<String> {
+    let cwd = cwd.to_str()?;
+    Some(format!("--{}--", cwd.trim_start_matches('/').replace('/', "-")))
+}
+
+/// Read the header cwd from a pi session JSONL file.
+fn read_session_header_cwd(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut first = String::new();
+    reader.read_line(&mut first).ok()?;
+    let v: Value = serde_json::from_str(&first).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("session") {
+        return None;
+    }
+    v.get("cwd").and_then(|c| c.as_str()).map(str::to_string)
+}
+
+/// Rank candidate session files: newer mtime wins, file name breaks ties.
+fn file_rank(path: &Path) -> (u64, String) {
+    let modified = fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    (modified, name)
 }
 
 /// Check if a path is a symlink without following it.
@@ -560,6 +820,7 @@ mod tests {
                 ppid: 1,
                 rss_kb: 50_000,
                 cpu_pct: 0.5,
+                started_at_ms: 1_733_234_400_000,
                 command: "node /usr/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js"
                     .to_string(),
             },
@@ -571,6 +832,7 @@ mod tests {
                 ppid: 1,
                 rss_kb: 10_000,
                 cpu_pct: 0.0,
+                started_at_ms: 1_733_234_400_000,
                 command: "pip install requests".to_string(), // must NOT match
             },
         );
@@ -581,6 +843,7 @@ mod tests {
                 ppid: 1,
                 rss_kb: 5_000,
                 cpu_pct: 0.0,
+                started_at_ms: 1_733_234_400_000,
                 command: "grep pi-coding-agent".to_string(), // must NOT match
             },
         );
@@ -591,6 +854,7 @@ mod tests {
                 ppid: 1,
                 rss_kb: 20_000,
                 cpu_pct: 0.0,
+                started_at_ms: 1_733_234_400_000,
                 command: "pi --resume".to_string(), // binary-name match
             },
         );
@@ -621,6 +885,14 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_session_dir() {
+        assert_eq!(
+            encode_session_dir(Path::new("/Users/pirate/code/abtop")).as_deref(),
+            Some("--Users-pirate-code-abtop--")
+        );
+    }
+
+    #[test]
     fn test_context_window_for_model() {
         assert_eq!(context_window_for_model("claude-sonnet-4-5"), 200_000);
         assert_eq!(context_window_for_model("claude-opus-4-6[1m]"), 1_000_000);
@@ -641,6 +913,18 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_assistant_text() {
+        let msg: Value = serde_json::from_str(
+            r#"{"content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"First line"},{"type":"text","text":"Second line"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_assistant_text(&msg).as_deref(),
+            Some("First line Second line")
+        );
+    }
+
+    #[test]
     fn test_format_tool_summary() {
         let args: Value =
             serde_json::from_str(r#"{"file_path":"src/main.rs","old":"x","new":"y"}"#).unwrap();
@@ -653,6 +937,82 @@ mod tests {
         );
 
         assert_eq!(format_tool_summary("read", None), "read");
+    }
+
+    #[test]
+    fn test_latest_session_for_cwd_uses_newest_matching_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let collector = PiCollector {
+            sessions_root: tmp.path().to_path_buf(),
+        };
+
+        let session_dir = tmp.path().join("--Users-demo-proj--");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let older = session_dir.join("2024-12-03T14-00-00-000Z_a.jsonl");
+        let newer = session_dir.join("2024-12-03T14-00-01-000Z_b.jsonl");
+        let wrong = session_dir.join("2024-12-03T14-00-02-000Z_c.jsonl");
+
+        fs::write(
+            &older,
+            r#"{"type":"session","version":3,"id":"old","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/Users/demo/proj"}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &newer,
+            r#"{"type":"session","version":3,"id":"new","timestamp":"2024-12-03T14:00:01.000Z","cwd":"/Users/demo/proj"}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &wrong,
+            r#"{"type":"session","version":3,"id":"wrong","timestamp":"2024-12-03T14:00:02.000Z","cwd":"/Users/other/proj"}
+"#,
+        )
+        .unwrap();
+
+        let found = collector.latest_session_for_cwd(Path::new("/Users/demo/proj"));
+        assert_eq!(found.as_deref(), Some(newer.as_path()));
+    }
+
+    #[test]
+    fn test_build_pending_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let collector = PiCollector {
+            sessions_root: tmp.path().to_path_buf(),
+        };
+        let session_dir = tmp.path().join("--Users-demo-proj--");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let mut process_info = HashMap::new();
+        process_info.insert(
+            4242,
+            ProcInfo {
+                pid: 4242,
+                ppid: 1,
+                rss_kb: 64_000,
+                cpu_pct: 0.0,
+                started_at_ms: 1_733_234_400_000,
+                command: "pi".to_string(),
+            },
+        );
+
+        let session = collector.build_pending_session(
+            4242,
+            Some(Path::new("/Users/demo/proj")),
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let session = session.expect("pending pi session");
+        assert_eq!(session.agent_cli, "pi");
+        assert_eq!(session.session_id, "pending-pi-4242");
+        assert_eq!(session.cwd, "/Users/demo/proj");
+        assert_eq!(session.project_name, "proj");
+        assert_eq!(session.model, "-");
+        assert_eq!(session.total_tokens(), 0);
     }
 
     #[test]
@@ -679,6 +1039,7 @@ mod tests {
         assert_eq!(r.total_cache_write, 10);
         assert_eq!(r.last_context_tokens, 360);
         assert_eq!(r.initial_prompt, "Fix the bug in src/main.rs");
+        assert_eq!(r.first_assistant_text, "Looking at it now");
         assert_eq!(r.current_task, "read src/main.rs");
         assert_eq!(r.token_history, vec![160]); // input + output + cacheWrite
     }
