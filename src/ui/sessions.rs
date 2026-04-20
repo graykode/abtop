@@ -264,7 +264,7 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     widths_vec.extend([
         Constraint::Length(project_w),   // project
         Constraint::Length(session_w),   // session id
-        Constraint::Min(6),              // summary (fills remaining)
+        Constraint::Fill(1),             // summary (fills remaining)
         Constraint::Length(status_w),    // status
         Constraint::Length(model_w),     // model
         Constraint::Length(context_w),   // context

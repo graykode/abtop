@@ -14,15 +14,10 @@ const MAX_SUMMARY_RETRIES: u32 = 2;
 
 /// Produce a terminal-safe fallback summary from a raw prompt.
 fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
-    let cleaned: String = prompt.chars()
+    prompt.chars()
         .filter(|c| !c.is_control() || *c == ' ')
         .take(max_len)
-        .collect();
-    if prompt.chars().count() > max_len {
-        format!("{}…", cleaned)
-    } else {
-        cleaned
-    }
+        .collect()
 }
 
 /// Outcome of an Enter-key jump attempt. Distinct from `Option<String>` so
@@ -235,7 +230,7 @@ impl App {
                     *count += 1;
                     if *count >= MAX_SUMMARY_RETRIES {
                         // Exhausted — store sanitized fallback using prompt from worker
-                        self.summaries.insert(sid, sanitize_fallback(&prompt, 28));
+                        self.summaries.insert(sid, sanitize_fallback(&prompt, 80));
                         save_summary_cache(&self.summaries);
                     }
                 }
@@ -497,9 +492,9 @@ impl App {
         } else if matches!(session.status, SessionStatus::Done) {
             // Done sessions: don't wait for pending summary, show fallback immediately
             if !session.initial_prompt.is_empty() {
-                sanitize_fallback(&session.initial_prompt, 28)
+                sanitize_fallback(&session.initial_prompt, 80)
             } else if !session.first_assistant_text.is_empty() {
-                sanitize_fallback(&session.first_assistant_text, 28)
+                sanitize_fallback(&session.first_assistant_text, 80)
             } else {
                 "—".to_string()
             }
@@ -515,9 +510,9 @@ impl App {
             };
             dots.to_string()
         } else if !session.initial_prompt.is_empty() {
-            sanitize_fallback(&session.initial_prompt, 28)
+            sanitize_fallback(&session.initial_prompt, 80)
         } else if !session.first_assistant_text.is_empty() {
-            sanitize_fallback(&session.first_assistant_text, 28)
+            sanitize_fallback(&session.first_assistant_text, 80)
         } else {
             "—".to_string()
         }
@@ -557,7 +552,7 @@ fn generate_summary(prompt: &str, assistant_text: &str) -> Option<String> {
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return Some(sanitize_fallback(prompt, 28)),
+        Err(_) => return Some(sanitize_fallback(prompt, 80)),
     };
 
     // Write prompt via stdin (no shell injection)
@@ -584,7 +579,7 @@ fn generate_summary(prompt: &str, assistant_text: &str) -> Option<String> {
         }
     };
 
-    let fallback = sanitize_fallback(prompt, 28);
+    let fallback = sanitize_fallback(prompt, 80);
 
     match result {
         Ok(output) if output.status.success() => {
@@ -594,7 +589,7 @@ fn generate_summary(prompt: &str, assistant_text: &str) -> Option<String> {
             let lower = raw.to_lowercase();
             // Reject empty, too long, generic, or prompt-echo outputs
             if raw.is_empty()
-                || raw.chars().count() > 40
+                || raw.chars().count() > 80
                 || raw.contains("Summarize")
                 || raw.starts_with("- ")
                 || lower.contains("new conversation")
@@ -629,9 +624,11 @@ fn load_summary_cache() -> HashMap<String, String> {
         Ok(content) => {
             let mut cache: HashMap<String, String> =
                 serde_json::from_str(&content).unwrap_or_default();
-            // Purge entries polluted by generate_summary's own claude --print calls
+            // Purge polluted or old truncated-fallback entries so they regenerate
             let before = cache.len();
-            cache.retain(|_, v| !v.contains("You are a conversation tit"));
+            cache.retain(|_, v| {
+                !v.contains("You are a conversation tit") && !v.ends_with('…')
+            });
             if cache.len() < before {
                 // Persist cleaned cache
                 let _ = std::fs::create_dir_all(cache_dir());
