@@ -12,6 +12,20 @@ pub struct ProcInfo {
     pub command: String,
 }
 
+/// Resolve all symlinks in /proc/{pid}/fd, returning their targets.
+/// Used by both port discovery (socket inodes) and Codex JSONL discovery.
+#[cfg(target_os = "linux")]
+pub fn scan_proc_fds(pid: u32) -> Vec<std::path::PathBuf> {
+    let fd_dir = format!("/proc/{}/fd", pid);
+    let entries = match fs::read_dir(&fd_dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+    entries.flatten()
+        .filter_map(|e| fs::read_link(e.path()).ok())
+        .collect()
+}
+
 #[cfg(target_os = "linux")]
 pub fn get_process_info() -> HashMap<u32, ProcInfo> {
     let mut map = HashMap::new();
@@ -59,7 +73,11 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
 
         let rss_kb = rss_pages * page_size / 1024;
 
-        // CPU%: lifetime average
+        // CPU%: lifetime average (total CPU time / wall time).
+        // This differs from ps's instantaneous %CPU but is sufficient for
+        // abtop's Working/Waiting threshold (cpu_pct > 1.0). A long-idle
+        // process that was busy at startup will show a declining average,
+        // eventually dropping below 1.0 as elapsed time grows.
         let uptime_ticks = (uptime_secs * clk_tck) as u64;
         let elapsed_ticks = uptime_ticks.saturating_sub(starttime);
         let cpu_pct = if elapsed_ticks > 0 {
@@ -149,6 +167,68 @@ pub fn has_active_descendant(
     false
 }
 
+/// On Linux, parse /proc/net/tcp[6] for LISTEN sockets, then match inodes
+/// via scan_proc_fds. Only scans FDs for PIDs in `known_pids` (from
+/// get_process_info) to avoid scanning all 500+ /proc entries.
+#[cfg(target_os = "linux")]
+pub fn get_listening_ports() -> HashMap<u32, Vec<u16>> {
+    // Step 1: Parse /proc/net/tcp + tcp6 for LISTEN sockets -> inode -> port
+    let mut inode_to_port: HashMap<u64, u16> = HashMap::new();
+    for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(content) = fs::read_to_string(path) {
+            for line in content.lines().skip(1) {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() < 10 || fields[3] != "0A" {
+                    continue;
+                }
+                if let Some(port_hex) = fields[1].rsplit(':').next() {
+                    if let Ok(port) = u16::from_str_radix(port_hex, 16) {
+                        if let Ok(inode) = fields[9].parse::<u64>() {
+                            inode_to_port.insert(inode, port);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if inode_to_port.is_empty() {
+        return HashMap::new();
+    }
+
+    // Step 2: Scan FDs of all PIDs for matching socket inodes.
+    // We scan all /proc PIDs rather than just known agent PIDs because
+    // child processes (servers, databases) that own ports may not be in
+    // the agent PID set but are still relevant for orphan port detection.
+    let mut map: HashMap<u32, Vec<u16>> = HashMap::new();
+    let proc_entries = match fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return map,
+    };
+
+    for entry in proc_entries.flatten() {
+        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        for target in scan_proc_fds(pid) {
+            let target_str = target.to_string_lossy();
+            if let Some(inode_str) = target_str
+                .strip_prefix("socket:[")
+                .and_then(|s| s.strip_suffix(']'))
+            {
+                if let Ok(inode) = inode_str.parse::<u64>() {
+                    if let Some(&port) = inode_to_port.get(&inode) {
+                        map.entry(pid).or_default().push(port);
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn get_listening_ports() -> HashMap<u32, Vec<u16>> {
     let mut map: HashMap<u32, Vec<u16>> = HashMap::new();
     let output = Command::new("lsof")
@@ -160,9 +240,8 @@ pub fn get_listening_ports() -> HashMap<u32, Vec<u16>> {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines().skip(1) {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            let is_tcp_listen = parts.len() >= 9
-                && parts[7] == "TCP"
-                && line.contains("(LISTEN)");
+            let is_tcp_listen =
+                parts.len() >= 9 && parts[7] == "TCP" && line.contains("(LISTEN)");
             if is_tcp_listen {
                 if let Ok(pid) = parts[1].parse::<u32>() {
                     if let Some(addr) = parts.get(8) {
