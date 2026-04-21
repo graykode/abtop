@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "linux"))]
 use std::process::Command;
 
 /// Collector for OpenAI Codex CLI sessions.
@@ -293,41 +294,63 @@ impl CodexCollector {
         pids
     }
 
-    /// Map codex PIDs to their open rollout-*.jsonl files via lsof.
+    /// Map codex PIDs to their open rollout-*.jsonl files.
+    ///
+    /// On Linux, scans /proc/{pid}/fd symlinks directly (no process spawn).
+    /// Falls back to lsof on other platforms.
     fn map_pid_to_jsonl(pids: &[u32]) -> HashMap<u32, PathBuf> {
         let mut map = HashMap::new();
         if pids.is_empty() {
             return map;
         }
 
-        // Build lsof command for all PIDs at once
-        let pid_args: Vec<String> = pids.iter().map(|p| format!("-p{}", p)).collect();
-        let mut args = vec!["-F", "pn"];
-        for pa in &pid_args {
-            args.push(pa);
+        #[cfg(target_os = "linux")]
+        {
+            for &pid in pids {
+                for target in process::scan_proc_fds(pid) {
+                    let is_rollout = target.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"));
+                    if is_rollout {
+                        map.insert(pid, target);
+                        break;
+                    }
+                }
+            }
+            map
         }
 
-        let output = Command::new("lsof")
-            .args(&args)
-            .output()
-            .ok();
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Fallback: lsof on macOS and other platforms
+            let pid_args: Vec<String> = pids.iter().map(|p| format!("-p{}", p)).collect();
+            let mut args = vec!["-F", "pn"];
+            for pa in &pid_args {
+                args.push(pa);
+            }
 
-        if let Some(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut current_pid: Option<u32> = None;
-            for line in stdout.lines() {
-                if let Some(pid_str) = line.strip_prefix('p') {
-                    current_pid = pid_str.parse::<u32>().ok();
-                } else if let Some(name) = line.strip_prefix('n') {
-                    if let Some(pid) = current_pid {
-                        if name.contains("rollout-") && name.ends_with(".jsonl") {
-                            map.insert(pid, PathBuf::from(name));
+            let output = Command::new("lsof")
+                .args(&args)
+                .output()
+                .ok();
+
+            if let Some(output) = output {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut current_pid: Option<u32> = None;
+                for line in stdout.lines() {
+                    if let Some(pid_str) = line.strip_prefix('p') {
+                        current_pid = pid_str.parse::<u32>().ok();
+                    } else if let Some(name) = line.strip_prefix('n') {
+                        if let Some(pid) = current_pid {
+                            if name.contains("rollout-") && name.ends_with(".jsonl") {
+                                map.insert(pid, PathBuf::from(name));
+                            }
                         }
                     }
                 }
             }
+            map
         }
-        map
     }
 
 }
