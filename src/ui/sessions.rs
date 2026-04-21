@@ -382,7 +382,16 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
 
         let has_children = !session.children.is_empty();
         let has_subagents = !session.subagents.is_empty();
-        let has_timeline = app.show_timeline && !session.tool_calls.is_empty();
+        let has_tool_calls = !session.tool_calls.is_empty();
+        // Focus mode (L): full-width timeline in an enlarged detail area.
+        let timeline_focused = app.show_timeline && has_tool_calls;
+        // Default split: when not focused, show a compact timeline in the right
+        // half of the lower area — but only if the terminal is wide enough that
+        // both halves remain readable (draw_timeline reserves 42 cols for labels).
+        const TIMELINE_SPLIT_MIN_WIDTH: u16 = 120;
+        let timeline_side_by_side = !app.show_timeline
+            && has_tool_calls
+            && detail_body.width >= TIMELINE_SPLIT_MIN_WIDTH;
 
         // Always show SESSION header (task) at top, then children/subagents/timeline below
         let session_header_h: u16 = {
@@ -390,7 +399,11 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
             if !session.initial_prompt.is_empty() { h += 1; }
             h
         };
-        let (header_area, lower_area) = if has_timeline || has_children || has_subagents {
+        let has_lower = timeline_focused
+            || timeline_side_by_side
+            || has_children
+            || has_subagents;
+        let (header_area, lower_area) = if has_lower {
             let parts = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -423,21 +436,43 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
             f.render_widget(Paragraph::new(lines), header_area);
         }
 
-        // Timeline OR Children + Subagents below session header
+        // Layout below the session header:
+        //   - focus mode (L): full-width timeline
+        //   - wide terminal with tool calls: left = children/subagents, right = compact timeline
+        //   - otherwise: children/subagents only (or nothing)
         if let Some(lower) = lower_area {
-            if has_timeline {
+            if timeline_focused {
                 draw_timeline(f, session, lower, theme, app.timeline_scroll);
-            } else if has_children || has_subagents {
+            } else {
+            // Split 50/50 whenever the side-by-side timeline is active, even if
+            // there's no left content — consistent layout beats saving the empty
+            // half, and sessions that gain/lose children at runtime shouldn't
+            // make the timeline flicker between full- and half-width.
+            let (left_area, right_timeline_area) = if timeline_side_by_side {
+                let split = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(lower);
+                (split[0], Some(split[1]))
+            } else {
+                (lower, None)
+            };
+
+            if let Some(tl_area) = right_timeline_area {
+                draw_timeline(f, session, tl_area, theme, app.timeline_scroll);
+            }
+
+            if has_children || has_subagents {
             let body_chunks = if has_children && has_subagents {
                 Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-                    .split(lower)
+                    .split(left_area)
             } else {
                 Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(100)])
-                    .split(lower)
+                    .split(left_area)
             };
 
             // Children (left side)
@@ -549,6 +584,7 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                 f.render_widget(Paragraph::new(lines), sa_area);
             }
             } // end if has_children || has_subagents
+            } // end else (timeline not focused)
         }
 
         // Footer: MEM + version (full width)
