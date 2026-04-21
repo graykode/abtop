@@ -306,22 +306,13 @@ impl CodexCollector {
         #[cfg(target_os = "linux")]
         {
             for &pid in pids {
-                let fd_dir = format!("/proc/{}/fd", pid);
-                let entries = match fs::read_dir(&fd_dir) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                for entry in entries.flatten() {
-                    if let Ok(target) = fs::read_link(entry.path()) {
-                        // Match on the file name component to avoid lossy UTF-8
-                        // conversion issues on the full path.
-                        let is_rollout = target.file_name()
-                            .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"));
-                        if is_rollout {
-                            map.insert(pid, target);
-                            break;
-                        }
+                for target in process::scan_proc_fds(pid) {
+                    let is_rollout = target.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"));
+                    if is_rollout {
+                        map.insert(pid, target);
+                        break;
                     }
                 }
             }
