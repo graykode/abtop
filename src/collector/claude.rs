@@ -217,7 +217,7 @@ impl ClaudeCollector {
         let empty_result = TranscriptResult {
             model: "-".to_string(),
             total_input: 0, total_output: 0, total_cache_read: 0, total_cache_create: 0,
-            last_context_tokens: 0, max_context_tokens: 0, turn_count: 0, current_task: String::new(),
+            last_context_tokens: 0, max_context_tokens: 0, context_history: Vec::new(), compaction_count: 0, turn_count: 0, current_task: String::new(),
             version: String::new(), git_branch: String::new(),
             last_activity: std::time::UNIX_EPOCH, new_offset: 0,
             file_identity: (0, 0),
@@ -239,6 +239,8 @@ impl ClaudeCollector {
         let git_branch = cached.git_branch.clone();
         let last_activity = cached.last_activity;
         let token_history = cached.token_history.clone();
+        let context_history = cached.context_history.clone();
+        let compaction_count = cached.compaction_count;
         let initial_prompt = cached.initial_prompt.clone();
         let first_assistant_text = cached.first_assistant_text.clone();
 
@@ -368,6 +370,9 @@ impl ClaudeCollector {
             git_added,
             git_modified,
             token_history,
+            context_history,
+            compaction_count,
+            context_window,
             subagents,
             mem_file_count,
             mem_line_count,
@@ -546,6 +551,10 @@ struct TranscriptResult {
     last_context_tokens: u64,
     /// High-water mark: largest context seen in any turn (for 1M detection)
     max_context_tokens: u64,
+    /// Per-turn context sizes for evolution visualization.
+    context_history: Vec<u64>,
+    /// Detected compaction events (context dropped > 30% between consecutive turns).
+    compaction_count: u32,
     turn_count: u32,
     current_task: String,
     version: String,
@@ -595,6 +604,8 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
         total_cache_create: 0,
         last_context_tokens: 0,
         max_context_tokens: 0,
+        context_history: Vec::new(),
+        compaction_count: 0,
         turn_count: 0,
         current_task: String::new(),
         version: String::new(),
@@ -695,10 +706,23 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                     result.total_output += out;
                                     result.total_cache_read += cr;
                                     result.total_cache_create += cc;
-                                    // Context = last turn's total input (this is what the model "sees")
-                                    result.last_context_tokens = inp + cr + cc;
+                                    // Context = what the model actually "sees" in its window:
+                                    // input_tokens (fresh) + cache_read (reused from cache).
+                                    // cache_creation is excluded — it's a write-side cost for
+                                    // future requests, not content in the current context window.
+                                    // Including it caused context_percent > 100% (#54).
+                                    let prev_context = result.last_context_tokens;
+                                    result.last_context_tokens = inp + cr;
                                     if result.last_context_tokens > result.max_context_tokens {
                                         result.max_context_tokens = result.last_context_tokens;
+                                    }
+                                    // Detect compaction: context drops > 30% between turns
+                                    if prev_context > 0 && result.last_context_tokens < prev_context * 7 / 10 {
+                                        result.compaction_count += 1;
+                                    }
+                                    // Track context evolution (cap to prevent OOM)
+                                    if result.context_history.len() < 10_000 {
+                                        result.context_history.push(result.last_context_tokens);
                                     }
                                     // Track per-turn total tokens for sparkline (cap to prevent OOM)
                                     if result.token_history.len() < 10_000 {
@@ -977,7 +1001,7 @@ mod tests {
         assert_eq!(result.total_cache_create, 30);
         assert_eq!(result.model, "claude-sonnet-4-6");
         assert_eq!(result.turn_count, 1);
-        assert_eq!(result.last_context_tokens, 330); // 100 + 200 + 30
+        assert_eq!(result.last_context_tokens, 300); // 100 + 200 (cache_creation excluded)
     }
 
     #[test]

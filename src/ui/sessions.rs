@@ -20,8 +20,12 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         height: area.height.saturating_sub(2),
     };
 
-    // Session list: 1 header + 2 rows per session (main + 1 task line)
-    let session_rows: u16 = app.sessions.len() as u16 * 2;
+    // Session list: 1 header + 2 rows per visible session, plus subagent rows in tree view.
+    let visible = app.visible_indices();
+    let session_rows: u16 = visible.iter().map(|&i| {
+        let base = 2u16;
+        if app.tree_view { base + app.sessions[i].subagents.len() as u16 } else { base }
+    }).sum();
     // Fixed detail height: keeps the detail panel stable regardless of content
     let detail_reserve: u16 = 10.min(inner.height / 2);
     let max_table = inner.height.saturating_sub(detail_reserve);
@@ -77,7 +81,9 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     let context_label = if w >= 100 { "Context" } else { "Ctx" };
     let tokens_w: u16 = if w >= 100 { 7 } else { 5 };
 
-    for (i, session) in app.sessions.iter().enumerate() {
+    let visible = app.visible_indices();
+    for &i in &visible {
+        let session = &app.sessions[i];
         let selected = i == app.selected;
         let marker = if selected { "►" } else { " " };
 
@@ -209,6 +215,45 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
             })
             .collect();
         rows.push(Row::new(task_cells).height(1));
+
+        // Tree view: show subagents as indented rows
+        if app.tree_view && !session.subagents.is_empty() {
+            for (sa_idx, sa) in session.subagents.iter().enumerate() {
+                let is_last = sa_idx == session.subagents.len() - 1;
+                // Tree connector fits the 3-wide agent column (was truncated before).
+                let prefix = if is_last { "└─" } else { "├─" };
+                let is_working = sa.status.eq_ignore_ascii_case("working")
+                    || sa.status.eq_ignore_ascii_case("in_progress");
+                let icon = if is_working { "●" } else { "✓" };
+                let sa_fg = if is_working { theme.proc_misc } else { theme.inactive_fg };
+
+                let mut sa_cells: Vec<Cell> = vec![
+                    Cell::from(""),
+                    Cell::from(Span::styled(prefix, Style::default().fg(theme.div_line))),
+                ];
+                if show_pid {
+                    sa_cells.push(Cell::from(""));
+                }
+                sa_cells.extend([
+                    Cell::from(Span::styled(
+                        truncate_str(&sa.name, project_w as usize),
+                        Style::default().fg(theme.graph_text),
+                    )),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(Span::styled(icon, Style::default().fg(sa_fg))),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(Span::styled(
+                        fmt_tokens(sa.tokens),
+                        Style::default().fg(theme.graph_text),
+                    )),
+                ]);
+                if show_memory { sa_cells.push(Cell::from("")); }
+                if show_turn { sa_cells.push(Cell::from("")); }
+                rows.push(Row::new(sa_cells).height(1));
+            }
+        }
     }
 
     let header_style = Style::default()
@@ -258,8 +303,9 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         widths_vec.push(Constraint::Length(4)); // turn
     }
 
-    // Scroll: each session = 2 rows. Ensure selected session is visible.
-    let total_rows = app.sessions.len() * 2;
+    // Scroll: rows vary per session in tree view; use the built row list as the source of truth.
+    let visible_sessions = app.visible_indices();
+    let total_rows = rows.len();
     let needs_scroll = total_rows > panel_chunks[0].height.saturating_sub(1) as usize;
 
     // Split table area into [table | scrollbar(1)] when scrollable
@@ -278,8 +324,17 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     }
 
     let visible_rows = table_area.height.saturating_sub(1) as usize; // -1 for header
-    let selected_row_start = app.selected * 2;
-    let selected_row_end = selected_row_start + 2;
+    // Row offset for the selected session, accounting for subagent rows in tree view
+    // and filter-hidden sessions above it.
+    let selected_pos = visible_sessions.iter().position(|&i| i == app.selected).unwrap_or(0);
+    let selected_row_start: usize = visible_sessions.iter().take(selected_pos).map(|&i| {
+        let base = 2;
+        if app.tree_view { base + app.sessions[i].subagents.len() } else { base }
+    }).sum();
+    let selected_session_rows = if app.tree_view {
+        2 + app.sessions.get(app.selected).map_or(0, |s| s.subagents.len())
+    } else { 2 };
+    let selected_row_end = selected_row_start + selected_session_rows;
     let scroll_offset = selected_row_end.saturating_sub(visible_rows);
     let visible = if scroll_offset < rows.len() {
         rows.into_iter().skip(scroll_offset).collect::<Vec<_>>()
@@ -573,6 +628,24 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                     ),
                     Style::default().fg(mem_color),
                 )));
+            }
+            // Context evolution sparkline (if history available)
+            if !session.context_history.is_empty() && session.context_window > 0 {
+                let normalized: Vec<f64> = session.context_history.iter()
+                    .map(|&v| (v as f64 / session.context_window as f64).min(1.0))
+                    .collect();
+                let spark_w = (detail_footer.width as usize).saturating_sub(16).clamp(4, 40);
+                let mut ctx_spans = vec![
+                    Span::styled(" CTX ", Style::default().fg(theme.graph_text)),
+                ];
+                ctx_spans.extend(super::braille_sparkline(&normalized, spark_w, &cpu_grad, theme.graph_text));
+                if session.compaction_count > 0 {
+                    ctx_spans.push(Span::styled(
+                        format!(" C{}", session.compaction_count),
+                        Style::default().fg(grad_at(&cpu_grad, 80.0)),
+                    ));
+                }
+                footer_lines.push(Line::from(ctx_spans));
             }
             let effort_part = if session.effort.is_empty() {
                 String::new()

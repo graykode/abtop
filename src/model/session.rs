@@ -76,6 +76,12 @@ pub struct AgentSession {
     pub git_added: u32,
     pub git_modified: u32,
     pub token_history: Vec<u64>,
+    /// Per-turn context size (input tokens) for context evolution visualization.
+    pub context_history: Vec<u64>,
+    /// Number of detected compaction events (context dropped > 30% between turns).
+    pub compaction_count: u32,
+    /// Context window size for this session's model (e.g. 200K, 1M).
+    pub context_window: u64,
     pub subagents: Vec<SubAgent>,
     pub mem_file_count: u32,
     pub mem_line_count: u32,
@@ -175,6 +181,9 @@ mod tests {
             git_added: 0,
             git_modified: 0,
             token_history: Vec::new(),
+            context_history: Vec::new(),
+            compaction_count: 0,
+            context_window: 0,
             subagents: Vec::new(),
             mem_file_count: 0,
             mem_line_count: 0,

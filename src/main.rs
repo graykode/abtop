@@ -7,7 +7,7 @@ mod setup;
 mod theme;
 mod ui;
 
-use app::App;
+use app::{App, JumpOutcome};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
@@ -68,6 +68,7 @@ fn main() -> io::Result<()> {
         });
 
     let demo_mode = std::env::args().any(|a| a == "--demo");
+    let exit_on_jump = std::env::args().any(|a| a == "--exit-on-jump");
 
     // --once flag: print snapshot and exit
     if std::env::args().any(|a| a == "--once") {
@@ -95,7 +96,7 @@ fn main() -> io::Result<()> {
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let app_result = run_app(&mut terminal, demo_mode, initial_theme);
+    let app_result = run_app(&mut terminal, demo_mode, initial_theme, exit_on_jump);
 
     // Always attempt both cleanup steps regardless of app result
     let r1 = disable_raw_mode();
@@ -105,7 +106,7 @@ fn main() -> io::Result<()> {
     app_result.and(r1).and(r2)
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, demo_mode: bool, initial_theme: Option<theme::Theme>) -> io::Result<()> {
+fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, demo_mode: bool, initial_theme: Option<theme::Theme>, exit_on_jump: bool) -> io::Result<()> {
     let mut app = App::new(initial_theme.unwrap_or_default());
     if demo_mode {
         demo::populate_demo(&mut app);
@@ -132,6 +133,16 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, demo_mode: boo
                             KeyCode::Enter | KeyCode::Char(' ') => app.config_toggle_selected(),
                             _ => {}
                         }
+                    } else if app.filter_active {
+                        match key.code {
+                            KeyCode::Esc => app.clear_filter(),
+                            KeyCode::Enter => app.filter_active = false,
+                            KeyCode::Backspace => app.filter_pop(),
+                            KeyCode::Down => app.select_next(),
+                            KeyCode::Up => app.select_prev(),
+                            KeyCode::Char(c) => app.filter_push(c),
+                            _ => {}
+                        }
                     } else {
                         match key.code {
                             KeyCode::Char('q') => app.quit(),
@@ -141,11 +152,16 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, demo_mode: boo
                             KeyCode::Char('x') if !demo_mode => app.kill_selected(),
                             KeyCode::Char('X') if !demo_mode => app.kill_orphan_ports(),
                             KeyCode::Char('t') => app.cycle_theme(),
+                            KeyCode::Char('T') => app.tree_view = !app.tree_view,
                             KeyCode::Char(c @ '1'..='5') => app.toggle_panel(c as u8 - b'0'),
                             KeyCode::Char('c') => app.toggle_config(),
+                            KeyCode::Char('/') => app.filter_active = true,
+                            KeyCode::Esc if !app.filter_text.is_empty() => app.clear_filter(),
                             KeyCode::Enter if !demo_mode => {
-                                if let Some(msg) = app.jump_to_session() {
-                                    app.set_status(msg);
+                                match app.jump_to_session() {
+                                    JumpOutcome::Jumped if exit_on_jump => app.quit(),
+                                    JumpOutcome::Failed(msg) => app.set_status(msg),
+                                    JumpOutcome::Jumped | JumpOutcome::NoOp => {}
                                 }
                             },
                             _ => {}

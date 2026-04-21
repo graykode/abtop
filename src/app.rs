@@ -25,6 +25,18 @@ fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
     }
 }
 
+/// Outcome of an Enter-key jump attempt. Distinct from `Option<String>` so
+/// callers (notably `--exit-on-jump`) can tell a real tmux jump apart from
+/// a no-op (outside tmux, or empty session list).
+pub enum JumpOutcome {
+    /// Actually switched to a tmux pane.
+    Jumped,
+    /// Tried to jump in tmux but no pane owns the session's PID.
+    Failed(String),
+    /// Not in tmux, or nothing selected — nothing happened.
+    NoOp,
+}
+
 pub struct App {
     pub sessions: Vec<AgentSession>,
     pub selected: usize,
@@ -62,6 +74,12 @@ pub struct App {
     pub show_sessions: bool,
     pub config_open: bool,
     pub config_selected: usize,
+    /// When true, subagents are shown as indented tree rows under their parent session.
+    pub tree_view: bool,
+    /// Session filter: when non-empty, only matching sessions are shown.
+    pub filter_text: String,
+    /// True when the filter input bar is capturing keystrokes.
+    pub filter_active: bool,
 }
 
 impl App {
@@ -93,6 +111,9 @@ impl App {
             show_sessions: true,
             config_open: false,
             config_selected: 0,
+            tree_view: false,
+            filter_text: String::new(),
+            filter_active: false,
         }
     }
 
@@ -164,6 +185,7 @@ impl App {
         if self.selected >= self.sessions.len() && !self.sessions.is_empty() {
             self.selected = self.sessions.len() - 1;
         }
+        self.clamp_selection_to_visible();
 
         // Compute rate as sum of per-session deltas (stable across session churn).
         // Update prev_tokens in place; stale entries are harmless (bounded by
@@ -258,14 +280,76 @@ impl App {
         })
     }
 
+    /// Returns indices of sessions matching the current filter.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        if self.filter_text.is_empty() {
+            return (0..self.sessions.len()).collect();
+        }
+        let query = self.filter_text.to_lowercase();
+        self.sessions.iter().enumerate()
+            .filter(|(_, s)| Self::session_matches(s, &query))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn session_matches(s: &AgentSession, query: &str) -> bool {
+        s.project_name.to_lowercase().contains(query)
+            || s.model.to_lowercase().contains(query)
+            || s.session_id.to_lowercase().contains(query)
+            || s.initial_prompt.to_lowercase().contains(query)
+            || s.cwd.to_lowercase().contains(query)
+            || format!("{:?}", s.status).to_lowercase().contains(query)
+    }
+
+    /// Ensure `selected` points to a session included in the current filter.
+    /// No-op when no sessions match; otherwise snaps to the first visible.
+    fn clamp_selection_to_visible(&mut self) {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
+            return;
+        }
+        if !visible.contains(&self.selected) {
+            self.selected = visible[0];
+        }
+    }
+
+    pub fn filter_push(&mut self, c: char) {
+        self.filter_text.push(c);
+        self.clamp_selection_to_visible();
+    }
+
+    pub fn filter_pop(&mut self) {
+        self.filter_text.pop();
+        self.clamp_selection_to_visible();
+    }
+
+    pub fn clear_filter(&mut self) {
+        self.filter_active = false;
+        self.filter_text.clear();
+    }
+
     pub fn select_next(&mut self) {
-        if !self.sessions.is_empty() {
-            self.selected = (self.selected + 1).min(self.sessions.len() - 1);
+        let visible = self.visible_indices();
+        if visible.is_empty() { return; }
+        if let Some(pos) = visible.iter().position(|&i| i == self.selected) {
+            if pos + 1 < visible.len() {
+                self.selected = visible[pos + 1];
+            }
+        } else {
+            self.selected = visible[0];
         }
     }
 
     pub fn select_prev(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        let visible = self.visible_indices();
+        if visible.is_empty() { return; }
+        if let Some(pos) = visible.iter().position(|&i| i == self.selected) {
+            if pos > 0 {
+                self.selected = visible[pos - 1];
+            }
+        } else {
+            self.selected = *visible.last().unwrap();
+        }
     }
 
     pub fn kill_selected(&mut self) {
@@ -350,21 +434,19 @@ impl App {
     }
 
     /// Jump to the terminal running the selected session's Claude process.
-    /// In tmux: switch to the pane. Otherwise: show a helpful status message.
-    pub fn jump_to_session(&mut self) -> Option<String> {
+    /// In tmux: switch to the pane. Otherwise: no-op.
+    pub fn jump_to_session(&mut self) -> JumpOutcome {
         if self.sessions.is_empty() {
-            return None;
+            return JumpOutcome::NoOp;
         }
-        let session = &self.sessions[self.selected];
-        let target_pid = session.pid;
-
-        // tmux: actual jump
-        if std::env::var("TMUX").is_ok() {
-            return self.jump_via_tmux(target_pid);
+        if std::env::var("TMUX").is_err() {
+            return JumpOutcome::NoOp;
         }
-
-        // No tmux: no action
-        None
+        let target_pid = self.sessions[self.selected].pid;
+        match self.jump_via_tmux(target_pid) {
+            None => JumpOutcome::Jumped,
+            Some(msg) => JumpOutcome::Failed(msg),
+        }
     }
 
     fn jump_via_tmux(&self, target_pid: u32) -> Option<String> {

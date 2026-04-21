@@ -106,7 +106,7 @@ fn draw_context_sparkline(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Colo
 fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 101], theme: &Theme) {
     let header_style = Style::default().fg(theme.main_fg).add_modifier(Modifier::BOLD);
 
-    // bar width = remaining space after Project(14) + Session(9) + pct(5) + padding
+    // bar width = remaining space after Project(10) + pct(5) + info(10) + padding
     let bar_width = (area.width as usize).saturating_sub(30).clamp(4, 20);
 
     let mut rows = Vec::new();
@@ -114,23 +114,21 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
     for session in &app.sessions {
         let raw_pct = session.context_percent;
         let bar_pct = raw_pct.min(100.0);
-        let warn = if raw_pct >= 90.0 { "⚠" } else { "" };
+        let warn = if raw_pct >= 90.0 { "⚠" } else if raw_pct >= 75.0 { "!" } else { "" };
         let pct_color = grad_at(cpu_grad, bar_pct);
 
-        let sid_short = if session.session_id.len() >= 8 {
-            &session.session_id[..8]
-        } else {
-            &session.session_id
+        // Context info: window size + compaction count (e.g. "200k C2")
+        let ctx_info = match (session.context_window > 0, session.compaction_count) {
+            (true, 0) => fmt_tokens(session.context_window),
+            (true, n) => format!("{} C{}", fmt_tokens(session.context_window), n),
+            (false, 0) => String::new(),
+            (false, n) => format!("C{}", n),
         };
 
         rows.push(Row::new(vec![
             Cell::from(Span::styled(
-                truncate_str(&session.project_name, 14),
+                truncate_str(&session.project_name, 10),
                 Style::default().fg(theme.title),
-            )),
-            Cell::from(Span::styled(
-                sid_short.to_string(),
-                Style::default().fg(theme.session_id),
             )),
             Cell::from(Line::from({
                 let mut spans = meter_bar(bar_pct, bar_width, cpu_grad, theme.meter_bg);
@@ -140,6 +138,10 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
                 ));
                 spans
             })),
+            Cell::from(Span::styled(
+                ctx_info,
+                Style::default().fg(theme.graph_text),
+            )),
         ]));
     }
 
@@ -156,14 +158,14 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
 
     let header = Row::new(vec![
         Cell::from(Span::styled("Project", header_style)),
-        Cell::from(Span::styled("Session", header_style)),
         Cell::from(Span::styled("Context", header_style)),
+        Cell::from(Span::styled("Window", header_style)),
     ]);
 
     let widths = [
-        Constraint::Length(14),
-        Constraint::Length(9),
+        Constraint::Length(10),
         Constraint::Min(10),
+        Constraint::Length(10),
     ];
 
     let table = Table::new(rows, widths).header(header);

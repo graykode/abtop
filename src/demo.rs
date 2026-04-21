@@ -47,6 +47,19 @@ pub fn populate_demo(app: &mut App) {
                 44000, 50000, 32000, 27000, 58000, 46000, 42000, 36000, 53000, 47000, 41000, 38000,
                 62000, 55000, 49000, 43000, 51000, 44000, 38000, 33000, 56000, 48000,
             ],
+            context_history: vec![
+                20000, 35000, 52000, 68000, 85000, 102000, 118000, 135000,
+                148000, 162000, 175000, 185000, 192000,
+                // compaction event: 192k -> 65k (66% drop)
+                65000,
+                78000, 92000, 108000, 125000, 138000, 145000, 155000,
+                168000, 178000, 185000, 190000,
+                // second compaction: 190k -> 58k
+                58000,
+                72000, 88000, 105000, 120000, 135000, 142000, 148000,
+            ],
+            compaction_count: 2,
+            context_window: 200_000,
             subagents: vec![
                 SubAgent {
                     name: "Explore test coverage".into(),
@@ -108,6 +121,15 @@ pub fn populate_demo(app: &mut App) {
                 46000, 53000, 42000, 37000, 60000, 52000, 45000, 38000, 56000, 49000, 43000, 36000,
                 63000, 57000, 50000, 44000, 54000, 47000,
             ],
+            context_history: vec![
+                15000, 28000, 45000, 62000, 80000, 95000, 112000, 128000,
+                142000, 158000, 172000, 182000, 190000, 195000,
+                // compaction: 195k -> 70k
+                70000,
+                85000, 98000, 115000, 130000, 145000, 158000, 170000, 182000,
+            ],
+            compaction_count: 1,
+            context_window: 200_000,
             subagents: vec![],
             mem_file_count: 2,
             mem_line_count: 8,
@@ -141,6 +163,9 @@ pub fn populate_demo(app: &mut App) {
             token_history: vec![
                 8000, 12000, 15000, 22000, 18000, 25000, 20000, 16000, 28000, 24000, 19000, 14000,
             ],
+            context_history: vec![],
+            compaction_count: 0,
+            context_window: 200_000,
             subagents: vec![],
             mem_file_count: 1,
             mem_line_count: 3,
@@ -229,6 +254,9 @@ pub fn populate_demo(app: &mut App) {
             token_history: vec![
                 4000, 7500, 11000, 8500, 14000, 9800, 6200, 12000, 9500, 7000, 10500,
             ],
+            context_history: vec![],
+            compaction_count: 0,
+            context_window: 200_000,
             subagents: vec![],
             mem_file_count: 0,
             mem_line_count: 0,

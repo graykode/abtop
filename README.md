@@ -1,6 +1,6 @@
 # abtop
 
-**Like htop, but for your AI coding agents.**
+**Like [btop](https://github.com/aristocratos/btop), but for your AI coding agents.**
 
 See every Claude Code, Codex CLI, and pi session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
 
@@ -108,8 +108,6 @@ Colorblind-friendly themes:
 |:-:|:-:|
 | ![deuteranopia](assets/themes/deuteranopia.png) | ![tritanopia](assets/themes/tritanopia.png) |
 
-Theme support contributed by [@tbouquet](https://github.com/tbouquet).
-
 ## Key Bindings
 
 | Key                | Action                               |
@@ -127,6 +125,10 @@ Theme support contributed by [@tbouquet](https://github.com/tbouquet).
 ## Privacy
 
 abtop reads local files only. No API keys, no auth. Tool names and file paths are shown in the UI, but file contents and prompt text are never displayed. Session summaries are generated via `claude --print`, which makes its own API call — this is the only indirect network usage.
+
+## Acknowledgements
+
+Huge thanks to [@tbouquet](https://github.com/tbouquet) for driving much of abtop's recent shape — themes, config overlay and panel toggles, session filtering, subagent tree view, the context window gauge with compaction detection, plus a steady stream of fixes and security hardening along the way.
 
 ## License
 
