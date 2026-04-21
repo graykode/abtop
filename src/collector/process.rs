@@ -7,33 +7,53 @@ pub struct ProcInfo {
     pub ppid: u32,
     pub rss_kb: u64,
     pub cpu_pct: f64,
+    /// Best-effort process start time derived from `ps etimes` (`now - etimes`).
+    pub started_at_ms: u64,
     pub command: String,
 }
 
 pub fn get_process_info() -> HashMap<u32, ProcInfo> {
     let mut map = HashMap::new();
+
+    // Linux supports `etimes` (elapsed seconds). macOS does not, so fall back to
+    // `etime` (formatted elapsed time) and parse it ourselves.
     let output = Command::new("ps")
-        .args(["-ww", "-eo", "pid,ppid,rss,%cpu,command"])
+        .args(["-ww", "-eo", "pid,ppid,rss,%cpu,etimes,command"])
         .output()
-        .ok();
+        .ok()
+        .filter(|o| o.status.success())
+        .or_else(|| {
+            Command::new("ps")
+                .args(["-ww", "-eo", "pid,ppid,rss,%cpu,etime,command"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+        });
 
     if let Some(output) = output {
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         for line in stdout.lines().skip(1) {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 5 {
+            if parts.len() >= 6 {
                 if let (Ok(pid), Ok(ppid), Ok(rss)) = (
                     parts[0].parse::<u32>(),
                     parts[1].parse::<u32>(),
                     parts[2].parse::<u64>(),
                 ) {
                     let cpu = parts[3].parse::<f64>().unwrap_or(0.0);
-                    let command = parts[4..].join(" ");
+                    let elapsed_secs = parse_elapsed_to_secs(parts[4]);
+                    let started_at_ms = now_ms.saturating_sub(elapsed_secs.saturating_mul(1000));
+                    let command = parts[5..].join(" ");
                     map.insert(pid, ProcInfo {
                         pid,
                         ppid,
                         rss_kb: rss,
                         cpu_pct: cpu,
+                        started_at_ms,
                         command,
                     });
                 }
@@ -41,6 +61,32 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
         }
     }
     map
+}
+
+fn parse_elapsed_to_secs(s: &str) -> u64 {
+    if let Ok(secs) = s.parse::<u64>() {
+        return secs;
+    }
+
+    let (days, rest) = if let Some((d, rest)) = s.split_once('-') {
+        (d.parse::<u64>().unwrap_or(0), rest)
+    } else {
+        (0, s)
+    };
+
+    let parts: Vec<u64> = rest
+        .split(':')
+        .map(|p| p.parse::<u64>().unwrap_or(0))
+        .collect();
+
+    let time_secs = match parts.as_slice() {
+        [h, m, s] => h.saturating_mul(3600) + m.saturating_mul(60) + s,
+        [m, s] => m.saturating_mul(60) + s,
+        [s] => *s,
+        _ => 0,
+    };
+
+    days.saturating_mul(86_400) + time_secs
 }
 
 pub fn get_children_map(procs: &HashMap<u32, ProcInfo>) -> HashMap<u32, Vec<u32>> {
@@ -114,6 +160,19 @@ pub fn cmd_has_binary(cmd: &str, name: &str) -> bool {
         let base = tok.rsplit('/').next().unwrap_or(tok);
         base == name
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_elapsed_to_secs() {
+        assert_eq!(parse_elapsed_to_secs("42"), 42);
+        assert_eq!(parse_elapsed_to_secs("01:02"), 62);
+        assert_eq!(parse_elapsed_to_secs("01:02:03"), 3723);
+        assert_eq!(parse_elapsed_to_secs("2-01:02:03"), 176_523);
+    }
 }
 
 pub fn collect_git_stats(cwd: &str) -> (u32, u32) {

@@ -1,5 +1,7 @@
 use crate::app::App;
-use crate::model::{AgentSession, ChildProcess, OrphanPort, RateLimitInfo, SessionStatus, SubAgent};
+use crate::model::{
+    AgentSession, ChildProcess, OrphanPort, RateLimitInfo, SessionStatus, SubAgent,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> u64 {
@@ -41,11 +43,9 @@ pub fn populate_demo(app: &mut App) {
             git_added: 2,
             git_modified: 8,
             token_history: vec![
-                18000, 22000, 45000, 38000, 52000, 41000, 35000, 28000,
-                61000, 55000, 48000, 39000, 44000, 50000, 32000, 27000,
-                58000, 46000, 42000, 36000, 53000, 47000, 41000, 38000,
-                62000, 55000, 49000, 43000, 51000, 44000, 38000, 33000,
-                56000, 48000,
+                18000, 22000, 45000, 38000, 52000, 41000, 35000, 28000, 61000, 55000, 48000, 39000,
+                44000, 50000, 32000, 27000, 58000, 46000, 42000, 36000, 53000, 47000, 41000, 38000,
+                62000, 55000, 49000, 43000, 51000, 44000, 38000, 33000, 56000, 48000,
             ],
             context_history: vec![
                 20000, 35000, 52000, 68000, 85000, 102000, 118000, 135000,
@@ -117,9 +117,8 @@ pub fn populate_demo(app: &mut App) {
             git_added: 1,
             git_modified: 4,
             token_history: vec![
-                32000, 28000, 41000, 55000, 62000, 48000, 35000, 29000,
-                44000, 58000, 51000, 39000, 46000, 53000, 42000, 37000,
-                60000, 52000, 45000, 38000, 56000, 49000, 43000, 36000,
+                32000, 28000, 41000, 55000, 62000, 48000, 35000, 29000, 44000, 58000, 51000, 39000,
+                46000, 53000, 42000, 37000, 60000, 52000, 45000, 38000, 56000, 49000, 43000, 36000,
                 63000, 57000, 50000, 44000, 54000, 47000,
             ],
             context_history: vec![
@@ -162,8 +161,7 @@ pub fn populate_demo(app: &mut App) {
             git_added: 0,
             git_modified: 2,
             token_history: vec![
-                8000, 12000, 15000, 22000, 18000, 25000, 20000, 16000,
-                28000, 24000, 19000, 14000,
+                8000, 12000, 15000, 22000, 18000, 25000, 20000, 16000, 28000, 24000, 19000, 14000,
             ],
             context_history: vec![],
             compaction_count: 0,
@@ -217,8 +215,44 @@ pub fn populate_demo(app: &mut App) {
             git_branch: "feat/heatmap".into(),
             git_added: 3,
             git_modified: 1,
+            token_history: vec![5000, 8000, 12000, 18000, 15000, 22000],
+            subagents: vec![],
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: vec![ChildProcess {
+                pid: 8950,
+                command: "python -m http.server 8080".into(),
+                mem_kb: 32_000,
+                port: Some(8080),
+            }],
+
+            first_assistant_text: String::new(),
+            initial_prompt: "Create interactive heatmap component with D3.js".into(),
+        },
+        AgentSession {
+            agent_cli: "pi",
+            pid: 9123,
+            session_id: "e5f6a7b8-9abc-def0-1234-555555555555".into(),
+            cwd: "/Users/demo/harness".into(),
+            project_name: "harness".into(),
+            started_at: now - 18 * 60 * 1000, // 18m ago
+            status: SessionStatus::Waiting,
+            model: "claude-sonnet-4-5".into(),
+            effort: "medium".into(),
+            context_percent: 41.0,
+            total_input_tokens: 7_800,
+            total_output_tokens: 3_200,
+            total_cache_read: 74_000,
+            total_cache_create: 8_500,
+            turn_count: 11,
+            current_tasks: vec!["waiting for input".into()],
+            mem_mb: 128,
+            version: String::new(),
+            git_branch: "main".into(),
+            git_added: 1,
+            git_modified: 4,
             token_history: vec![
-                5000, 8000, 12000, 18000, 15000, 22000,
+                4000, 7500, 11000, 8500, 14000, 9800, 6200, 12000, 9500, 7000, 10500,
             ],
             context_history: vec![],
             compaction_count: 0,
@@ -226,17 +260,16 @@ pub fn populate_demo(app: &mut App) {
             subagents: vec![],
             mem_file_count: 0,
             mem_line_count: 0,
-            children: vec![
-                ChildProcess {
-                    pid: 8950,
-                    command: "python -m http.server 8080".into(),
-                    mem_kb: 32_000,
-                    port: Some(8080),
-                },
-            ],
+            children: vec![ChildProcess {
+                pid: 9145,
+                command: "cargo test --package openclaw".into(),
+                mem_kb: 48_000,
+                port: None,
+            }],
 
             first_assistant_text: String::new(),
-            initial_prompt: "Create interactive heatmap component with D3.js".into(),
+            initial_prompt: "Refactor the pi extension loader to use the new resource resolver"
+                .into(),
         },
     ];
 
@@ -256,6 +289,10 @@ pub fn populate_demo(app: &mut App) {
     app.summaries.insert(
         "d4e5f6a7-89ab-cdef-0123-444444444444".into(),
         "D3 heatmap component".into(),
+    );
+    app.summaries.insert(
+        "e5f6a7b8-9abc-def0-1234-555555555555".into(),
+        "Pi extension loader refactor".into(),
     );
 
     // --- Rate limits ---
@@ -280,10 +317,9 @@ pub fn populate_demo(app: &mut App) {
 
     // --- Token rates (synthetic sparkline) ---
     let rates = [
-        0.0, 0.0, 120.0, 340.0, 580.0, 420.0, 0.0, 0.0, 890.0, 1200.0,
-        950.0, 680.0, 0.0, 0.0, 450.0, 780.0, 1100.0, 1350.0, 920.0, 610.0,
-        0.0, 340.0, 670.0, 890.0, 1050.0, 780.0, 520.0, 0.0, 0.0, 1400.0,
-        1180.0, 850.0, 620.0, 410.0, 0.0, 560.0, 820.0, 1060.0, 1280.0, 940.0,
+        0.0, 0.0, 120.0, 340.0, 580.0, 420.0, 0.0, 0.0, 890.0, 1200.0, 950.0, 680.0, 0.0, 0.0,
+        450.0, 780.0, 1100.0, 1350.0, 920.0, 610.0, 0.0, 340.0, 670.0, 890.0, 1050.0, 780.0, 520.0,
+        0.0, 0.0, 1400.0, 1180.0, 850.0, 620.0, 410.0, 0.0, 560.0, 820.0, 1060.0, 1280.0, 940.0,
         700.0, 480.0, 0.0, 0.0, 380.0, 720.0, 1150.0, 1320.0, 980.0, 650.0,
     ];
     app.token_rates.clear();
@@ -292,12 +328,10 @@ pub fn populate_demo(app: &mut App) {
     }
 
     // --- Orphan ports ---
-    app.orphan_ports = vec![
-        OrphanPort {
-            port: 4000,
-            pid: 6543,
-            command: "node dist/server.js".into(),
-            project_name: "old-project".into(),
-        },
-    ];
+    app.orphan_ports = vec![OrphanPort {
+        port: 4000,
+        pid: 6543,
+        command: "node dist/server.js".into(),
+        project_name: "old-project".into(),
+    }];
 }
