@@ -4,11 +4,12 @@ version = 4
 
 [[package]]
 name = "abtop"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "crossterm",
  "dirs",
+ "libc",
  "proc_pidinfo",
  "ratatui",
  "serde",
