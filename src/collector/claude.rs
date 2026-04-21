@@ -7,11 +7,36 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+#[cfg(all(not(target_os = "linux"), not(target_vendor = "apple")))]
+use std::process::Command;
 
 /// A single Claude config directory (sessions + projects + transcripts).
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct ConfigDir {
     sessions_dir: PathBuf,
     projects_dir: PathBuf,
+}
+
+impl ConfigDir {
+    fn new(base: PathBuf) -> Self {
+        Self {
+            sessions_dir: base.join("sessions"),
+            projects_dir: base.join("projects"),
+        }
+    }
+
+    fn base_dir(&self) -> PathBuf {
+        self.sessions_dir
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProcessOpenPaths {
+    cwd: Option<PathBuf>,
+    paths: Vec<PathBuf>,
 }
 
 pub struct ClaudeCollector {
@@ -62,13 +87,7 @@ impl ClaudeCollector {
             }
         }
 
-        self.config_dirs = seen
-            .into_iter()
-            .map(|base| ConfigDir {
-                sessions_dir: base.join("sessions"),
-                projects_dir: base.join("projects"),
-            })
-            .collect();
+        self.config_dirs = seen.into_iter().map(ConfigDir::new).collect();
     }
 
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
@@ -79,9 +98,18 @@ impl ClaudeCollector {
             self.refresh_config_dirs(&shared.process_info);
         }
 
+        let active_session_paths = self.discover_active_session_paths(&shared.process_info);
+        let active_config_dirs: Vec<ConfigDir> = active_session_paths
+            .iter()
+            .map(|(_, config)| config.clone())
+            .collect();
+        self.merge_config_dirs(active_config_dirs);
+
         // Collect all session file paths first to avoid borrowing self
         // immutably (config_dirs) and mutably (load_session) at the same time.
-        let mut session_paths = Vec::new();
+        let mut session_paths: Vec<(PathBuf, ConfigDir)> = Vec::new();
+        session_paths.extend(active_session_paths);
+
         for config in &self.config_dirs {
             let session_files = match fs::read_dir(&config.sessions_dir) {
                 Ok(entries) => entries,
@@ -93,32 +121,128 @@ impl ClaudeCollector {
                 if path.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue;
                 }
-                session_paths.push(path);
+                session_paths.push((path, config.clone()));
             }
         }
 
-        let mut sessions = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();
-        for path in &session_paths {
-            if let Some(session) = self.load_session(path, &shared.process_info, &shared.children_map, &shared.ports) {
-                if seen_ids.insert(session.session_id.clone()) {
-                    sessions.push(session);
-                }
-            }
-        }
+        let mut sessions = self.load_session_paths(
+            &session_paths,
+            &shared.process_info,
+            &shared.children_map,
+            &shared.ports,
+        );
 
         // Evict transcript cache for sessions that no longer exist
         let active_ids: std::collections::HashSet<&str> =
             sessions.iter().map(|s| s.session_id.as_str()).collect();
-        self.transcript_cache.retain(|sid, _| active_ids.contains(sid.as_str()));
+        self.transcript_cache
+            .retain(|sid, _| active_ids.contains(sid.as_str()));
 
         sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
         sessions
     }
 
+    fn load_session_paths(
+        &mut self,
+        session_paths: &[(PathBuf, ConfigDir)],
+        process_info: &HashMap<u32, ProcInfo>,
+        children_map: &HashMap<u32, Vec<u32>>,
+        ports: &HashMap<u32, Vec<u16>>,
+    ) -> Vec<AgentSession> {
+        let mut sessions = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        for (path, config) in session_paths {
+            if let Some(session) =
+                self.load_session(path, config, process_info, children_map, ports)
+            {
+                if seen_ids.insert(session.session_id.clone()) {
+                    sessions.push(session);
+                }
+            }
+        }
+        sessions
+    }
+
+    fn merge_config_dirs(&mut self, dirs: Vec<ConfigDir>) {
+        let mut seen: std::collections::BTreeSet<ConfigDir> =
+            self.config_dirs.iter().cloned().collect();
+        seen.extend(dirs);
+        self.config_dirs = seen.into_iter().collect();
+    }
+
+    fn discover_active_session_paths(
+        &self,
+        process_info: &HashMap<u32, process::ProcInfo>,
+    ) -> Vec<(PathBuf, ConfigDir)> {
+        let pids = Self::find_claude_pids(process_info);
+        if pids.is_empty() {
+            return Vec::new();
+        }
+
+        let open_paths = Self::map_pid_to_open_paths(&pids);
+        Self::session_paths_from_open_paths(&pids, &open_paths)
+    }
+
+    fn session_paths_from_open_paths(
+        pids: &[u32],
+        open_paths: &HashMap<u32, ProcessOpenPaths>,
+    ) -> Vec<(PathBuf, ConfigDir)> {
+        let mut paths = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+
+        for &pid in pids {
+            let Some(info) = open_paths.get(&pid) else {
+                continue;
+            };
+            for config in config_dirs_from_open_paths(info) {
+                let Some(path) = find_session_file_for_pid(&config.sessions_dir, pid) else {
+                    continue;
+                };
+                if seen.insert(path.clone()) {
+                    paths.push((path, config));
+                }
+            }
+        }
+
+        paths
+    }
+
+    fn find_claude_pids(process_info: &HashMap<u32, process::ProcInfo>) -> Vec<u32> {
+        let mut pids = Vec::new();
+        for (pid, info) in process_info {
+            let cmd = &info.command;
+            if process::cmd_has_binary(cmd, "claude") && !cmd.contains("--print") {
+                pids.push(*pid);
+            }
+        }
+        pids
+    }
+
+    fn map_pid_to_open_paths(pids: &[u32]) -> HashMap<u32, ProcessOpenPaths> {
+        if pids.is_empty() {
+            return HashMap::new();
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            map_pid_to_proc_open_paths(pids)
+        }
+
+        #[cfg(target_vendor = "apple")]
+        {
+            map_pid_to_libproc_open_paths(pids)
+        }
+
+        #[cfg(all(not(target_os = "linux"), not(target_vendor = "apple")))]
+        {
+            map_pid_to_lsof_open_paths(pids)
+        }
+    }
+
     fn load_session(
         &mut self,
         path: &Path,
+        config: &ConfigDir,
         process_info: &HashMap<u32, ProcInfo>,
         children_map: &HashMap<u32, Vec<u32>>,
         ports: &HashMap<u32, Vec<u16>>,
@@ -129,9 +253,7 @@ impl ClaudeCollector {
 
         let proc_cmd = process_info.get(&sf.pid).map(|p| p.command.as_str());
         let pid_alive = proc_cmd
-            .map(|c| {
-                process::cmd_has_binary(c, "claude")
-            })
+            .map(|c| process::cmd_has_binary(c, "claude"))
             .unwrap_or(false);
 
         // Skip --print sessions (e.g. abtop's own summary generation).
@@ -141,22 +263,18 @@ impl ClaudeCollector {
             return None;
         }
 
-        let project_name = sf
-            .cwd
-            .rsplit('/')
-            .next()
-            .unwrap_or("?")
-            .to_string();
+        let project_name = sf.cwd.rsplit('/').next().unwrap_or("?").to_string();
 
         let proc = process_info.get(&sf.pid);
         let mem_mb = proc.map(|p| p.rss_kb / 1024).unwrap_or(0);
 
-        let transcript_path = self.find_transcript(&sf.cwd, &sf.session_id);
+        let transcript_path = Self::find_transcript_in_config(config, &sf.cwd, &sf.session_id);
 
         if let Some(ref tp) = transcript_path {
             let cached = self.transcript_cache.remove(&sf.session_id);
             // Detect file replacement: if inode or mtime changed, reparse from scratch
-            let identity_changed = cached.as_ref()
+            let identity_changed = cached
+                .as_ref()
                 .map(|c| c.file_identity != file_identity(tp))
                 .unwrap_or(false);
             let from_offset = if identity_changed {
@@ -221,16 +339,30 @@ impl ClaudeCollector {
 
         let empty_result = TranscriptResult {
             model: "-".to_string(),
-            total_input: 0, total_output: 0, total_cache_read: 0, total_cache_create: 0,
-            last_context_tokens: 0, max_context_tokens: 0, context_history: Vec::new(), compaction_count: 0, turn_count: 0, current_task: String::new(),
-            version: String::new(), git_branch: String::new(),
-            last_activity: std::time::UNIX_EPOCH, new_offset: 0,
+            total_input: 0,
+            total_output: 0,
+            total_cache_read: 0,
+            total_cache_create: 0,
+            last_context_tokens: 0,
+            max_context_tokens: 0,
+            context_history: Vec::new(),
+            compaction_count: 0,
+            turn_count: 0,
+            current_task: String::new(),
+            version: String::new(),
+            git_branch: String::new(),
+            last_activity: std::time::UNIX_EPOCH,
+            new_offset: 0,
             file_identity: (0, 0),
-            token_history: Vec::new(), initial_prompt: String::new(),
+            token_history: Vec::new(),
+            initial_prompt: String::new(),
             first_assistant_text: String::new(),
             tool_calls: Vec::new(), last_assistant_ts_ms: 0,
         };
-        let cached = self.transcript_cache.get(&sf.session_id).unwrap_or(&empty_result);
+        let cached = self
+            .transcript_cache
+            .get(&sf.session_id)
+            .unwrap_or(&empty_result);
 
         let model = cached.model.clone();
         let total_input = cached.total_input;
@@ -267,9 +399,8 @@ impl ClaudeCollector {
                 let claude_cpu_active = proc.is_some_and(|p| p.cpu_pct > 1.0);
                 // 2. Any descendant using significant CPU (>5%) → likely running a tool
                 //    (higher threshold avoids false positives from idle watchers/servers)
-                let has_active_descendant = process::has_active_descendant(
-                    sf.pid, children_map, process_info, 5.0,
-                );
+                let has_active_descendant =
+                    process::has_active_descendant(sf.pid, children_map, process_info, 5.0);
                 if claude_cpu_active || has_active_descendant {
                     SessionStatus::Working
                 } else {
@@ -298,10 +429,7 @@ impl ClaudeCollector {
         let mut children = Vec::new();
         // Collect all descendants (not just direct children) so we catch
         // grandchild processes that listen on ports (e.g. Claude → shell → node).
-        let mut stack: Vec<u32> = children_map
-            .get(&sf.pid)
-            .cloned()
-            .unwrap_or_default();
+        let mut stack: Vec<u32> = children_map.get(&sf.pid).cloned().unwrap_or_default();
         let mut visited = std::collections::HashSet::new();
         while let Some(cpid) = stack.pop() {
             if !visited.insert(cpid) {
@@ -330,16 +458,7 @@ impl ClaudeCollector {
         let project_dir = transcript_path
             .as_ref()
             .and_then(|tp| tp.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| {
-                // Fallback to the default (~/.claude) projects dir.
-                // config_dirs is sorted (BTreeSet), so ~/.claude is always
-                // first when it exists.
-                dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".claude")
-                    .join("projects")
-                    .join(encode_cwd_path(&sf.cwd))
-            });
+            .unwrap_or_else(|| config.projects_dir.join(encode_cwd_path(&sf.cwd)));
 
         // Subagent discovery
         let subagents_dir = project_dir.join(&sf.session_id).join("subagents");
@@ -390,42 +509,38 @@ impl ClaudeCollector {
         })
     }
 
-    fn find_transcript(&self, cwd: &str, session_id: &str) -> Option<PathBuf> {
+    fn find_transcript_in_config(
+        config: &ConfigDir,
+        cwd: &str,
+        session_id: &str,
+    ) -> Option<PathBuf> {
         let jsonl_name = format!("{}.jsonl", session_id);
         let encoded = encode_cwd_path(cwd);
 
-        // Pass 1: try the exact encoded-cwd path across all config dirs first.
-        // This avoids a worktree-fallback match in one dir shadowing the
-        // correct exact match in another dir.
-        for config in &self.config_dirs {
-            let path = config.projects_dir.join(&encoded).join(&jsonl_name);
-            if path.exists() && !is_symlink(&path) {
-                return Some(path);
-            }
+        let path = config.projects_dir.join(&encoded).join(&jsonl_name);
+        if path.exists() && !is_symlink(&path) {
+            return Some(path);
         }
 
-        // Pass 2: scan all project subdirectories for worktree sessions
-        // where the transcript directory may not match the encoded cwd.
-        for config in &self.config_dirs {
-            if let Ok(entries) = fs::read_dir(&config.projects_dir) {
-                for entry in entries.flatten() {
-                    if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
-                        continue;
-                    }
-                    if !entry.path().is_dir() {
-                        continue;
-                    }
-                    let candidate = entry.path().join(&jsonl_name);
-                    if candidate.exists() && !is_symlink(&candidate) {
-                        return Some(candidate);
-                    }
+        // Scan project subdirectories for worktree sessions where the
+        // transcript directory may not match the encoded cwd.
+        if let Ok(entries) = fs::read_dir(&config.projects_dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
+                    continue;
+                }
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                let candidate = entry.path().join(&jsonl_name);
+                if candidate.exists() && !is_symlink(&candidate) {
+                    return Some(candidate);
                 }
             }
         }
 
         None
     }
-
 
     fn collect_subagents(subagents_dir: &Path) -> Vec<SubAgent> {
         let mut subagents = Vec::new();
@@ -465,7 +580,8 @@ impl ClaudeCollector {
                 Err(_) => continue,
             };
 
-            let description = meta_val.get("description")
+            let description = meta_val
+                .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("agent")
                 .to_string();
@@ -487,8 +603,10 @@ impl ClaudeCollector {
 
                 // Parse jsonl for token totals
                 let transcript = parse_transcript(&jsonl_path, 0);
-                tokens = transcript.total_input + transcript.total_output
-                    + transcript.total_cache_read + transcript.total_cache_create;
+                tokens = transcript.total_input
+                    + transcript.total_output
+                    + transcript.total_cache_read
+                    + transcript.total_cache_create;
             }
 
             let status = {
@@ -543,10 +661,189 @@ impl super::AgentCollector for ClaudeCollector {
     }
 
     fn discovered_config_dirs(&self) -> Vec<PathBuf> {
-        self.config_dirs.iter()
-            .map(|c| c.sessions_dir.parent().unwrap_or(Path::new(".")).to_path_buf())
-            .collect()
+        self.config_dirs.iter().map(ConfigDir::base_dir).collect()
     }
+}
+
+#[cfg(target_os = "linux")]
+fn map_pid_to_proc_open_paths(pids: &[u32]) -> HashMap<u32, ProcessOpenPaths> {
+    let mut map = HashMap::new();
+
+    for &pid in pids {
+        let cwd = fs::read_link(format!("/proc/{}/cwd", pid)).ok();
+        let entries = match fs::read_dir(format!("/proc/{}/fd", pid)) {
+            Ok(entries) => entries,
+            Err(_) => {
+                if cwd.is_some() {
+                    map.insert(
+                        pid,
+                        ProcessOpenPaths {
+                            cwd,
+                            paths: Vec::new(),
+                        },
+                    );
+                }
+                continue;
+            }
+        };
+
+        let paths = entries
+            .flatten()
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .filter(|path| path.is_absolute())
+            .collect();
+        map.insert(pid, ProcessOpenPaths { cwd, paths });
+    }
+
+    map
+}
+
+#[cfg(target_vendor = "apple")]
+fn map_pid_to_libproc_open_paths(pids: &[u32]) -> HashMap<u32, ProcessOpenPaths> {
+    use proc_pidinfo::{
+        proc_pidfdinfo, proc_pidinfo_list, Pid, ProcFDInfo, ProcFDType, VnodeFdInfoWithPath,
+    };
+
+    let mut map = HashMap::new();
+
+    for &raw_pid in pids {
+        let pid = Pid(raw_pid);
+        let fds = match proc_pidinfo_list::<ProcFDInfo>(pid) {
+            Ok(fds) => fds,
+            Err(_) => continue,
+        };
+
+        let paths = fds
+            .into_iter()
+            .filter(|fd| fd.fd_type() == Ok(ProcFDType::VNODE))
+            .filter_map(|fd| proc_pidfdinfo::<VnodeFdInfoWithPath>(pid, fd.proc_fd).ok())
+            .flatten()
+            .filter_map(|vnode| vnode.path().ok().map(PathBuf::from))
+            .collect();
+
+        map.insert(raw_pid, ProcessOpenPaths { cwd: None, paths });
+    }
+
+    map
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_vendor = "apple")))]
+fn map_pid_to_lsof_open_paths(pids: &[u32]) -> HashMap<u32, ProcessOpenPaths> {
+    let pid_args: Vec<String> = pids.iter().map(|p| format!("-p{}", p)).collect();
+    let mut args = vec!["-F", "ftn"];
+    for pa in &pid_args {
+        args.push(pa);
+    }
+
+    let output = Command::new("lsof").args(&args).output().ok();
+    output
+        .map(|out| parse_lsof_process_info(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or_default()
+}
+
+#[cfg_attr(any(target_os = "linux", target_vendor = "apple"), allow(dead_code))]
+fn parse_lsof_process_info(output: &str) -> HashMap<u32, ProcessOpenPaths> {
+    let mut map: HashMap<u32, ProcessOpenPaths> = HashMap::new();
+    let mut current_pid: Option<u32> = None;
+    let mut current_fd = String::new();
+
+    for line in output.lines() {
+        if let Some(pid_str) = line.strip_prefix('p') {
+            current_pid = pid_str.parse::<u32>().ok();
+            if let Some(pid) = current_pid {
+                map.entry(pid).or_default();
+            }
+            current_fd.clear();
+        } else if let Some(fd) = line.strip_prefix('f') {
+            current_fd = fd.to_string();
+        } else if let Some(name) = line.strip_prefix('n') {
+            let Some(pid) = current_pid else {
+                continue;
+            };
+            if name.is_empty() || name.starts_with('[') {
+                continue;
+            }
+            let path = PathBuf::from(name);
+            let info = map.entry(pid).or_default();
+            if current_fd == "cwd" {
+                info.cwd = Some(path.clone());
+            }
+            info.paths.push(path);
+        }
+    }
+
+    map
+}
+
+fn config_dirs_from_open_paths(info: &ProcessOpenPaths) -> Vec<ConfigDir> {
+    let mut candidates = Vec::new();
+    if let Some(cwd) = &info.cwd {
+        candidates.push(cwd.clone());
+    }
+    candidates.extend(info.paths.iter().cloned());
+
+    let mut roots = std::collections::BTreeSet::new();
+    for path in candidates {
+        for root in candidate_config_roots_from_path(&path) {
+            if is_claude_config_root(&root) {
+                roots.insert(root);
+            }
+        }
+    }
+
+    roots.into_iter().map(ConfigDir::new).collect()
+}
+
+fn candidate_config_roots_from_path(path: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    roots.push(path.to_path_buf());
+
+    let mut cursor = path;
+    while let Some(parent) = cursor.parent() {
+        if cursor.file_name().and_then(|n| n.to_str()) == Some("sessions")
+            || cursor.file_name().and_then(|n| n.to_str()) == Some("projects")
+        {
+            roots.push(parent.to_path_buf());
+        }
+        cursor = parent;
+    }
+
+    roots
+}
+
+fn is_claude_config_root(path: &Path) -> bool {
+    path.join("sessions").is_dir() && path.join("projects").is_dir()
+}
+
+fn find_session_file_for_pid(sessions_dir: &Path, pid: u32) -> Option<PathBuf> {
+    let direct = sessions_dir.join(format!("{}.json", pid));
+    if direct.exists() && !is_symlink(&direct) {
+        return Some(direct);
+    }
+
+    let entries = fs::read_dir(sessions_dir).ok()?;
+    for entry in entries.flatten() {
+        if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // Skip files we can't read or parse — one bad file shouldn't abort
+        // the whole fallback search (previously `?` bubbled out of the loop).
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(session) = serde_json::from_str::<SessionFile>(&content) else {
+            continue;
+        };
+        if session.pid == pid {
+            return Some(path);
+        }
+    }
+
+    None
 }
 
 struct TranscriptResult {
@@ -596,7 +893,8 @@ fn file_identity(path: &Path) -> (u64, u64) {
         .ok()
         .map(|m| {
             let ino = m.ino();
-            let mtime_ns = m.modified()
+            let mtime_ns = m
+                .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos() as u64)
@@ -644,7 +942,11 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
         return result;
     }
     // File shrank (truncation/rotation) — reset and reparse from start
-    let effective_offset = if file_len < from_offset { 0 } else { from_offset };
+    let effective_offset = if file_len < from_offset {
+        0
+    } else {
+        from_offset
+    };
     let from_offset = effective_offset;
 
     let mut reader = BufReader::new(file);
@@ -667,7 +969,11 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
         // Bounded read: take(MAX+1) physically caps the allocation. Without
         // this, a malformed or hostile transcript with an unbounded line
         // would OOM the process before any length check could fire.
-        match reader.by_ref().take(MAX_LINE_BYTES as u64 + 1).read_line(&mut line_buf) {
+        match reader
+            .by_ref()
+            .take(MAX_LINE_BYTES as u64 + 1)
+            .read_line(&mut line_buf)
+        {
             Ok(0) => break,
             Ok(n) => {
                 // Cap hit without a newline — malformed/hostile line. Skip
@@ -695,7 +1001,9 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                             bytes_read += n as u64;
                         }
                         // Incomplete line with parse error — defer
-                        if !has_newline { break; }
+                        if !has_newline {
+                            break;
+                        }
                         continue;
                     }
                 };
@@ -719,10 +1027,22 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                     result.model = m.to_string();
                                 }
                                 if let Some(usage) = msg.get("usage") {
-                                    let inp = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    let out = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    let cr = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    let cc = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let inp = usage
+                                        .get("input_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let out = usage
+                                        .get("output_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let cr = usage
+                                        .get("cache_read_input_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    let cc = usage
+                                        .get("cache_creation_input_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
                                     result.total_input += inp;
                                     result.total_output += out;
                                     result.total_cache_read += cr;
@@ -733,7 +1053,10 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                     if result.last_context_tokens > result.max_context_tokens {
                                         result.max_context_tokens = result.last_context_tokens;
                                     }
-                                    if prev_context > 0 && result.last_context_tokens < prev_context * 7 / 10 {
+                                    // Detect compaction: context drops > 30% between turns
+                                    if prev_context > 0
+                                        && result.last_context_tokens < prev_context * 7 / 10
+                                    {
                                         result.compaction_count += 1;
                                     }
                                     if result.context_history.len() < 10_000 {
@@ -745,10 +1068,15 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                 }
                                 // Extract first assistant text (text blocks only) for summary fallback
                                 if result.first_assistant_text.is_empty() {
-                                    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
-                                        let texts: Vec<&str> = content.iter()
+                                    if let Some(content) =
+                                        msg.get("content").and_then(|c| c.as_array())
+                                    {
+                                        let texts: Vec<&str> = content
+                                            .iter()
                                             .filter_map(|block| {
-                                                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                                if block.get("type").and_then(|t| t.as_str())
+                                                    == Some("text")
+                                                {
                                                     block.get("text").and_then(|t| t.as_str())
                                                 } else {
                                                     None
@@ -763,15 +1091,22 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                                 .filter(|l| !l.is_empty())
                                                 .collect::<Vec<_>>()
                                                 .join(" ");
-                                            result.first_assistant_text = truncate(&normalized, 200);
+                                            result.first_assistant_text =
+                                                truncate(&normalized, 200);
                                         }
                                     }
                                 }
                                 // Extract ALL tool_use entries for timeline + last for current_task
-                                if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+                                if let Some(content) = msg.get("content").and_then(|c| c.as_array())
+                                {
                                     for item in content {
-                                        if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                                            let tool = item.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                                        if item.get("type").and_then(|t| t.as_str())
+                                            == Some("tool_use")
+                                        {
+                                            let tool = item
+                                                .get("name")
+                                                .and_then(|n| n.as_str())
+                                                .unwrap_or("?");
                                             let arg = extract_tool_arg(item);
                                             result.current_task = format!("{} {}", tool, arg);
                                             if result.tool_calls.len() < 500 {
@@ -855,7 +1190,10 @@ fn extract_prompt_text(message: &Value) -> String {
             arr.iter()
                 .filter_map(|block| {
                     if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        block.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                        block
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
                     } else {
                         None
                     }
@@ -878,7 +1216,11 @@ fn extract_prompt_text(message: &Value) -> String {
     let mut result = cleaned;
     while let Some(start) = result.find("[Image") {
         if let Some(end) = result[start..].find(']') {
-            result = format!("{}{}", &result[..start], result[start + end + 1..].trim_start());
+            result = format!(
+                "{}{}",
+                &result[..start],
+                result[start + end + 1..].trim_start()
+            );
         } else {
             break;
         }
@@ -1029,13 +1371,510 @@ mod tests {
         file.flush().unwrap();
     }
 
+    fn write_session_file(path: &Path, pid: u32, session_id: &str, cwd: &Path) {
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"pid":{},"sessionId":"{}","cwd":"{}","startedAt":1774715116826}}"#,
+                pid,
+                session_id,
+                cwd.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_transcript(projects: &Path, cwd: &Path, session_id: &str, prompt: &str) -> PathBuf {
+        let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript = transcript_dir.join(format!("{}.jsonl", session_id));
+        std::fs::write(
+            &transcript,
+            format!(
+                r#"{{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{{"role":"user","content":"{}"}}}}
+{{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":12,"output_tokens":6,"cache_read_input_tokens":3,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"done"}}]}}}}
+"#,
+                prompt
+            ),
+        )
+        .unwrap();
+        transcript
+    }
+
+    fn make_proc_info(pid: u32, command: &str) -> HashMap<u32, ProcInfo> {
+        let mut process_info = HashMap::new();
+        process_info.insert(
+            pid,
+            ProcInfo {
+                pid,
+                ppid: 1,
+                rss_kb: 2048,
+                cpu_pct: 0.0,
+                command: command.to_string(),
+            },
+        );
+        process_info
+    }
+
+    #[test]
+    fn test_parse_lsof_process_info_captures_multiple_pids_and_cwd() {
+        let output = "\
+p111
+fcwd
+tDIR
+n/Users/alice/project
+f15
+tDIR
+n/Users/alice/.claude-work
+p222
+fcwd
+tDIR
+n/Users/bob/project
+f20
+tREG
+n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
+";
+
+        let parsed = parse_lsof_process_info(output);
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed.get(&111).unwrap().cwd.as_deref(),
+            Some(Path::new("/Users/alice/project")),
+        );
+        assert!(parsed.get(&222).unwrap().paths.contains(&PathBuf::from(
+            "/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl"
+        )));
+    }
+
+    #[test]
+    fn test_config_dirs_from_open_paths_finds_profile_root_and_ignores_project_claude_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude-work");
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        std::fs::create_dir_all(profile.join("projects")).unwrap();
+
+        let project_claude = temp.path().join("repo").join(".claude");
+        std::fs::create_dir_all(&project_claude).unwrap();
+        std::fs::write(project_claude.join("settings.local.json"), "{}").unwrap();
+
+        let info = ProcessOpenPaths {
+            cwd: Some(temp.path().join("repo")),
+            paths: vec![
+                project_claude,
+                profile.clone(),
+                profile
+                    .join("projects")
+                    .join("-tmp-repo")
+                    .join("session.jsonl"),
+            ],
+        };
+
+        let configs = config_dirs_from_open_paths(&info);
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].base_dir(), profile);
+    }
+
+    #[test]
+    fn test_config_dirs_from_open_paths_finds_profile_root_without_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude-work");
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        let projects = profile.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        let info = ProcessOpenPaths {
+            cwd: None,
+            paths: vec![projects.join("-tmp-repo").join("session.jsonl")],
+        };
+
+        let configs = config_dirs_from_open_paths(&info);
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].base_dir(), profile);
+    }
+
+    #[test]
+    fn test_session_paths_from_open_paths_maps_pid_to_session_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude-work");
+        let sessions = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 4242;
+        let session_path = sessions.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, "session-4242", &cwd);
+
+        let mut open_paths = HashMap::new();
+        open_paths.insert(
+            pid,
+            ProcessOpenPaths {
+                cwd: None,
+                paths: vec![projects.join("-tmp-repo").join("session-4242.jsonl")],
+            },
+        );
+
+        let discovered = ClaudeCollector::session_paths_from_open_paths(&[pid], &open_paths);
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].0, session_path);
+        assert_eq!(discovered[0].1.base_dir(), profile);
+    }
+
+    #[test]
+    fn test_session_paths_from_open_paths_deduplicates_same_session_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude-work");
+        let sessions = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 4242;
+        let session_path = sessions.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, "session-4242", &cwd);
+
+        let mut open_paths = HashMap::new();
+        open_paths.insert(
+            pid,
+            ProcessOpenPaths {
+                cwd: None,
+                paths: vec![
+                    projects.join("-tmp-repo").join("session-4242.jsonl"),
+                    sessions.join(format!("{}.json", pid)),
+                    profile.clone(),
+                ],
+            },
+        );
+
+        let discovered = ClaudeCollector::session_paths_from_open_paths(&[pid], &open_paths);
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].0, session_path);
+    }
+
+    #[test]
+    fn test_collect_sessions_deduplicates_active_and_scanned_session_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude-work");
+        let sessions = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 4242;
+        let session_id = "session-4242";
+        let session_path = sessions.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, session_id, &cwd);
+        write_transcript(&projects, &cwd, session_id, "dedup prompt");
+
+        let config = ConfigDir::new(profile.clone());
+        let process_info = make_proc_info(pid, "claude");
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config.clone()];
+        let session_paths = vec![
+            (session_path.clone(), config.clone()),
+            (session_path.clone(), config),
+        ];
+        let sessions = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, session_id);
+    }
+
+    #[test]
+    fn test_find_session_file_for_pid_falls_back_to_embedded_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let session_path = sessions.join("custom-name.json");
+        write_session_file(&session_path, 4242, "session-4242", &cwd);
+
+        assert_eq!(
+            find_session_file_for_pid(&sessions, 4242).as_deref(),
+            Some(session_path.as_path()),
+        );
+    }
+
+    #[test]
+    fn test_find_session_file_for_pid_skips_bad_files_and_continues() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // A malformed JSON file that appears before the real one on-disk.
+        // Previously the `?` operator made one bad file abort the whole
+        // fallback search; now the loop must skip it and still find the match.
+        std::fs::write(sessions.join("aaa-broken.json"), "not json at all").unwrap();
+        let target = sessions.join("zzz-valid.json");
+        write_session_file(&target, 9999, "session-9999", &cwd);
+
+        assert_eq!(
+            find_session_file_for_pid(&sessions, 9999).as_deref(),
+            Some(target.as_path()),
+        );
+    }
+
+    #[test]
+    fn test_find_session_file_for_pid_prefers_direct_pid_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let direct = sessions.join("4242.json");
+        let fallback = sessions.join("custom-name.json");
+        write_session_file(&direct, 4242, "direct", &cwd);
+        write_session_file(&fallback, 4242, "fallback", &cwd);
+
+        assert_eq!(
+            find_session_file_for_pid(&sessions, 4242).as_deref(),
+            Some(direct.as_path()),
+        );
+    }
+
+    #[test]
+    fn test_find_session_file_for_pid_rejects_symlinked_session_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let real_direct = temp.path().join("real-direct.json");
+        write_session_file(&real_direct, 4242, "direct", &cwd);
+        std::os::unix::fs::symlink(&real_direct, sessions.join("4242.json")).unwrap();
+
+        let real_fallback = temp.path().join("real-fallback.json");
+        write_session_file(&real_fallback, 4242, "fallback", &cwd);
+        std::os::unix::fs::symlink(&real_fallback, sessions.join("fallback.json")).unwrap();
+
+        assert!(find_session_file_for_pid(&sessions, 4242).is_none());
+    }
+
+    #[test]
+    fn test_find_claude_pids_excludes_print_sessions() {
+        let mut process_info = HashMap::new();
+        process_info.insert(
+            10,
+            ProcInfo {
+                pid: 10,
+                ppid: 1,
+                rss_kb: 1,
+                cpu_pct: 0.0,
+                command: "claude".to_string(),
+            },
+        );
+        process_info.insert(
+            11,
+            ProcInfo {
+                pid: 11,
+                ppid: 1,
+                rss_kb: 1,
+                cpu_pct: 0.0,
+                command: "claude --print summarize".to_string(),
+            },
+        );
+        process_info.insert(
+            12,
+            ProcInfo {
+                pid: 12,
+                ppid: 1,
+                rss_kb: 1,
+                cpu_pct: 0.0,
+                command: "codex".to_string(),
+            },
+        );
+
+        assert_eq!(ClaudeCollector::find_claude_pids(&process_info), vec![10]);
+    }
+
+    #[test]
+    fn test_find_transcript_in_config_uses_same_root_worktree_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude-work");
+        let projects = profile.join("projects");
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+
+        let wrong_profile = temp.path().join(".claude-other");
+        std::fs::create_dir_all(wrong_profile.join("sessions")).unwrap();
+        let wrong_projects = wrong_profile.join("projects");
+        std::fs::create_dir_all(wrong_projects.join("other-project")).unwrap();
+        std::fs::write(
+            wrong_projects.join("other-project").join("session-1.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+
+        let worktree_dir = projects.join("actual-worktree");
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+        let transcript = worktree_dir.join("session-1.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+
+        let config = ConfigDir::new(profile);
+
+        assert_eq!(
+            ClaudeCollector::find_transcript_in_config(&config, "/tmp/repo", "session-1")
+                .as_deref(),
+            Some(transcript.as_path()),
+        );
+    }
+
+    #[test]
+    fn test_find_transcript_in_config_rejects_symlinked_exact_and_fallback_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude-work");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let session_id = "session-1";
+        let real_exact = temp.path().join("real-exact.jsonl");
+        std::fs::write(&real_exact, "{}\n").unwrap();
+        let exact_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&exact_dir).unwrap();
+        std::os::unix::fs::symlink(&real_exact, exact_dir.join(format!("{}.jsonl", session_id)))
+            .unwrap();
+
+        let real_fallback = temp.path().join("real-fallback.jsonl");
+        std::fs::write(&real_fallback, "{}\n").unwrap();
+        let fallback_dir = projects.join("actual-worktree");
+        std::fs::create_dir_all(&fallback_dir).unwrap();
+        std::os::unix::fs::symlink(
+            &real_fallback,
+            fallback_dir.join(format!("{}.jsonl", session_id)),
+        )
+        .unwrap();
+
+        let config = ConfigDir::new(profile);
+
+        assert!(ClaudeCollector::find_transcript_in_config(
+            &config,
+            cwd.to_str().unwrap(),
+            session_id
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_open_paths_without_cwd_loads_session_from_same_config_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude-work");
+        let sessions = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 5151;
+        let session_id = "session-5151";
+        let session_path = sessions.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, session_id, &cwd);
+        let transcript = write_transcript(&projects, &cwd, session_id, "libproc prompt");
+
+        let mut open_paths = HashMap::new();
+        open_paths.insert(
+            pid,
+            ProcessOpenPaths {
+                cwd: None,
+                paths: vec![transcript],
+            },
+        );
+        let discovered = ClaudeCollector::session_paths_from_open_paths(&[pid], &open_paths);
+        let process_info = make_proc_info(pid, "claude");
+        let mut collector = ClaudeCollector::new();
+
+        assert_eq!(discovered.len(), 1);
+        let session = collector
+            .load_session(
+                &discovered[0].0,
+                &discovered[0].1,
+                &process_info,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
+
+        assert_eq!(session.session_id, session_id);
+        assert_eq!(session.initial_prompt, "libproc prompt");
+        assert_eq!(session.total_input_tokens, 12);
+    }
+
+    #[test]
+    fn test_load_session_uses_non_default_config_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude-work");
+        let sessions = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 5151;
+        let session_id = "session-5151";
+        let session_path = sessions.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, session_id, &cwd);
+
+        let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(
+            transcript_dir.join(format!("{}.jsonl", session_id)),
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","version":"2.1.90","gitBranch":"main","message":{"role":"user","content":"profile specific prompt"}}
+{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":12,"output_tokens":6,"cache_read_input_tokens":3,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"done"}]}}
+"#,
+        )
+        .unwrap();
+
+        let mut collector = ClaudeCollector::new();
+        let process_info = make_proc_info(pid, "claude");
+        let children_map = HashMap::new();
+        let ports = HashMap::new();
+        let config = ConfigDir::new(profile);
+
+        let session = collector
+            .load_session(&session_path, &config, &process_info, &children_map, &ports)
+            .unwrap();
+
+        assert_eq!(session.session_id, session_id);
+        assert_eq!(session.cwd, cwd.to_str().unwrap());
+        assert_eq!(session.total_input_tokens, 12);
+        assert_eq!(session.total_cache_read, 3);
+        assert_eq!(session.initial_prompt, "profile specific prompt");
+    }
+
     #[test]
     fn test_parse_transcript_basic_tokens() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","version":"2.1.86","gitBranch":"main","message":{"role":"user","content":"fix the bug"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"role":"assistant","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":200,"cache_creation_input_tokens":30},"content":[{"type":"text","text":"I found the issue."}]}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","version":"2.1.86","gitBranch":"main","message":{"role":"user","content":"fix the bug"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"role":"assistant","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":200,"cache_creation_input_tokens":30},"content":[{"type":"text","text":"I found the issue."}]}}"#,
+            ],
+        );
         let result = parse_transcript(file.path(), 0);
         assert_eq!(result.total_input, 100);
         assert_eq!(result.total_output, 50);
@@ -1049,12 +1888,15 @@ mod tests {
     #[test]
     fn test_parse_transcript_multiple_turns() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"first prompt"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"First response."}]}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"second prompt"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:01:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":200,"output_tokens":80,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Second response."}]}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"first prompt"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"First response."}]}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"second prompt"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:01:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":200,"output_tokens":80,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Second response."}]}}"#,
+            ],
+        );
         let result = parse_transcript(file.path(), 0);
         assert_eq!(result.turn_count, 2);
         assert_eq!(result.total_input, 300); // 100 + 200
@@ -1065,10 +1907,13 @@ mod tests {
     #[test]
     fn test_parse_transcript_tool_use_current_task() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"fix the bug"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/main.rs"}}]}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"fix the bug"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/main.rs"}}]}}"#,
+            ],
+        );
         let result = parse_transcript(file.path(), 0);
         assert_eq!(result.current_task, "Edit src/main.rs");
     }
@@ -1076,9 +1921,12 @@ mod tests {
     #[test]
     fn test_parse_transcript_initial_prompt() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"refactor the auth module"}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"refactor the auth module"}}"#,
+            ],
+        );
         let result = parse_transcript(file.path(), 0);
         assert_eq!(result.initial_prompt, "refactor the auth module");
     }
@@ -1086,18 +1934,24 @@ mod tests {
     #[test]
     fn test_parse_transcript_incremental_offset() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"first prompt"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"First response."}]}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"first prompt"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"First response."}]}}"#,
+            ],
+        );
         let first = parse_transcript(file.path(), 0);
         let offset = first.new_offset;
         assert!(offset > 0);
 
         // Append a third line (new assistant turn)
-        write_lines(&mut file, &[
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:01:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":40,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Third."}]}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:01:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":40,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Third."}]}}"#,
+            ],
+        );
         let delta = parse_transcript(file.path(), offset);
         assert_eq!(delta.turn_count, 1);
         assert_eq!(delta.total_input, 40);
@@ -1116,7 +1970,10 @@ mod tests {
     #[test]
     fn test_encode_cwd_path() {
         assert_eq!(encode_cwd_path("/Users/foo/bar"), "-Users-foo-bar");
-        assert_eq!(encode_cwd_path("/home/user/my_project.v2"), "-home-user-my-project-v2");
+        assert_eq!(
+            encode_cwd_path("/home/user/my_project.v2"),
+            "-home-user-my-project-v2"
+        );
     }
 
     #[test]
@@ -1124,11 +1981,20 @@ mod tests {
         // Base model with low token usage → 200K
         assert_eq!(context_window_for_model("claude-opus-4-6", 50_000), 200_000);
         // Explicit [1m] suffix → 1M regardless of token count
-        assert_eq!(context_window_for_model("claude-opus-4-6[1m]", 0), 1_000_000);
-        assert_eq!(context_window_for_model("claude-sonnet-4-6", 100_000), 200_000);
+        assert_eq!(
+            context_window_for_model("claude-opus-4-6[1m]", 0),
+            1_000_000
+        );
+        assert_eq!(
+            context_window_for_model("claude-sonnet-4-6", 100_000),
+            200_000
+        );
         assert_eq!(context_window_for_model("unknown-model", 0), 200_000);
         // Token usage exceeds 200K → must be 1M window
-        assert_eq!(context_window_for_model("claude-opus-4-6", 250_000), 1_000_000);
+        assert_eq!(
+            context_window_for_model("claude-opus-4-6", 250_000),
+            1_000_000
+        );
     }
 
     #[test]
@@ -1139,18 +2005,24 @@ mod tests {
 
     #[test]
     fn test_shorten_path() {
-        assert_eq!(shorten_path("src/collector/claude.rs"), "collector/claude.rs");
+        assert_eq!(
+            shorten_path("src/collector/claude.rs"),
+            "collector/claude.rs"
+        );
         assert_eq!(shorten_path("main.rs"), "main.rs");
     }
 
     #[test]
     fn test_parse_transcript_skips_malformed_json() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
-            r#"THIS IS NOT VALID JSON"#,
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"response"}]}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
+                r#"THIS IS NOT VALID JSON"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"response"}]}}"#,
+            ],
+        );
         let result = parse_transcript(file.path(), 0);
         // Bad line should be skipped, assistant line still parsed
         assert_eq!(result.turn_count, 1);
@@ -1162,10 +2034,13 @@ mod tests {
     fn test_parse_transcript_file_shrunk_resets() {
         use std::io::Seek;
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"first"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"resp"}]}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"first"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"resp"}]}}"#,
+            ],
+        );
         let first = parse_transcript(file.path(), 0);
         let old_offset = first.new_offset;
         assert!(old_offset > 0);
@@ -1173,9 +2048,12 @@ mod tests {
         // Simulate file rotation: truncate and write shorter content
         file.as_file().set_len(0).unwrap();
         file.seek(std::io::SeekFrom::Start(0)).unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"assistant","timestamp":"2026-03-28T16:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"new session"}]}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"assistant","timestamp":"2026-03-28T16:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"new session"}]}}"#,
+            ],
+        );
         // Pass old offset that is now beyond file length
         let result = parse_transcript(file.path(), old_offset);
         // Should reset to 0 and parse the new content
@@ -1186,12 +2064,15 @@ mod tests {
     #[test]
     fn test_parse_transcript_current_task_cleared_between_turns() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            // Turn 1: has tool_use
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/main.rs"}}]}}"#,
-            // Turn 2: text only, no tool_use
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:01:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Done, all changes applied."}]}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                // Turn 1: has tool_use
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/main.rs"}}]}}"#,
+                // Turn 2: text only, no tool_use
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:01:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Done, all changes applied."}]}}"#,
+            ],
+        );
         let result = parse_transcript(file.path(), 0);
         assert_eq!(result.turn_count, 2);
         // current_task should be empty because last turn had no tool_use
@@ -1201,9 +2082,12 @@ mod tests {
     #[test]
     fn test_parse_transcript_version_and_git_branch() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","version":"2.1.90","gitBranch":"feat/payments","message":{"role":"user","content":"add stripe"}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","version":"2.1.90","gitBranch":"feat/payments","message":{"role":"user","content":"add stripe"}}"#,
+            ],
+        );
         let result = parse_transcript(file.path(), 0);
         assert_eq!(result.version, "2.1.90");
         assert_eq!(result.git_branch, "feat/payments");
@@ -1214,7 +2098,10 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write!(file, r#"{{"effortLevel":"high","other":true}}"#).unwrap();
         file.flush().unwrap();
-        assert_eq!(read_effort_from_settings(file.path()).as_deref(), Some("high"));
+        assert_eq!(
+            read_effort_from_settings(file.path()).as_deref(),
+            Some("high")
+        );
     }
 
     #[test]

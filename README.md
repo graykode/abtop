@@ -3,6 +3,7 @@
 **Like [btop](https://github.com/aristocratos/btop), but for your AI coding agents.**
 
 See every Claude Code and Codex CLI session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
+Claude Code and Codex CLI sessions are discovered from local process/file state, so multiple active profiles are supported across macOS and Linux.
 
 ![demo](assets/demo.gif)
 
@@ -120,7 +121,7 @@ Colorblind-friendly themes:
 
 ## Privacy
 
-abtop reads local files only. No API keys, no auth. Tool names and file paths are shown in the UI, but file contents and prompt text are never displayed. Session summaries are generated via `claude --print`, which makes its own API call — this is the only indirect network usage.
+abtop reads local files and local process/open-file metadata only. No API keys, no auth. Tool names and file paths are shown in the UI, but file contents and prompt text are never displayed. Session summaries are generated via `claude --print`, which makes its own API call — this is the only indirect network usage.
 
 ## Acknowledgements
 

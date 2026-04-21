@@ -75,15 +75,26 @@ Panel descriptions:
 
 All read-only from local filesystem + `ps` + `lsof`. No API calls, no auth.
 
-### 1. Claude Code session discovery: `~/.claude/sessions/{PID}.json`
+### 1. Claude Code session discovery: process + config-root mapping
+
+Discovery strategy:
+1. Find running `claude` processes via `ps`
+2. Map PID → open files/directories via `lsof`
+3. Infer Claude config roots from open paths that contain `sessions/` and `projects/`
+4. Read `{config-root}/sessions/{PID}.json`, falling back to scanning session files for the matching embedded PID
+5. Parse `{config-root}/projects/{encoded-path}/{sessionId}.jsonl`
+
+Fallback config roots are still scanned: `~/.claude`, abtop's own `CLAUDE_CONFIG_DIR`, and on Linux any `CLAUDE_CONFIG_DIR` read from `/proc/{pid}/environ`.
+
+Session file format:
 ```json
 { "pid": 7336, "sessionId": "2f029acc-...", "cwd": "/Users/graykode/abtop", "startedAt": 1774715116826, "kind": "interactive", "entrypoint": "cli" }
 ```
 - ~170 bytes. Created on start, deleted on exit.
-- Scan all files, verify PID alive with `ps -p {pid} -o command=` containing `/claude`.
+- Verify PID alive with shared `ps` data containing a `claude` binary.
 - Skip `--print` sessions (abtop's own LLM calls for summary generation).
 
-### 2. Claude Code transcript: `~/.claude/projects/{encoded-path}/{sessionId}.jsonl`
+### 2. Claude Code transcript: `{config-root}/projects/{encoded-path}/{sessionId}.jsonl`
 Path encoding: `/Users/foo/bar` → `-Users-foo-bar`
 
 Key line types:
