@@ -324,7 +324,15 @@ impl ClaudeCollector {
                         let remaining = 500 - prev.tool_calls.len();
                         prev.tool_calls.extend(delta.tool_calls.into_iter().take(remaining));
                     }
-                    prev.last_assistant_ts_ms = delta.last_assistant_ts_ms;
+                    // Only overwrite turn-state when the delta actually
+                    // observed new user/assistant lines. A no-op tick (file
+                    // didn't grow) returns an empty delta whose zeroed
+                    // timestamps would otherwise wipe the live markers and
+                    // break the timeline animation between polls.
+                    if delta.saw_turn {
+                        prev.last_assistant_ts_ms = delta.last_assistant_ts_ms;
+                        prev.last_user_ts_ms = delta.last_user_ts_ms;
+                    }
                     if prev.initial_prompt.is_empty() && !delta.initial_prompt.is_empty() {
                         prev.initial_prompt = delta.initial_prompt;
                     }
@@ -357,7 +365,8 @@ impl ClaudeCollector {
             token_history: Vec::new(),
             initial_prompt: String::new(),
             first_assistant_text: String::new(),
-            tool_calls: Vec::new(), last_assistant_ts_ms: 0,
+            tool_calls: Vec::new(), last_assistant_ts_ms: 0, last_user_ts_ms: 0,
+            saw_turn: false,
         };
         let cached = self
             .transcript_cache
@@ -507,6 +516,7 @@ impl ClaudeCollector {
             first_assistant_text,
             tool_calls,
             pending_since_ms: cached.last_assistant_ts_ms,
+            thinking_since_ms: cached.last_user_ts_ms,
         })
     }
 
@@ -878,6 +888,15 @@ struct TranscriptResult {
     tool_calls: Vec<crate::model::ToolCall>,
     /// Timestamp of the last assistant turn (epoch ms), used to compute tool duration.
     last_assistant_ts_ms: u64,
+    /// Timestamp (epoch ms) of the most recent `user` line that has not been
+    /// followed by an assistant turn. Zero when the latest entry was an
+    /// assistant turn. Mutually exclusive with `last_assistant_ts_ms`.
+    last_user_ts_ms: u64,
+    /// True when this parse observed at least one `user` or `assistant`
+    /// line. When false the timestamp fields above are just defaults and
+    /// must not overwrite cached state — otherwise a no-new-data tick
+    /// would clear the live pending/thinking markers.
+    saw_turn: bool,
 }
 
 /// Check if a path is a symlink without following it.
@@ -929,6 +948,8 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
         first_assistant_text: String::new(),
         tool_calls: Vec::new(),
         last_assistant_ts_ms: 0,
+        last_user_ts_ms: 0,
+        saw_turn: false,
     };
 
     let file = match fs::File::open(path) {
@@ -1124,6 +1145,9 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                 if entry_ts_ms > 0 {
                                     result.last_assistant_ts_ms = entry_ts_ms;
                                 }
+                                // Any assistant turn closes the prior "thinking" window.
+                                result.last_user_ts_ms = 0;
+                                result.saw_turn = true;
                             }
                         }
                         Some("user") => {
@@ -1145,6 +1169,13 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                 }
                                 result.last_assistant_ts_ms = 0;
                             }
+                            // Mark the start of a thinking window — next assistant
+                            // turn clears it. Covers both prompts and tool_result
+                            // lines (both serialize as `user` type).
+                            if entry_ts_ms > 0 {
+                                result.last_user_ts_ms = entry_ts_ms;
+                            }
+                            result.saw_turn = true;
                             if let Some(v) = val.get("version").and_then(|v| v.as_str()) {
                                 result.version = v.to_string();
                             }

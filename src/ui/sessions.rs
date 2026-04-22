@@ -698,7 +698,12 @@ fn draw_timeline(
     scroll: usize,
 ) {
     let tool_calls = &session.tool_calls;
-    if tool_calls.is_empty() {
+    let is_thinking = session.thinking_since_ms > 0
+        && matches!(
+            session.status,
+            crate::model::SessionStatus::Working | crate::model::SessionStatus::Waiting
+        );
+    if tool_calls.is_empty() && !is_thinking {
         return;
     }
 
@@ -723,6 +728,11 @@ fn draw_timeline(
     let is_pending = |tc: &crate::model::ToolCall| -> bool {
         tc.duration_ms == 0 && session.pending_since_ms > 0
     };
+    let thinking_duration = if is_thinking {
+        now_ms.saturating_sub(session.thinking_since_ms)
+    } else {
+        0
+    };
 
     let total_duration: u64 = tool_calls.iter().map(live_duration).sum();
     let max_duration = tool_calls
@@ -734,12 +744,19 @@ fn draw_timeline(
 
     let mut lines = Vec::new();
 
-    // Header — note "1 running" if any tool is live.
+    // Header — note "1 running" / "thinking Xs" if the session is live.
     let pending_count = tool_calls.iter().filter(|tc| is_pending(tc)).count();
-    let running_note = if pending_count > 0 {
-        format!(", {} running", pending_count)
-    } else {
+    let mut status_notes: Vec<String> = Vec::new();
+    if pending_count > 0 {
+        status_notes.push(format!("{} running", pending_count));
+    }
+    if is_thinking {
+        status_notes.push(format!("thinking {}", fmt_duration(thinking_duration)));
+    }
+    let running_note = if status_notes.is_empty() {
         String::new()
+    } else {
+        format!(", {}", status_notes.join(", "))
     };
     lines.push(Line::from(vec![
         Span::styled(
@@ -756,8 +773,12 @@ fn draw_timeline(
     // Available width for the bar: total width - name(7) - arg(22) - duration(8) - padding(5)
     let bar_width = (area.width as usize).saturating_sub(42).max(5);
 
-    // Render each tool call as a row
-    let visible_rows = (area.height as usize).saturating_sub(1); // -1 for header
+    // Render each tool call as a row. Reserve the last visible row for the
+    // live Thinking row when the model is between turns.
+    let header_rows = 1;
+    let thinking_rows = if is_thinking { 1 } else { 0 };
+    let visible_rows = (area.height as usize)
+        .saturating_sub(header_rows + thinking_rows);
     let start = scroll.min(tool_calls.len().saturating_sub(visible_rows));
 
     for tc in tool_calls.iter().skip(start).take(visible_rows) {
@@ -821,6 +842,39 @@ fn draw_timeline(
             Span::styled(
                 duration_label,
                 Style::default().fg(duration_color),
+            ),
+        ]));
+    }
+
+    // Virtual "Thinking" row — the model is generating its next turn, which
+    // never shows up as a tool_use in the JSONL. Growth scales against the
+    // longest tool so short thinks fill gradually; long thinks cap at full.
+    if is_thinking {
+        let color = theme.title;
+        let pulse_bright = (now_ms / 500).is_multiple_of(2);
+        let bar_fill = if max_duration > 0 {
+            ((thinking_duration as f64 / max_duration as f64) * bar_width as f64).ceil() as usize
+        } else {
+            bar_width
+        };
+        let bar_fill = bar_fill.min(bar_width);
+        let bar_empty = bar_width - bar_fill;
+        let name_style = Style::default()
+            .fg(color)
+            .add_modifier(if pulse_bright { Modifier::BOLD } else { Modifier::DIM });
+        let bar_style = Style::default().fg(color).add_modifier(Modifier::DIM);
+        lines.push(Line::from(vec![
+            Span::styled("●Think ", name_style),
+            Span::styled(
+                format!(" {:<20}", "generating reply"),
+                Style::default().fg(theme.graph_text),
+            ),
+            Span::styled(" ", Style::default()),
+            Span::styled("█".repeat(bar_fill), bar_style),
+            Span::styled("░".repeat(bar_empty), Style::default().fg(theme.div_line)),
+            Span::styled(
+                format!(" {:>5}…", fmt_duration(thinking_duration)),
+                Style::default().fg(color),
             ),
         ]));
     }

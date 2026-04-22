@@ -108,6 +108,11 @@ pub struct AgentSession {
     /// turn has already been closed (no tools currently in flight).
     /// Used to animate the timeline bar for the running tool(s).
     pub pending_since_ms: u64,
+    /// Unix-epoch ms of the most recent `user` line (prompt or tool_result)
+    /// that has not yet been followed by an assistant response. Zero when
+    /// the last transcript entry was an assistant turn. Used to render a
+    /// live "Thinking" row while the model is generating its next reply.
+    pub thinking_since_ms: u64,
 }
 
 impl AgentSession {
@@ -210,6 +215,7 @@ mod tests {
             first_assistant_text: String::new(),
             tool_calls: Vec::new(),
             pending_since_ms: 0,
+            thinking_since_ms: 0,
         }
     }
 

@@ -114,6 +114,7 @@ pub fn populate_demo(app: &mut App) {
                 ToolCall { name: "WebSearch".into(), arg: "stripe webhook best practice".into(), duration_ms: 0 },
             ],
             pending_since_ms: now - 6_000, // 6s ago → bar animates
+            thinking_since_ms: 0,
         },
         AgentSession {
             agent_cli: "claude",
@@ -161,6 +162,7 @@ pub fn populate_demo(app: &mut App) {
             initial_prompt: "Add batch inference endpoint with GPU scheduling".into(),
             tool_calls: vec![],
             pending_since_ms: 0,
+            thinking_since_ms: 0,
         },
         AgentSession {
             agent_cli: "claude",
@@ -226,6 +228,10 @@ pub fn populate_demo(app: &mut App) {
                 ToolCall { name: "Bash".into(), arg: "npm run dev".into(), duration_ms: 1500 },
             ],
             pending_since_ms: 0,
+            // Model is generating its next reply — virtual "Thinking" row
+            // animates. 1s offset keeps the bar visibly growing against the
+            // session's 2.8s max tool duration before it caps at 100%.
+            thinking_since_ms: now - 1_000,
         },
         AgentSession {
             agent_cli: "codex",
@@ -271,6 +277,7 @@ pub fn populate_demo(app: &mut App) {
             initial_prompt: "Create interactive heatmap component with D3.js".into(),
             tool_calls: vec![],
             pending_since_ms: 0,
+            thinking_since_ms: 0,
         },
     ];
 

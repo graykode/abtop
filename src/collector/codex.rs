@@ -274,6 +274,7 @@ impl CodexCollector {
             first_assistant_text: String::new(),
             tool_calls: vec![],
             pending_since_ms: 0,
+            thinking_since_ms: 0,
         }, rate_limit))
     }
 
