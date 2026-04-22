@@ -251,6 +251,18 @@ impl ClaudeCollector {
         let mut sf: SessionFile = serde_json::from_str(&content).ok()?;
         sf.sanitize();
 
+        // `/clear` mints a new sessionId + transcript without rewriting
+        // `sessions/{PID}.json`. Override with the most recent transcript in
+        // the project dir so counters/status track the live session instead
+        // of the stale one. (#68)
+        if let Some(live_sid) =
+            find_live_session_id(&config.projects_dir, &sf.cwd, sf.started_at)
+        {
+            if live_sid != sf.session_id {
+                sf.session_id = live_sid;
+            }
+        }
+
         let proc_cmd = process_info.get(&sf.pid).map(|p| p.command.as_str());
         let pid_alive = proc_cmd
             .map(|c| process::cmd_has_binary(c, "claude"))
@@ -824,6 +836,50 @@ fn candidate_config_roots_from_path(path: &Path) -> Vec<PathBuf> {
 
 fn is_claude_config_root(path: &Path) -> bool {
     path.join("sessions").is_dir() && path.join("projects").is_dir()
+}
+
+/// Find the currently-live session_id for a PID by scanning its project
+/// directory for the most recently modified transcript.
+///
+/// `/clear` mints a new sessionId and a new `{sid}.jsonl` without rewriting
+/// `sessions/{PID}.json`, so the session file's sid goes stale. The fresh
+/// transcript is however always present on disk in the same project dir.
+/// `started_at_ms` filters out transcripts older than this PID's lifetime
+/// (prior runs or sibling claudes that left files behind).
+fn find_live_session_id(projects_dir: &Path, cwd: &str, started_at_ms: u64) -> Option<String> {
+    let encoded = encode_cwd_path(cwd);
+    let project_dir = projects_dir.join(&encoded);
+    let entries = fs::read_dir(&project_dir).ok()?;
+
+    // Allow a small grace window (5s) before started_at to tolerate clock
+    // skew between the session file's startedAt and jsonl creation mtime.
+    let min_mtime = std::time::UNIX_EPOCH
+        + std::time::Duration::from_millis(started_at_ms.saturating_sub(5_000));
+
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for entry in entries.flatten() {
+        if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        if mtime < min_mtime {
+            continue;
+        }
+        match &best {
+            Some((best_mtime, _)) if mtime <= *best_mtime => {}
+            _ => best = Some((mtime, stem.to_string())),
+        }
+    }
+
+    best.map(|(_, sid)| sid)
 }
 
 fn find_session_file_for_pid(sessions_dir: &Path, pid: u32) -> Option<PathBuf> {
@@ -2260,5 +2316,119 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
         // CLAUDE_CONFIG_DIR_EXTRA should not match CLAUDE_CONFIG_DIR
         let data = b"CLAUDE_CONFIG_DIR_EXTRA=/wrong\0";
         assert!(parse_environ_var(data, "CLAUDE_CONFIG_DIR").is_none());
+    }
+
+    fn set_mtime(path: &Path, secs_from_now: i64) {
+        let t = if secs_from_now >= 0 {
+            std::time::SystemTime::now() + std::time::Duration::from_secs(secs_from_now as u64)
+        } else {
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs((-secs_from_now) as u64)
+        };
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(t).unwrap();
+    }
+
+    #[test]
+    fn test_find_live_session_id_picks_newest_jsonl() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = temp.path().join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let project_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let old_path = project_dir.join("old-sid.jsonl");
+        let new_path = project_dir.join("new-sid.jsonl");
+        std::fs::write(&old_path, "{}\n").unwrap();
+        std::fs::write(&new_path, "{}\n").unwrap();
+        set_mtime(&old_path, -60);
+        set_mtime(&new_path, 0);
+
+        let started_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64)
+            .saturating_sub(120_000);
+
+        let sid = find_live_session_id(&projects, cwd.to_str().unwrap(), started_ms);
+        assert_eq!(sid.as_deref(), Some("new-sid"));
+    }
+
+    #[test]
+    fn test_find_live_session_id_filters_by_started_at() {
+        // An old jsonl from a prior claude run in the same cwd must not be
+        // picked up when started_at is more recent.
+        let temp = tempfile::tempdir().unwrap();
+        let projects = temp.path().join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let project_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let stale = project_dir.join("abandoned.jsonl");
+        std::fs::write(&stale, "{}\n").unwrap();
+        set_mtime(&stale, -3600);
+
+        // Session started 60s ago — the hour-old file must be filtered.
+        let started_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64)
+            .saturating_sub(60_000);
+
+        let sid = find_live_session_id(&projects, cwd.to_str().unwrap(), started_ms);
+        assert!(sid.is_none(), "expected None, got {:?}", sid);
+    }
+
+    #[test]
+    fn test_find_live_session_id_empty_dir_returns_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = temp.path().join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(projects.join(encode_cwd_path(cwd.to_str().unwrap()))).unwrap();
+        assert!(find_live_session_id(&projects, cwd.to_str().unwrap(), 0).is_none());
+    }
+
+    #[test]
+    fn test_load_session_overrides_sid_after_clear() {
+        // Reproduces issue #68: session file still points at the PID's initial
+        // sessionId, but a newer transcript (from /clear) exists in the same
+        // project dir. The loaded session must reflect the new sid + its
+        // counters, not the stale one.
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 7777;
+        let old_sid = "old-sid-before-clear";
+        let new_sid = "new-sid-after-clear";
+        let session_path = sessions.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, old_sid, &cwd);
+
+        let old_transcript = write_transcript(&projects, &cwd, old_sid, "first");
+        let new_transcript = write_transcript(&projects, &cwd, new_sid, "after clear");
+        set_mtime(&old_transcript, -30);
+        set_mtime(&new_transcript, 0);
+
+        let config = ConfigDir::new(profile.clone());
+        let process_info = make_proc_info(pid, "claude");
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config.clone()];
+
+        let sessions = collector.load_session_paths(
+            &[(session_path, config)],
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, new_sid);
     }
 }
