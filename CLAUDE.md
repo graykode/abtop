@@ -352,3 +352,4 @@ abtop reads transcripts, prompts, tool inputs, and memory files. These may conta
 - **Terminal size**: minimum 80x24. Panels degrade gracefully when small (context panel hidden first).
 - **PID reuse in port cache**: invalidate cached ports when the set of tracked PIDs changes.
 - **Rate limit staleness**: reject rate limit data older than 10 minutes.
+- **`/clear` + multi-PID same cwd**: after `/clear`, Claude Code mints a new `sessionId` + `.jsonl` without rewriting `sessions/{PID}.json`. abtop overrides the stale sid by picking the newest transcript in the project dir, but this heuristic can't disambiguate ownership when two live `claude` PIDs share a cwd — so the override is disabled in that case and both sessions keep their original sid until exit. Use separate worktrees if live tracking is needed on both simultaneously.
