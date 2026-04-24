@@ -390,8 +390,13 @@ impl ClaudeCollector {
                         prev.initial_prompt = delta.initial_prompt;
                     }
                     prev.file_accesses.extend(delta.file_accesses);
-                    if prev.file_accesses.len() > MAX_FILE_ACCESSES {
-                        prev.file_accesses.truncate(MAX_FILE_ACCESSES);
+                    // Sliding window: drop OLDEST entries past the cap so the
+                    // cache always holds the most recent MAX_FILE_ACCESSES.
+                    // `truncate` would have kept the oldest and silently
+                    // dropped every new access once the cache hit the cap.
+                    let len = prev.file_accesses.len();
+                    if len > MAX_FILE_ACCESSES {
+                        prev.file_accesses.drain(..len - MAX_FILE_ACCESSES);
                     }
                     prev.new_offset = delta.new_offset;
                     self.transcript_cache.insert(sf.session_id.clone(), prev);
@@ -1319,26 +1324,27 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                                     duration_ms: 0, // filled on next user turn
                                                 });
                                             }
-                                            // Extract file access audit entries
-                                            if result.file_accesses.len() < MAX_FILE_ACCESSES {
-                                                if let Some(file_path) = item
-                                                    .get("input")
-                                                    .and_then(|i| i.get("file_path"))
-                                                    .and_then(|f| f.as_str())
-                                                {
-                                                    let op = match tool {
-                                                        "Read" => Some(FileOp::Read),
-                                                        "Edit" => Some(FileOp::Edit),
-                                                        "Write" => Some(FileOp::Write),
-                                                        _ => None,
-                                                    };
-                                                    if let Some(op) = op {
-                                                        result.file_accesses.push(FileAccess {
-                                                            path: file_path.to_string(),
-                                                            operation: op,
-                                                            turn_index: result.turn_count,
-                                                        });
-                                                    }
+                                            // Extract file access audit entries.
+                                            // Cap is applied once at the end of
+                                            // parse_transcript via a sliding window so
+                                            // the latest accesses always survive.
+                                            if let Some(file_path) = item
+                                                .get("input")
+                                                .and_then(|i| i.get("file_path"))
+                                                .and_then(|f| f.as_str())
+                                            {
+                                                let op = match tool {
+                                                    "Read" => Some(FileOp::Read),
+                                                    "Edit" => Some(FileOp::Edit),
+                                                    "Write" => Some(FileOp::Write),
+                                                    _ => None,
+                                                };
+                                                if let Some(op) = op {
+                                                    result.file_accesses.push(FileAccess {
+                                                        path: file_path.to_string(),
+                                                        operation: op,
+                                                        turn_index: result.turn_count,
+                                                    });
                                                 }
                                             }
                                         }
@@ -1398,6 +1404,14 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
             }
             Err(_) => break,
         }
+    }
+
+    // Sliding window cap: keep the most recent MAX_FILE_ACCESSES, drop
+    // the oldest. Applied once after the parse loop so peak memory stays
+    // bounded by the file size, not by the number of historical accesses.
+    let len = result.file_accesses.len();
+    if len > MAX_FILE_ACCESSES {
+        result.file_accesses.drain(..len - MAX_FILE_ACCESSES);
     }
 
     result.new_offset = bytes_read;
@@ -2212,6 +2226,38 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
         assert_eq!(result.total_input, 300); // 100 + 200
         assert_eq!(result.total_output, 130); // 50 + 80
         assert_eq!(result.token_history.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_transcript_file_accesses_sliding_window() {
+        // Regression: parse_transcript used to gate pushes on a `< MAX`
+        // check, so once the cap was hit during a single parse the latest
+        // tool_use entries were silently dropped — leaving the audit log
+        // frozen on the *oldest* file accesses. The fix moves the cap to
+        // a sliding window applied at end-of-parse, so the last
+        // MAX_FILE_ACCESSES entries always survive.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let extra = 5usize;
+        let total = MAX_FILE_ACCESSES + extra;
+        let mut lines: Vec<String> = Vec::with_capacity(total);
+        for i in 0..total {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"tool_use","name":"Edit","input":{{"file_path":"src/file_{}.rs"}}}}]}}}}"#,
+                i
+            ));
+        }
+        let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_lines(&mut file, &line_refs);
+
+        let result = parse_transcript(file.path(), 0);
+
+        assert_eq!(result.file_accesses.len(), MAX_FILE_ACCESSES);
+        // Oldest `extra` entries must have been dropped, newest must survive.
+        assert_eq!(result.file_accesses[0].path, format!("src/file_{}.rs", extra));
+        assert_eq!(
+            result.file_accesses[MAX_FILE_ACCESSES - 1].path,
+            format!("src/file_{}.rs", total - 1),
+        );
     }
 
     #[test]
