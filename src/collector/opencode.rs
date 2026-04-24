@@ -17,12 +17,15 @@ const MAX_SESSIONS: u32 = 20;
 /// 3. Match running PIDs to sessions by cwd
 ///
 /// Uses `sqlite3 -readonly -json` for safe concurrent reads (WAL mode).
-/// Queries run on slow ticks only (every ~10s via MultiCollector gating)
-/// to avoid forking a sqlite3 process every 2s.
+/// Queries run only on slow ticks (every ~10s via SharedProcessData.slow_tick)
+/// to avoid forking a sqlite3 process every 2s. The last result is cached and
+/// reused on fast ticks.
 pub struct OpenCodeCollector {
     db_path: PathBuf,
     /// Whether sqlite3 CLI is available (checked once).
     sqlite3_available: Option<bool>,
+    /// Cached session rows from the last slow-tick query.
+    cached_sessions: Vec<DbSession>,
 }
 
 impl OpenCodeCollector {
@@ -33,6 +36,7 @@ impl OpenCodeCollector {
         Self {
             db_path: data_dir.join("opencode").join("opencode.db"),
             sqlite3_available: None,
+            cached_sessions: Vec::new(),
         }
     }
 
@@ -46,12 +50,24 @@ impl OpenCodeCollector {
     }
 
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
-        // Security: skip if db_path is a symlink (fail-closed)
-        if is_symlink(&self.db_path) || !self.db_path.exists() || !self.check_sqlite3() {
+        // Fail-closed on a symlinked DB (security policy). No exists() check:
+        // query_sessions already returns None if the file is absent or
+        // unreadable, and a pre-check would be TOCTOU-racy.
+        if is_symlink(&self.db_path) || !self.check_sqlite3() {
             return vec![];
         }
 
-        // Find running opencode PIDs and their commands for cwd matching
+        // Refresh the SQLite snapshot only on slow ticks. On fast ticks we
+        // reuse cached_sessions and only refresh the live-process matching.
+        if shared.slow_tick || self.cached_sessions.is_empty() {
+            if let Some(fresh) = self.query_sessions() {
+                self.cached_sessions = fresh;
+            }
+        }
+        if self.cached_sessions.is_empty() {
+            return vec![];
+        }
+
         let opencode_pids = Self::find_opencode_pids(&shared.process_info);
         let pid_commands: HashMap<u32, &str> = opencode_pids.iter()
             .filter_map(|&pid| {
@@ -59,11 +75,7 @@ impl OpenCodeCollector {
             })
             .collect();
 
-        // Query sessions from SQLite
-        let db_sessions = match self.query_sessions() {
-            Some(s) => s,
-            None => return vec![],
-        };
+        let db_sessions = self.cached_sessions.clone();
 
         let now_ms = current_time_ms();
         let mut sessions = Vec::new();
@@ -337,6 +349,7 @@ impl super::AgentCollector for OpenCodeCollector {
     }
 }
 
+#[derive(Clone)]
 struct DbSession {
     id: String,
     title: String,
