@@ -3,6 +3,7 @@ mod collector;
 mod config;
 mod demo;
 mod model;
+#[cfg(feature = "claude")]
 mod setup;
 mod theme;
 mod ui;
@@ -27,10 +28,16 @@ fn main() -> io::Result<()> {
         return run_update();
     }
 
-    // --setup flag: configure StatusLine hook and exit
+    // --setup flag: configure StatusLine hook and exit (Claude-only).
+    #[cfg(feature = "claude")]
     if std::env::args().any(|a| a == "--setup") {
         setup::run_setup();
         return Ok(());
+    }
+    #[cfg(not(feature = "claude"))]
+    if std::env::args().any(|a| a == "--setup") {
+        eprintln!("--setup installs the Claude StatusLine hook; rebuild with --features claude");
+        std::process::exit(1);
     }
 
     // --theme flag > config file > default

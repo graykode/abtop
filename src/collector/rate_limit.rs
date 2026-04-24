@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 const CLAUDE_RATE_FILE: &str = "abtop-rate-limits.json";
 
 /// Cached Codex rate limit: ~/.cache/abtop/codex-rate-limits.json
+#[cfg(feature = "codex")]
 const CODEX_CACHE_FILE: &str = "codex-rate-limits.json";
 
 #[derive(Debug, Deserialize)]
@@ -62,12 +63,14 @@ pub fn read_rate_limits(extra_dirs: &[PathBuf]) -> Vec<RateLimitInfo> {
 /// Rate limits have their own `resets_at` expiry and the cache is refreshed
 /// whenever the next Codex session runs, so the reader keeps serving the last
 /// known value regardless of file age — the UI shows "N m ago" for staleness.
+#[cfg(feature = "codex")]
 pub fn read_codex_cache() -> Option<RateLimitInfo> {
     let path = codex_cache_path()?;
     read_rate_file(&path, "codex")
 }
 
 /// Write Codex rate limit to cache file (atomic: write temp + rename).
+#[cfg(feature = "codex")]
 pub fn write_codex_cache(info: &RateLimitInfo) {
     let Some(path) = codex_cache_path() else { return };
     if let Some(parent) = path.parent() {
@@ -88,6 +91,7 @@ pub fn write_codex_cache(info: &RateLimitInfo) {
     }
 }
 
+#[cfg(feature = "codex")]
 fn window_json(pct: Option<f64>, resets_at: Option<u64>) -> String {
     match (pct, resets_at) {
         (Some(p), Some(r)) => format!(r#"{{"used_percentage":{},"resets_at":{}}}"#, p, r),
@@ -96,6 +100,7 @@ fn window_json(pct: Option<f64>, resets_at: Option<u64>) -> String {
     }
 }
 
+#[cfg(feature = "codex")]
 fn codex_cache_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("abtop").join(CODEX_CACHE_FILE))
 }

@@ -1,3 +1,4 @@
+#[cfg(feature = "claude")]
 use serde::Deserialize;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,6 +31,7 @@ pub struct FileAccess {
 }
 
 /// Maximum file access entries kept per session to bound memory.
+#[cfg(feature = "claude")]
 pub const MAX_FILE_ACCESSES: usize = 1000;
 
 /// Account-level rate limit info (shared across all sessions).
@@ -193,6 +195,8 @@ impl AgentSession {
     }
 }
 
+/// Claude session-file entry written by the Claude CLI under `~/.claude/`.
+#[cfg(feature = "claude")]
 #[derive(Debug, Deserialize)]
 pub struct SessionFile {
     pub pid: u32,
@@ -203,6 +207,7 @@ pub struct SessionFile {
     pub started_at: u64,
 }
 
+#[cfg(feature = "claude")]
 impl SessionFile {
     /// Truncate string fields to sane limits after deserialization.
     pub fn sanitize(&mut self) {
@@ -212,6 +217,7 @@ impl SessionFile {
 }
 
 /// Truncate a string at a char boundary to avoid panics on multi-byte UTF-8.
+#[cfg(feature = "claude")]
 fn truncate_string(s: &mut String, max_bytes: usize) {
     if s.len() > max_bytes {
         // Find the last char boundary at or before max_bytes

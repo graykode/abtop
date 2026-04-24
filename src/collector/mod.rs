@@ -1,9 +1,13 @@
+#[cfg(feature = "claude")]
 pub mod claude;
+#[cfg(feature = "codex")]
 pub mod codex;
 pub mod process;
 pub mod rate_limit;
 
+#[cfg(feature = "claude")]
 pub use claude::ClaudeCollector;
+#[cfg(feature = "codex")]
 pub use codex::CodexCollector;
 pub use rate_limit::read_rate_limits;
 
@@ -69,6 +73,7 @@ pub struct SharedProcessData {
     pub ports: HashMap<u32, Vec<u16>>,
     /// True on slow poll ticks (every 5 ticks ≈ 10s). Collectors should
     /// defer expensive discovery (e.g. /proc reads) to slow ticks.
+    #[allow(dead_code)] // not read when only codex feature is enabled
     pub slow_tick: bool,
 }
 
@@ -112,12 +117,16 @@ pub struct MultiCollector {
 const SLOW_POLL_INTERVAL: u32 = 5;
 
 impl MultiCollector {
+    // Per-agent cfg-gated push calls cannot use the `vec![]` macro.
+    #[allow(clippy::vec_init_then_push)]
     pub fn new() -> Self {
+        let mut collectors: Vec<Box<dyn AgentCollector>> = Vec::new();
+        #[cfg(feature = "claude")]
+        collectors.push(Box::new(ClaudeCollector::new()));
+        #[cfg(feature = "codex")]
+        collectors.push(Box::new(CodexCollector::new()));
         Self {
-            collectors: vec![
-                Box::new(ClaudeCollector::new()),
-                Box::new(CodexCollector::new()),
-            ],
+            collectors,
             tick_count: SLOW_POLL_INTERVAL, // trigger on first tick
             cached_ports: HashMap::new(),
             cached_port_pids: Vec::new(),
