@@ -11,6 +11,7 @@ keywords = ["tui", "monitor", "claude", "ai", "agent"]
 categories = ["command-line-utilities"]
 readme = "README.md"
 authors = ["Tae Hwan Jung <nlkey2022@gmail.com>"]
+exclude = ["assets/*", "assets/**/*"]
 
 [dependencies]
 ratatui = "0.29"

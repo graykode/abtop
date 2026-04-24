@@ -5,7 +5,7 @@
 See every Claude Code and Codex CLI session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
 Claude Code and Codex CLI sessions are discovered from local process/file state, so multiple active profiles are supported across macOS and Linux.
 
-![demo](assets/demo.gif)
+![demo](https://raw.githubusercontent.com/graykode/abtop/main/assets/demo.gif)
 
 ## Why
 
@@ -89,21 +89,21 @@ tmux new -s work
 
 | btop (default) | dracula | catppuccin |
 |:-:|:-:|:-:|
-| ![btop](assets/themes/btop.png) | ![dracula](assets/themes/dracula.png) | ![catppuccin](assets/themes/catppuccin.png) |
+| ![btop](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/btop.png) | ![dracula](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/dracula.png) | ![catppuccin](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/catppuccin.png) |
 
 | tokyo-night | gruvbox | nord |
 |:-:|:-:|:-:|
-| ![tokyo-night](assets/themes/tokyo-night.png) | ![gruvbox](assets/themes/gruvbox.png) | ![nord](assets/themes/nord.png) |
+| ![tokyo-night](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/tokyo-night.png) | ![gruvbox](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/gruvbox.png) | ![nord](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/nord.png) |
 
 Colorblind-friendly themes:
 
 | high-contrast | protanopia |
 |:-:|:-:|
-| ![high-contrast](assets/themes/high-contrast.png) | ![protanopia](assets/themes/protanopia.png) |
+| ![high-contrast](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/high-contrast.png) | ![protanopia](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/protanopia.png) |
 
 | deuteranopia | tritanopia |
 |:-:|:-:|
-| ![deuteranopia](assets/themes/deuteranopia.png) | ![tritanopia](assets/themes/tritanopia.png) |
+| ![deuteranopia](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/deuteranopia.png) | ![tritanopia](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/tritanopia.png) |
 
 ## Configuration
 
