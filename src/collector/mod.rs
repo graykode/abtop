@@ -2,6 +2,8 @@
 pub mod claude;
 #[cfg(feature = "codex")]
 pub mod codex;
+#[cfg(feature = "gemini")]
+pub mod gemini;
 pub mod process;
 pub mod rate_limit;
 
@@ -9,11 +11,14 @@ pub mod rate_limit;
 pub use claude::ClaudeCollector;
 #[cfg(feature = "codex")]
 pub use codex::CodexCollector;
+#[cfg(feature = "gemini")]
+pub use gemini::GeminiCollector;
 pub use rate_limit::read_rate_limits;
 
 /// Redact common secret patterns to avoid displaying credentials in the TUI.
 /// Replaces the prefix and all following non-whitespace chars with [REDACTED].
 /// Best-effort: covers well-known prefixed tokens, not arbitrary high-entropy strings.
+#[allow(dead_code)] // caller set depends on enabled agent features
 pub(crate) fn redact_secrets(s: &str) -> String {
     const PATTERNS: &[&str] = &[
         // Anthropic / OpenAI / OpenRouter
@@ -125,6 +130,8 @@ impl MultiCollector {
         collectors.push(Box::new(ClaudeCollector::new()));
         #[cfg(feature = "codex")]
         collectors.push(Box::new(CodexCollector::new()));
+        #[cfg(feature = "gemini")]
+        collectors.push(Box::new(GeminiCollector::new()));
         Self {
             collectors,
             tick_count: SLOW_POLL_INTERVAL, // trigger on first tick
