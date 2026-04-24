@@ -169,6 +169,14 @@ impl AgentSession {
         self.total_input_tokens + self.total_output_tokens + self.total_cache_create
     }
 
+    /// Whether this session's `*_tokens` fields are denominated in real tokens
+    /// (vs agent-native units like kiro's scaled credits). Cross-session token
+    /// aggregations (rate, total) must exclude sessions where this is false to
+    /// avoid mixing units.
+    pub fn reports_real_tokens(&self) -> bool {
+        self.agent_cli != "kiro"
+    }
+
     pub fn elapsed(&self) -> Duration {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
