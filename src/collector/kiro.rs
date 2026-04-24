@@ -378,14 +378,14 @@ fn clean_prompt_text(raw: &str) -> String {
 
 fn extract_tool_arg(input: &Value) -> String {
     if let Some(fp) = input.get("file_path").and_then(|f| f.as_str()) {
-        return shorten_path(fp);
+        return super::redact_secrets(&shorten_path(fp));
     }
     if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
         let short = cmd.lines().next().unwrap_or(cmd);
         return super::redact_secrets(&truncate(short, 40));
     }
     if let Some(pat) = input.get("pattern").and_then(|p| p.as_str()) {
-        return truncate(pat, 40);
+        return super::redact_secrets(&truncate(pat, 40));
     }
     // ReadInternalWebsites / MCP tools: inputs[0]
     if let Some(first) = input
@@ -394,7 +394,7 @@ fn extract_tool_arg(input: &Value) -> String {
         .and_then(|a| a.first())
         .and_then(|v| v.as_str())
     {
-        return truncate(first, 40);
+        return super::redact_secrets(&truncate(first, 40));
     }
     String::new()
 }
@@ -548,11 +548,13 @@ impl KiroCollector {
         };
 
         // Title precedence: metadata.title → parsed first prompt.
-        let initial_prompt = meta
-            .title
-            .clone()
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| parse_result.initial_prompt.clone());
+        let initial_prompt = super::redact_secrets(
+            &meta
+                .title
+                .clone()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| parse_result.initial_prompt.clone()),
+        );
 
         // Status: last_activity within 30s → Working; else check CPU/descendants.
         // CPU threshold 5.0 matches `has_active_descendant`'s threshold for consistency.
@@ -656,7 +658,7 @@ impl KiroCollector {
             mem_line_count: 0,
             children,
             initial_prompt,
-            first_assistant_text: parse_result.first_assistant_text,
+            first_assistant_text: super::redact_secrets(&parse_result.first_assistant_text),
             tool_calls: vec![],
             pending_since_ms: 0,
             thinking_since_ms: 0,
