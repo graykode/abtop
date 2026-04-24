@@ -664,7 +664,7 @@ fn format_tool_summary(name: &str, args: Option<&Value>) -> String {
         name.to_string()
     } else {
         let short: String = arg_str.chars().take(60).collect();
-        format!("{} {}", name, short)
+        format!("{} {}", name, super::redact_secrets(&short))
     }
 }
 
