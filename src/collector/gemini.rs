@@ -31,6 +31,8 @@ pub struct GeminiCollector {
     project_map: HashMap<String, String>,
     /// When the project map was last loaded (for periodic refresh)
     project_map_loaded: std::time::Instant,
+    /// Cached Gemini CLI version from ~/.nvm walk; refreshed on slow ticks.
+    cached_version: Option<String>,
 }
 
 impl GeminiCollector {
@@ -42,6 +44,7 @@ impl GeminiCollector {
             gemini_dir,
             project_map,
             project_map_loaded: std::time::Instant::now(),
+            cached_version: None,
         }
     }
 
@@ -50,38 +53,36 @@ impl GeminiCollector {
             return vec![];
         }
 
-        // Refresh project map every 30 seconds
         if self.project_map_loaded.elapsed().as_secs() > 30 {
             self.project_map = load_project_map(&self.gemini_dir);
             self.project_map_loaded = std::time::Instant::now();
         }
 
-        // Step 1: Find running gemini processes
-        let gemini_procs = find_gemini_pids(&shared.process_info);
+        // Gemini CLI version: walk ~/.nvm, which is expensive. Only refresh on
+        // slow ticks or the first call.
+        if shared.slow_tick || self.cached_version.is_none() {
+            self.cached_version = read_gemini_version();
+        }
+        let version = self.cached_version.clone().unwrap_or_default();
 
-        // Step 2: For each running process, find its cwd and resolve the project
+        let gemini_procs = find_gemini_pids(&shared.process_info);
         let mut sessions = Vec::new();
         let mut seen_sessions = std::collections::HashSet::new();
 
         for (pid, cwd) in &gemini_procs {
             let project_name = self.resolve_project_name(cwd);
-            let tmp_dir = self.gemini_dir.join("tmp").join(&project_name);
-            let chats_dir = tmp_dir.join("chats");
-
+            let chats_dir = self.gemini_dir.join("tmp").join(&project_name).join("chats");
             if !chats_dir.exists() {
                 continue;
             }
-
-            // Find the most recently modified session file in this project
             if let Some(session_path) = find_latest_session(&chats_dir) {
                 if let Some(session) = parse_gemini_session(
                     &session_path,
                     Some(*pid),
                     cwd,
                     &project_name,
-                    &shared.process_info,
-                    &shared.children_map,
-                    &shared.ports,
+                    &version,
+                    shared,
                 ) {
                     seen_sessions.insert(session.session_id.clone());
                     sessions.push(session);
@@ -89,34 +90,26 @@ impl GeminiCollector {
             }
         }
 
-        // Step 3: Also scan for recently active sessions (< 5 min) without a running process
-        // This handles sessions that just finished
-        let tmp_dir = self.gemini_dir.join("tmp");
-        if let Ok(entries) = fs::read_dir(&tmp_dir) {
-            for entry in entries.flatten() {
-                let chats_dir = entry.path().join("chats");
-                if !chats_dir.exists() {
-                    continue;
-                }
-                if let Ok(chat_entries) = fs::read_dir(&chats_dir) {
+        // Scan for recently-finished sessions (< 5 min) without a running
+        // process. This is a full tree walk, so defer to slow ticks.
+        if shared.slow_tick {
+            let tmp_dir = self.gemini_dir.join("tmp");
+            if let Ok(entries) = fs::read_dir(&tmp_dir) {
+                for entry in entries.flatten() {
+                    let chats_dir = entry.path().join("chats");
+                    if !chats_dir.exists() {
+                        continue;
+                    }
+                    let Ok(chat_entries) = fs::read_dir(&chats_dir) else { continue };
                     for chat_entry in chat_entries.flatten() {
                         let path = chat_entry.path();
                         if path.extension().and_then(|e| e.to_str()) != Some("json") {
                             continue;
                         }
-                        // Only recently modified
-                        if let Ok(meta) = fs::metadata(&path) {
-                            if let Ok(modified) = meta.modified() {
-                                let age = std::time::SystemTime::now()
-                                    .duration_since(modified)
-                                    .unwrap_or_default();
-                                if age.as_secs() > 300 {
-                                    continue;
-                                }
-                            }
+                        if !is_recently_modified(&path, 300) {
+                            continue;
                         }
                         let project_name = entry.file_name().to_string_lossy().to_string();
-                        // Resolve cwd from the project map (reverse lookup)
                         let cwd = self.project_map.iter()
                             .find(|(_, v)| **v == project_name)
                             .map(|(k, _)| k.clone())
@@ -127,12 +120,10 @@ impl GeminiCollector {
                             None,
                             &cwd,
                             &project_name,
-                            &shared.process_info,
-                            &shared.children_map,
-                            &shared.ports,
+                            &version,
+                            shared,
                         ) {
-                            if !seen_sessions.contains(&session.session_id) {
-                                seen_sessions.insert(session.session_id.clone());
+                            if seen_sessions.insert(session.session_id.clone()) {
                                 sessions.push(session);
                             }
                         }
@@ -159,9 +150,6 @@ impl super::AgentCollector for GeminiCollector {
     fn collect(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)
     }
-
-    // Gemini CLI does not expose rate limit info in session files (yet).
-    // This can be added when/if Google surfaces quota data.
 }
 
 /// Load the project name mapping from `~/.gemini/projects.json`.
@@ -299,10 +287,12 @@ fn parse_gemini_session(
     pid: Option<u32>,
     cwd: &str,
     project_name: &str,
-    process_info: &HashMap<u32, ProcInfo>,
-    children_map: &HashMap<u32, Vec<u32>>,
-    ports: &HashMap<u32, Vec<u16>>,
+    version: &str,
+    shared: &super::SharedProcessData,
 ) -> Option<AgentSession> {
+    let process_info = &shared.process_info;
+    let children_map = &shared.children_map;
+    let ports = &shared.ports;
     let content = fs::read_to_string(path).ok()?;
     let val: Value = serde_json::from_str(&content).ok()?;
 
@@ -343,7 +333,8 @@ fn parse_gemini_session(
                     if let Some(content) = msg["content"].as_array() {
                         if let Some(first) = content.first() {
                             if let Some(text) = first["text"].as_str() {
-                                initial_prompt = text.chars().take(120).collect();
+                                let truncated: String = text.chars().take(120).collect();
+                                initial_prompt = super::redact_secrets(&truncated);
                             }
                         }
                     }
@@ -360,18 +351,19 @@ fn parse_gemini_session(
                     total_output += out;
                     total_cached += cached;
                     total_thoughts += thoughts;
-                    token_history.push(inp + out + cached);
+                    if token_history.len() < 10_000 {
+                        token_history.push(inp + out + cached);
+                    }
                 }
                 if let Some(m) = msg["model"].as_str() {
                     model = m.to_string();
                 }
-                // First assistant text (for summary fallback)
                 if first_assistant_text.is_empty() {
                     if let Some(content) = msg["content"].as_str() {
-                        first_assistant_text = content.chars().take(200).collect();
+                        let truncated: String = content.chars().take(200).collect();
+                        first_assistant_text = super::redact_secrets(&truncated);
                     }
                 }
-                // Track current task from thinking steps
                 if let Some(thoughts) = msg["thoughts"].as_array() {
                     if let Some(last) = thoughts.last() {
                         if let Some(subject) = last["subject"].as_str() {
@@ -454,9 +446,6 @@ fn parse_gemini_session(
         }
     }
 
-    // Gemini CLI version: read from the package if possible
-    let version = read_gemini_version().unwrap_or_default();
-
     Some(AgentSession {
         agent_cli: "gemini",
         pid: display_pid,
@@ -466,24 +455,26 @@ fn parse_gemini_session(
         started_at,
         status,
         model,
-        effort: String::new(), // Gemini CLI doesn't have an effort setting
+        effort: String::new(),
         context_percent,
         total_input_tokens: total_input,
         total_output_tokens: total_output,
         total_cache_read: total_cached,
-        total_cache_create: total_thoughts, // Map thought tokens to cache_create slot
+        // Gemini reports separate `thoughts` (thinking) tokens; map to
+        // cache_create since we have no dedicated field for them.
+        total_cache_create: total_thoughts,
         turn_count,
         current_tasks,
         mem_mb,
-        version,
-        git_branch: String::new(), // Populated by MultiCollector
+        version: version.to_string(),
+        git_branch: String::new(),
         git_added: 0,
         git_modified: 0,
         token_history,
         context_history: vec![],
         compaction_count: 0,
         context_window,
-        subagents: vec![], // Gemini CLI doesn't have subagents
+        subagents: vec![],
         mem_file_count: 0,
         mem_line_count: 0,
         children,
@@ -494,6 +485,17 @@ fn parse_gemini_session(
         thinking_since_ms: 0,
         file_accesses: vec![],
     })
+}
+
+/// Cheap mtime check: returns true if `path` was modified within the last
+/// `max_age_secs` seconds.
+fn is_recently_modified(path: &Path, max_age_secs: u64) -> bool {
+    let Ok(meta) = fs::metadata(path) else { return false };
+    let Ok(modified) = meta.modified() else { return false };
+    std::time::SystemTime::now()
+        .duration_since(modified)
+        .map(|d| d.as_secs() <= max_age_secs)
+        .unwrap_or(false)
 }
 
 /// Try to read the Gemini CLI version from the installed package.
@@ -563,13 +565,15 @@ mod tests {
             "kind": "main"
         }"#;
         let path = write_session(dir.path(), session);
-        let process_info = HashMap::new();
-        let children_map = HashMap::new();
-        let ports = HashMap::new();
+        let shared = super::super::SharedProcessData {
+            process_info: HashMap::new(),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: false,
+        };
 
         let result = parse_gemini_session(
-            &path, None, "/home/user/project", "project",
-            &process_info, &children_map, &ports,
+            &path, None, "/home/user/project", "project", "0.38.1", &shared,
         ).unwrap();
 
         assert_eq!(result.session_id, "test-123");
@@ -603,13 +607,15 @@ mod tests {
             "kind": "main"
         }"#;
         let path = write_session(dir.path(), session);
-        let process_info = HashMap::new();
-        let children_map = HashMap::new();
-        let ports = HashMap::new();
+        let shared = super::super::SharedProcessData {
+            process_info: HashMap::new(),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: false,
+        };
 
         let result = parse_gemini_session(
-            &path, None, "/home/user/project", "project",
-            &process_info, &children_map, &ports,
+            &path, None, "/home/user/project", "project", "0.38.1", &shared,
         ).unwrap();
 
         assert_eq!(result.turn_count, 2);
@@ -631,13 +637,15 @@ mod tests {
             "kind": "main"
         }"#;
         let path = write_session(dir.path(), session);
-        let process_info = HashMap::new();
-        let children_map = HashMap::new();
-        let ports = HashMap::new();
+        let shared = super::super::SharedProcessData {
+            process_info: HashMap::new(),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: false,
+        };
 
         let result = parse_gemini_session(
-            &path, None, "/home/user/project", "project",
-            &process_info, &children_map, &ports,
+            &path, None, "/home/user/project", "project", "0.38.1", &shared,
         );
 
         // Should still return a session (just with zero tokens)
