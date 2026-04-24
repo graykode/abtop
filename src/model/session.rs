@@ -1,5 +1,3 @@
-#[cfg(feature = "claude")]
-use serde::Deserialize;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -29,10 +27,6 @@ pub struct FileAccess {
     #[allow(dead_code)]
     pub turn_index: u32,
 }
-
-/// Maximum file access entries kept per session to bound memory.
-#[cfg(feature = "claude")]
-pub const MAX_FILE_ACCESSES: usize = 1000;
 
 /// Account-level rate limit info (shared across all sessions).
 #[derive(Debug, Clone, Default)]
@@ -192,40 +186,6 @@ impl AgentSession {
         } else {
             format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
         }
-    }
-}
-
-/// Claude session-file entry written by the Claude CLI under `~/.claude/`.
-#[cfg(feature = "claude")]
-#[derive(Debug, Deserialize)]
-pub struct SessionFile {
-    pub pid: u32,
-    #[serde(rename = "sessionId")]
-    pub session_id: String,
-    pub cwd: String,
-    #[serde(rename = "startedAt")]
-    pub started_at: u64,
-}
-
-#[cfg(feature = "claude")]
-impl SessionFile {
-    /// Truncate string fields to sane limits after deserialization.
-    pub fn sanitize(&mut self) {
-        truncate_string(&mut self.session_id, 256);
-        truncate_string(&mut self.cwd, 4096);
-    }
-}
-
-/// Truncate a string at a char boundary to avoid panics on multi-byte UTF-8.
-#[cfg(feature = "claude")]
-fn truncate_string(s: &mut String, max_bytes: usize) {
-    if s.len() > max_bytes {
-        // Find the last char boundary at or before max_bytes
-        let mut end = max_bytes;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s.truncate(end);
     }
 }
 

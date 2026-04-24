@@ -5,10 +5,6 @@ use std::path::{Path, PathBuf};
 /// File written by the StatusLine hook: ~/.claude/abtop-rate-limits.json
 const CLAUDE_RATE_FILE: &str = "abtop-rate-limits.json";
 
-/// Cached Codex rate limit: ~/.cache/abtop/codex-rate-limits.json
-#[cfg(feature = "codex")]
-const CODEX_CACHE_FILE: &str = "codex-rate-limits.json";
-
 #[derive(Debug, Deserialize)]
 struct RateLimitFile {
     #[serde(default)]
@@ -59,50 +55,56 @@ pub fn read_rate_limits(extra_dirs: &[PathBuf]) -> Vec<RateLimitInfo> {
     results
 }
 
-/// Read cached Codex rate limit (fallback when no live session provides one).
-/// Rate limits have their own `resets_at` expiry and the cache is refreshed
-/// whenever the next Codex session runs, so the reader keeps serving the last
-/// known value regardless of file age — the UI shows "N m ago" for staleness.
 #[cfg(feature = "codex")]
-pub fn read_codex_cache() -> Option<RateLimitInfo> {
-    let path = codex_cache_path()?;
-    read_rate_file(&path, "codex")
-}
+pub use codex_cache::{read_codex_cache, write_codex_cache};
 
-/// Write Codex rate limit to cache file (atomic: write temp + rename).
 #[cfg(feature = "codex")]
-pub fn write_codex_cache(info: &RateLimitInfo) {
-    let Some(path) = codex_cache_path() else { return };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+mod codex_cache {
+    use super::{read_rate_file, RateLimitInfo};
+    use std::path::PathBuf;
+
+    const CODEX_CACHE_FILE: &str = "codex-rate-limits.json";
+
+    /// Read cached Codex rate limit (fallback when no live session provides one).
+    /// Rate limits have their own `resets_at` expiry and the cache is refreshed
+    /// whenever the next Codex session runs, so the reader keeps serving the last
+    /// known value regardless of file age — the UI shows "N m ago" for staleness.
+    pub fn read_codex_cache() -> Option<RateLimitInfo> {
+        let path = codex_cache_path()?;
+        read_rate_file(&path, "codex")
     }
 
-    let json = format!(
-        r#"{{"source":"codex","five_hour":{},"seven_day":{},"updated_at":{}}}"#,
-        window_json(info.five_hour_pct, info.five_hour_resets_at),
-        window_json(info.seven_day_pct, info.seven_day_resets_at),
-        info.updated_at.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
-    );
+    /// Write Codex rate limit to cache file (atomic: write temp + rename).
+    pub fn write_codex_cache(info: &RateLimitInfo) {
+        let Some(path) = codex_cache_path() else { return };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
 
-    // Atomic write: temp file + rename to avoid corrupted reads
-    let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, &json).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+        let json = format!(
+            r#"{{"source":"codex","five_hour":{},"seven_day":{},"updated_at":{}}}"#,
+            window_json(info.five_hour_pct, info.five_hour_resets_at),
+            window_json(info.seven_day_pct, info.seven_day_resets_at),
+            info.updated_at.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
+        );
+
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
-}
 
-#[cfg(feature = "codex")]
-fn window_json(pct: Option<f64>, resets_at: Option<u64>) -> String {
-    match (pct, resets_at) {
-        (Some(p), Some(r)) => format!(r#"{{"used_percentage":{},"resets_at":{}}}"#, p, r),
-        (Some(p), None) => format!(r#"{{"used_percentage":{},"resets_at":0}}"#, p),
-        _ => "null".to_string(),
+    fn window_json(pct: Option<f64>, resets_at: Option<u64>) -> String {
+        match (pct, resets_at) {
+            (Some(p), Some(r)) => format!(r#"{{"used_percentage":{},"resets_at":{}}}"#, p, r),
+            (Some(p), None) => format!(r#"{{"used_percentage":{},"resets_at":0}}"#, p),
+            _ => "null".to_string(),
+        }
     }
-}
 
-#[cfg(feature = "codex")]
-fn codex_cache_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("abtop").join(CODEX_CACHE_FILE))
+    fn codex_cache_path() -> Option<PathBuf> {
+        dirs::cache_dir().map(|d| d.join("abtop").join(CODEX_CACHE_FILE))
+    }
 }
 
 fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
