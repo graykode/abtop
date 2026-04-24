@@ -9,6 +9,9 @@ pub struct ProcInfo {
     pub ppid: u32,
     pub rss_kb: u64,
     pub cpu_pct: f64,
+    /// Best-effort process start time in unix-epoch ms. Zero when unavailable.
+    #[allow(dead_code)] // only read by optional agent collectors (pi)
+    pub started_at_ms: u64,
     pub command: String,
 }
 
@@ -86,6 +89,13 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
             0.0
         };
 
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let age_ms = (elapsed_ticks as f64 * 1000.0 / clk_tck) as u64;
+        let started_at_ms = now_ms.saturating_sub(age_ms);
+
         // /proc/{pid}/cmdline: NUL-separated
         let command = fs::read_to_string(format!("/proc/{pid}/cmdline"))
             .unwrap_or_default()
@@ -96,7 +106,7 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
             continue; // kernel thread, skip
         }
 
-        map.insert(pid, ProcInfo { pid, ppid, rss_kb, cpu_pct, command });
+        map.insert(pid, ProcInfo { pid, ppid, rss_kb, cpu_pct, started_at_ms, command });
     }
     map
 }
@@ -126,6 +136,7 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
                         ppid,
                         rss_kb: rss,
                         cpu_pct: cpu,
+                        started_at_ms: 0,
                         command,
                     });
                 }

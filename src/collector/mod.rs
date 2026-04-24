@@ -4,6 +4,8 @@ pub mod claude;
 pub mod codex;
 #[cfg(feature = "gemini")]
 pub mod gemini;
+#[cfg(feature = "pi")]
+pub mod pi;
 pub mod process;
 pub mod rate_limit;
 
@@ -13,6 +15,8 @@ pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
 #[cfg(feature = "gemini")]
 pub use gemini::GeminiCollector;
+#[cfg(feature = "pi")]
+pub use pi::PiCollector;
 pub use rate_limit::read_rate_limits;
 
 /// Redact common secret patterns to avoid displaying credentials in the TUI.
@@ -132,6 +136,8 @@ impl MultiCollector {
         collectors.push(Box::new(CodexCollector::new()));
         #[cfg(feature = "gemini")]
         collectors.push(Box::new(GeminiCollector::new()));
+        #[cfg(feature = "pi")]
+        collectors.push(Box::new(PiCollector::new()));
         Self {
             collectors,
             tick_count: SLOW_POLL_INTERVAL, // trigger on first tick

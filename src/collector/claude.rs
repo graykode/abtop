@@ -1726,6 +1726,7 @@ mod tests {
                 ppid: 1,
                 rss_kb: 2048,
                 cpu_pct: 0.0,
+                started_at_ms: 0,
                 command: command.to_string(),
             },
         );
@@ -2101,6 +2102,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 ppid: 1,
                 rss_kb: 1,
                 cpu_pct: 0.0,
+                started_at_ms: 0,
                 command: "claude".to_string(),
             },
         );
@@ -2111,6 +2113,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 ppid: 1,
                 rss_kb: 1,
                 cpu_pct: 0.0,
+                started_at_ms: 0,
                 command: "claude --print summarize".to_string(),
             },
         );
@@ -2121,6 +2124,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 ppid: 1,
                 rss_kb: 1,
                 cpu_pct: 0.0,
+                started_at_ms: 0,
                 command: "codex".to_string(),
             },
         );
@@ -3000,6 +3004,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 ppid: 1,
                 rss_kb: 2048,
                 cpu_pct: 0.0,
+                started_at_ms: 0,
                 command: "claude".to_string(),
             },
         );
@@ -3070,6 +3075,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 ppid: real_pid,
                 rss_kb: 512,
                 cpu_pct: 0.0,
+                started_at_ms: 0,
                 command: "claude --print -".to_string(),
             },
         );

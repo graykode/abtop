@@ -16,10 +16,11 @@ authors = ["Tae Hwan Jung <nlkey2022@gmail.com>"]
 # All built-in agent collectors are enabled by default. Users who only use
 # one CLI can build a slim binary with e.g.
 #   cargo install abtop --no-default-features --features claude
-default = ["claude", "codex", "gemini"]
+default = ["claude", "codex", "gemini", "pi"]
 claude = []
 codex = []
 gemini = []
+pi = []
 
 [dependencies]
 ratatui = "0.29"

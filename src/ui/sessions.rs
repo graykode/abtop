@@ -85,6 +85,8 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
             "codex"  => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
             #[cfg(feature = "gemini")]
             "gemini" => ("#GM", Color::Rgb(136, 176, 255)), // #88B0FF cornflower blue
+            #[cfg(feature = "pi")]
+            "pi"     => ("#PI", Color::Rgb(167, 139, 250)), // #A78BFA muted violet
             other => {
                 let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
                 (Box::leak(fallback.into_boxed_str()) as &str, theme.inactive_fg)
