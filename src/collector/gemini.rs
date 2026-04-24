@@ -328,14 +328,12 @@ fn parse_gemini_session(
 
     for msg in messages {
         match msg["type"].as_str() {
-            Some("user") => {
-                if initial_prompt.is_empty() {
-                    if let Some(content) = msg["content"].as_array() {
-                        if let Some(first) = content.first() {
-                            if let Some(text) = first["text"].as_str() {
-                                let truncated: String = text.chars().take(120).collect();
-                                initial_prompt = super::redact_secrets(&truncated);
-                            }
+            Some("user") if initial_prompt.is_empty() => {
+                if let Some(content) = msg["content"].as_array() {
+                    if let Some(first) = content.first() {
+                        if let Some(text) = first["text"].as_str() {
+                            let truncated: String = text.chars().take(120).collect();
+                            initial_prompt = super::redact_secrets(&truncated);
                         }
                     }
                 }
