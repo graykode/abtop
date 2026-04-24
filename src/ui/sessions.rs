@@ -87,6 +87,8 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
             "gemini" => ("#GM", Color::Rgb(136, 176, 255)), // #88B0FF cornflower blue
             #[cfg(feature = "kiro")]
             "kiro"   => ("*KR", Color::Rgb(99, 230, 190)),  // #63E6BE mint
+            #[cfg(feature = "opencode")]
+            "opencode" => ("#OC", Color::Rgb(74, 222, 128)), // #4ADE80 emerald
             #[cfg(feature = "pi")]
             "pi"     => ("#PI", Color::Rgb(167, 139, 250)), // #A78BFA muted violet
             other => {

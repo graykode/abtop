@@ -885,6 +885,7 @@ mod tests {
             ppid: 1,
             rss_kb: 0,
             cpu_pct: 0.0,
+            started_at_ms: 0,
             command: cmd.to_string(),
         }
     }

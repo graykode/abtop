@@ -6,6 +6,8 @@ pub mod codex;
 pub mod gemini;
 #[cfg(feature = "kiro")]
 pub mod kiro;
+#[cfg(feature = "opencode")]
+pub mod opencode;
 #[cfg(feature = "pi")]
 pub mod pi;
 pub mod process;
@@ -19,6 +21,8 @@ pub use codex::CodexCollector;
 pub use gemini::GeminiCollector;
 #[cfg(feature = "kiro")]
 pub use kiro::KiroCollector;
+#[cfg(feature = "opencode")]
+pub use opencode::OpenCodeCollector;
 #[cfg(feature = "pi")]
 pub use pi::PiCollector;
 pub use rate_limit::read_rate_limits;
@@ -142,6 +146,8 @@ impl MultiCollector {
         collectors.push(Box::new(GeminiCollector::new()));
         #[cfg(feature = "kiro")]
         collectors.push(Box::new(KiroCollector::new()));
+        #[cfg(feature = "opencode")]
+        collectors.push(Box::new(OpenCodeCollector::new()));
         #[cfg(feature = "pi")]
         collectors.push(Box::new(PiCollector::new()));
         Self {
