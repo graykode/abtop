@@ -1,5 +1,6 @@
 use super::process::{self, ProcInfo};
-use crate::model::{AgentSession, ChildProcess, FileAccess, FileOp, SessionFile, SessionStatus, SubAgent, MAX_FILE_ACCESSES};
+use crate::model::{AgentSession, ChildProcess, FileAccess, FileOp, SessionStatus, SubAgent};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -9,6 +10,39 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 #[cfg(all(not(target_os = "linux"), not(target_vendor = "apple")))]
 use std::process::Command;
+
+/// Maximum file access entries kept per session to bound memory.
+pub const MAX_FILE_ACCESSES: usize = 1000;
+
+/// Claude session-file entry written by the Claude CLI under `~/.claude/`.
+#[derive(Debug, Deserialize)]
+pub struct SessionFile {
+    pub pid: u32,
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub cwd: String,
+    #[serde(rename = "startedAt")]
+    pub started_at: u64,
+}
+
+impl SessionFile {
+    /// Truncate string fields to sane limits after deserialization.
+    pub fn sanitize(&mut self) {
+        truncate_string(&mut self.session_id, 256);
+        truncate_string(&mut self.cwd, 4096);
+    }
+}
+
+/// Truncate a string at a char boundary to avoid panics on multi-byte UTF-8.
+fn truncate_string(s: &mut String, max_bytes: usize) {
+    if s.len() > max_bytes {
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+}
 
 /// A single Claude config directory (sessions + projects + transcripts).
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -1692,6 +1726,7 @@ mod tests {
                 ppid: 1,
                 rss_kb: 2048,
                 cpu_pct: 0.0,
+                started_at_ms: 0,
                 command: command.to_string(),
             },
         );
@@ -2067,6 +2102,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 ppid: 1,
                 rss_kb: 1,
                 cpu_pct: 0.0,
+                started_at_ms: 0,
                 command: "claude".to_string(),
             },
         );
@@ -2077,6 +2113,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 ppid: 1,
                 rss_kb: 1,
                 cpu_pct: 0.0,
+                started_at_ms: 0,
                 command: "claude --print summarize".to_string(),
             },
         );
@@ -2087,6 +2124,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 ppid: 1,
                 rss_kb: 1,
                 cpu_pct: 0.0,
+                started_at_ms: 0,
                 command: "codex".to_string(),
             },
         );
@@ -2966,6 +3004,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 ppid: 1,
                 rss_kb: 2048,
                 cpu_pct: 0.0,
+                started_at_ms: 0,
                 command: "claude".to_string(),
             },
         );
@@ -3036,6 +3075,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 ppid: real_pid,
                 rss_kb: 512,
                 cpu_pct: 0.0,
+                started_at_ms: 0,
                 command: "claude --print -".to_string(),
             },
         );

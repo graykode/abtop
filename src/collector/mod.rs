@@ -1,15 +1,36 @@
+#[cfg(feature = "claude")]
 pub mod claude;
+#[cfg(feature = "codex")]
 pub mod codex;
+#[cfg(feature = "gemini")]
+pub mod gemini;
+#[cfg(feature = "kiro")]
+pub mod kiro;
+#[cfg(feature = "opencode")]
+pub mod opencode;
+#[cfg(feature = "pi")]
+pub mod pi;
 pub mod process;
 pub mod rate_limit;
 
+#[cfg(feature = "claude")]
 pub use claude::ClaudeCollector;
+#[cfg(feature = "codex")]
 pub use codex::CodexCollector;
+#[cfg(feature = "gemini")]
+pub use gemini::GeminiCollector;
+#[cfg(feature = "kiro")]
+pub use kiro::KiroCollector;
+#[cfg(feature = "opencode")]
+pub use opencode::OpenCodeCollector;
+#[cfg(feature = "pi")]
+pub use pi::PiCollector;
 pub use rate_limit::read_rate_limits;
 
 /// Redact common secret patterns to avoid displaying credentials in the TUI.
 /// Replaces the prefix and all following non-whitespace chars with [REDACTED].
 /// Best-effort: covers well-known prefixed tokens, not arbitrary high-entropy strings.
+#[allow(dead_code)] // caller set depends on enabled agent features
 pub(crate) fn redact_secrets(s: &str) -> String {
     const PATTERNS: &[&str] = &[
         // Anthropic / OpenAI / OpenRouter
@@ -69,6 +90,7 @@ pub struct SharedProcessData {
     pub ports: HashMap<u32, Vec<u16>>,
     /// True on slow poll ticks (every 5 ticks ≈ 10s). Collectors should
     /// defer expensive discovery (e.g. /proc reads) to slow ticks.
+    #[allow(dead_code)] // not read when only codex feature is enabled
     pub slow_tick: bool,
 }
 
@@ -112,12 +134,24 @@ pub struct MultiCollector {
 const SLOW_POLL_INTERVAL: u32 = 5;
 
 impl MultiCollector {
+    // Per-agent cfg-gated push calls cannot use the `vec![]` macro.
+    #[allow(clippy::vec_init_then_push)]
     pub fn new() -> Self {
+        let mut collectors: Vec<Box<dyn AgentCollector>> = Vec::new();
+        #[cfg(feature = "claude")]
+        collectors.push(Box::new(ClaudeCollector::new()));
+        #[cfg(feature = "codex")]
+        collectors.push(Box::new(CodexCollector::new()));
+        #[cfg(feature = "gemini")]
+        collectors.push(Box::new(GeminiCollector::new()));
+        #[cfg(feature = "kiro")]
+        collectors.push(Box::new(KiroCollector::new()));
+        #[cfg(feature = "opencode")]
+        collectors.push(Box::new(OpenCodeCollector::new()));
+        #[cfg(feature = "pi")]
+        collectors.push(Box::new(PiCollector::new()));
         Self {
-            collectors: vec![
-                Box::new(ClaudeCollector::new()),
-                Box::new(CodexCollector::new()),
-            ],
+            collectors,
             tick_count: SLOW_POLL_INTERVAL, // trigger on first tick
             cached_ports: HashMap::new(),
             cached_port_pids: Vec::new(),
