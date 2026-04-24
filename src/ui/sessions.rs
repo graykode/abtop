@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::model::{AgentSession, FileOp};
 use crate::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -89,10 +90,12 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         };
 
         let (status_icon, status_color) = match &session.status {
-            crate::model::SessionStatus::Working => ("● Work", theme.proc_misc),
+            crate::model::SessionStatus::Thinking => ("◉ Think", theme.proc_misc),
+            crate::model::SessionStatus::Executing => ("● Exec", theme.hi_fg),
             crate::model::SessionStatus::Waiting => {
                 ("◌ Wait", grad_at(&proc_grad, 50.0))
             }
+            crate::model::SessionStatus::RateLimited => ("⏳ Rate", theme.status_fg),
             crate::model::SessionStatus::Done => ("✓ Done", theme.inactive_fg),
         };
 
@@ -383,23 +386,29 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         let has_children = !session.children.is_empty();
         let has_subagents = !session.subagents.is_empty();
         let has_tool_calls = !session.tool_calls.is_empty();
-        // Focus mode (L): full-width timeline in an enlarged detail area.
-        let timeline_focused = app.show_timeline && has_tool_calls;
-        // Default split: when not focused, show a compact timeline in the right
-        // half of the lower area — but only if the terminal is wide enough that
-        // both halves remain readable (draw_timeline reserves 42 cols for labels).
+        let has_file_audit = app.show_file_audit && !session.file_accesses.is_empty();
+        // Focus mode: file audit (F) takes priority over timeline (L) when both
+        // are toggled on. Only one "full lower" mode is active at a time.
+        let file_audit_focused = has_file_audit;
+        let timeline_focused = !file_audit_focused && app.show_timeline && has_tool_calls;
+        // Default split: when neither focus mode is active, show a compact
+        // timeline in the right half of the lower area - but only if the
+        // terminal is wide enough that both halves remain readable
+        // (draw_timeline reserves 42 cols for labels).
         const TIMELINE_SPLIT_MIN_WIDTH: u16 = 120;
-        let timeline_side_by_side = !app.show_timeline
+        let timeline_side_by_side = !file_audit_focused
+            && !app.show_timeline
             && has_tool_calls
             && detail_body.width >= TIMELINE_SPLIT_MIN_WIDTH;
 
-        // Always show SESSION header (task) at top, then children/subagents/timeline below
+        // Always show SESSION header (task) at top, then children/subagents/timeline/file_audit below
         let session_header_h: u16 = {
             let mut h = 1u16; // SESSION title
             if !session.initial_prompt.is_empty() { h += 1; }
             h
         };
-        let has_lower = timeline_focused
+        let has_lower = file_audit_focused
+            || timeline_focused
             || timeline_side_by_side
             || has_children
             || has_subagents;
@@ -437,15 +446,18 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         }
 
         // Layout below the session header:
-        //   - focus mode (L): full-width timeline
+        //   - file audit focus (F): full-width file audit
+        //   - timeline focus (L): full-width timeline
         //   - wide terminal with tool calls: left = children/subagents, right = compact timeline
         //   - otherwise: children/subagents only (or nothing)
         if let Some(lower) = lower_area {
-            if timeline_focused {
+            if file_audit_focused {
+                draw_file_audit(f, session, lower, theme);
+            } else if timeline_focused {
                 draw_timeline(f, session, lower, theme, app.timeline_scroll);
             } else {
             // Split 50/50 whenever the side-by-side timeline is active, even if
-            // there's no left content — consistent layout beats saving the empty
+            // there's no left content - consistent layout beats saving the empty
             // half, and sessions that gain/lose children at runtime shouldn't
             // make the timeline flicker between full- and half-width.
             let (left_area, right_timeline_area) = if timeline_side_by_side {
@@ -584,7 +596,7 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
                 f.render_widget(Paragraph::new(lines), sa_area);
             }
             } // end if has_children || has_subagents
-            } // end else (timeline not focused)
+            } // end else (not focused)
         }
 
         // Footer: MEM + version (full width)
@@ -644,6 +656,44 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
     }
 }
 
+/// Render the file access audit log in the given area.
+fn draw_file_audit(f: &mut Frame, session: &AgentSession, area: Rect, theme: &Theme) {
+    use std::collections::HashSet;
+    let unique_files: HashSet<&str> = session.file_accesses.iter().map(|a| a.path.as_str()).collect();
+    let unique_count = unique_files.len();
+    let total_count = session.file_accesses.len();
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!(" FILE AUDIT ({} accesses, {} unique files)", total_count, unique_count),
+        Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+    )));
+
+    let max_rows = area.height.saturating_sub(1) as usize;
+    let max_path_w = (area.width as usize).saturating_sub(5);
+
+    // Show most recent entries first (reverse order), limited to available rows
+    for access in session.file_accesses.iter().rev().take(max_rows) {
+        let (label, color) = match access.operation {
+            FileOp::Read => ("R", theme.session_id),   // blue
+            FileOp::Edit => ("E", theme.proc_misc),    // yellow
+            FileOp::Write => ("W", theme.cpu_box),     // cyan
+        };
+        let max_path = max_path_w.saturating_sub(4); // room for turn index
+        let path_display = truncate_str(&access.path, max_path);
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {} ", label), Style::default().fg(color)),
+            Span::styled(path_display, Style::default().fg(theme.main_fg)),
+            Span::styled(
+                format!(" t{}", access.turn_index),
+                Style::default().fg(theme.inactive_fg),
+            ),
+        ]));
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
+}
+
 pub(crate) fn shorten_model(model: &str, is_1m: bool) -> String {
     // "claude-opus-4-6" → "opus4.6", "claude-sonnet-4-6" → "sonnet4.6", "claude-haiku-4-5" → "haiku4.5"
     let s = model
@@ -701,7 +751,9 @@ fn draw_timeline(
     let is_thinking = session.thinking_since_ms > 0
         && matches!(
             session.status,
-            crate::model::SessionStatus::Working | crate::model::SessionStatus::Waiting
+            crate::model::SessionStatus::Thinking
+                | crate::model::SessionStatus::Executing
+                | crate::model::SessionStatus::Waiting
         );
     if tool_calls.is_empty() && !is_thinking {
         return;

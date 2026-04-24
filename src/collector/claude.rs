@@ -1,5 +1,5 @@
 use super::process::{self, ProcInfo};
-use crate::model::{AgentSession, ChildProcess, SessionFile, SessionStatus, SubAgent};
+use crate::model::{AgentSession, ChildProcess, FileAccess, FileOp, SessionFile, SessionStatus, SubAgent, MAX_FILE_ACCESSES};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -389,6 +389,15 @@ impl ClaudeCollector {
                     if prev.initial_prompt.is_empty() && !delta.initial_prompt.is_empty() {
                         prev.initial_prompt = delta.initial_prompt;
                     }
+                    prev.file_accesses.extend(delta.file_accesses);
+                    // Sliding window: drop OLDEST entries past the cap so the
+                    // cache always holds the most recent MAX_FILE_ACCESSES.
+                    // `truncate` would have kept the oldest and silently
+                    // dropped every new access once the cache hit the cap.
+                    let len = prev.file_accesses.len();
+                    if len > MAX_FILE_ACCESSES {
+                        prev.file_accesses.drain(..len - MAX_FILE_ACCESSES);
+                    }
                     prev.new_offset = delta.new_offset;
                     self.transcript_cache.insert(sf.session_id.clone(), prev);
                 }
@@ -418,8 +427,11 @@ impl ClaudeCollector {
             token_history: Vec::new(),
             initial_prompt: String::new(),
             first_assistant_text: String::new(),
-            tool_calls: Vec::new(), last_assistant_ts_ms: 0, last_user_ts_ms: 0,
+            tool_calls: Vec::new(),
+            last_assistant_ts_ms: 0,
+            last_user_ts_ms: 0,
             saw_turn: false,
+            file_accesses: Vec::new(),
         };
         let cached = self
             .transcript_cache
@@ -437,37 +449,42 @@ impl ClaudeCollector {
         let current_task = cached.current_task.clone();
         let version = cached.version.clone();
         let git_branch = cached.git_branch.clone();
-        let last_activity = cached.last_activity;
         let token_history = cached.token_history.clone();
         let context_history = cached.context_history.clone();
         let compaction_count = cached.compaction_count;
         let initial_prompt = cached.initial_prompt.clone();
         let first_assistant_text = cached.first_assistant_text.clone();
         let tool_calls = cached.tool_calls.clone();
+        let file_accesses = cached.file_accesses.clone();
 
         if !pid_alive {
             return None;
         }
 
+        // Status is best-effort. Signals we trust:
+        //   1. Active descendant CPU → tool is running.
+        //   2. last_user_ts_ms > 0 → trailing transcript line is a real
+        //      user prompt with no assistant reply yet, so the model is
+        //      generating. tool_result wrappers are skipped at the
+        //      parser level so this only fires for actual prompts.
+        //
+        // We drop the mtime freshness gate intentionally: Claude Code
+        // writes the assistant turn atomically when it lands, so during
+        // a long streamed reply the file isn't touched and mtime would
+        // go stale. Without the gate the status now matches the live
+        // "Think" row in the timeline (both keyed off last_user_ts_ms),
+        // and an idle session can't get stuck Thinking because the
+        // tool_result skip means last_user only flips on real prompts.
         let status = {
-            let since_activity = std::time::SystemTime::now()
-                .duration_since(last_activity)
-                .unwrap_or_default();
-            if since_activity.as_secs() < 30 {
-                SessionStatus::Working
+            let has_active_descendant =
+                process::has_active_descendant(sf.pid, children_map, process_info, 5.0);
+            let model_generating = cached.last_user_ts_ms > 0;
+            if has_active_descendant {
+                SessionStatus::Executing
+            } else if model_generating {
+                SessionStatus::Thinking
             } else {
-                // Transcript is stale (>30s). Check CPU-based signals:
-                // 1. Claude process using CPU > 1% → likely thinking/streaming
-                let claude_cpu_active = proc.is_some_and(|p| p.cpu_pct > 1.0);
-                // 2. Any descendant using significant CPU (>5%) → likely running a tool
-                //    (higher threshold avoids false positives from idle watchers/servers)
-                let has_active_descendant =
-                    process::has_active_descendant(sf.pid, children_map, process_info, 5.0);
-                if claude_cpu_active || has_active_descendant {
-                    SessionStatus::Working
-                } else {
-                    SessionStatus::Waiting
-                }
+                SessionStatus::Waiting
             }
         };
 
@@ -570,6 +587,7 @@ impl ClaudeCollector {
             tool_calls,
             pending_since_ms: cached.last_assistant_ts_ms,
             thinking_since_ms: cached.last_user_ts_ms,
+            file_accesses,
         })
     }
 
@@ -1063,9 +1081,11 @@ struct TranscriptResult {
     last_user_ts_ms: u64,
     /// True when this parse observed at least one `user` or `assistant`
     /// line. When false the timestamp fields above are just defaults and
-    /// must not overwrite cached state — otherwise a no-new-data tick
+    /// must not overwrite cached state - otherwise a no-new-data tick
     /// would clear the live pending/thinking markers.
     saw_turn: bool,
+    /// File access audit log extracted from tool_use entries.
+    file_accesses: Vec<FileAccess>,
 }
 
 /// Check if a path is a symlink without following it.
@@ -1119,6 +1139,7 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
         last_assistant_ts_ms: 0,
         last_user_ts_ms: 0,
         saw_turn: false,
+        file_accesses: Vec::new(),
     };
 
     let file = match fs::File::open(path) {
@@ -1287,7 +1308,7 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                         }
                                     }
                                 }
-                                // Extract ALL tool_use entries for timeline + last for current_task
+                                // Extract all tool_use entries: timeline + current_task + file access audit
                                 if let Some(content) = msg.get("content").and_then(|c| c.as_array())
                                 {
                                     for item in content {
@@ -1299,6 +1320,7 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                                 .and_then(|n| n.as_str())
                                                 .unwrap_or("?");
                                             let arg = extract_tool_arg(item);
+                                            // Last tool_use in forward order wins current_task
                                             result.current_task = format!("{} {}", tool, arg);
                                             if result.tool_calls.len() < 500 {
                                                 result.tool_calls.push(crate::model::ToolCall {
@@ -1306,6 +1328,29 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                                     arg: truncate(&arg, 40),
                                                     duration_ms: 0, // filled on next user turn
                                                 });
+                                            }
+                                            // Extract file access audit entries.
+                                            // Cap is applied once at the end of
+                                            // parse_transcript via a sliding window so
+                                            // the latest accesses always survive.
+                                            if let Some(file_path) = item
+                                                .get("input")
+                                                .and_then(|i| i.get("file_path"))
+                                                .and_then(|f| f.as_str())
+                                            {
+                                                let op = match tool {
+                                                    "Read" => Some(FileOp::Read),
+                                                    "Edit" => Some(FileOp::Edit),
+                                                    "Write" => Some(FileOp::Write),
+                                                    _ => None,
+                                                };
+                                                if let Some(op) = op {
+                                                    result.file_accesses.push(FileAccess {
+                                                        path: file_path.to_string(),
+                                                        operation: op,
+                                                        turn_index: result.turn_count,
+                                                    });
+                                                }
                                             }
                                         }
                                     }
@@ -1339,9 +1384,15 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
                                 result.last_assistant_ts_ms = 0;
                             }
                             // Mark the start of a thinking window — next assistant
-                            // turn clears it. Covers both prompts and tool_result
-                            // lines (both serialize as `user` type).
-                            if entry_ts_ms > 0 {
+                            // turn clears it. **Skip tool_result wrappers**:
+                            // Claude Code serializes both real prompts and tool
+                            // results as `user`-role lines, but only real prompts
+                            // mean "model has been asked, no reply yet". A tool
+                            // loop alternates assistant(tool_use) ↔ user(tool_result)
+                            // inside one logical turn, and treating each
+                            // tool_result as the start of a new thinking window
+                            // makes the status flicker Think ↔ Wait per tool call.
+                            if entry_ts_ms > 0 && !is_tool_result_user_msg(val.get("message")) {
                                 result.last_user_ts_ms = entry_ts_ms;
                             }
                             result.saw_turn = true;
@@ -1366,6 +1417,14 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
         }
     }
 
+    // Sliding window cap: keep the most recent MAX_FILE_ACCESSES, drop
+    // the oldest. Applied once after the parse loop so peak memory stays
+    // bounded by the file size, not by the number of historical accesses.
+    let len = result.file_accesses.len();
+    if len > MAX_FILE_ACCESSES {
+        result.file_accesses.drain(..len - MAX_FILE_ACCESSES);
+    }
+
     result.new_offset = bytes_read;
     result
 }
@@ -1374,6 +1433,28 @@ fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
 /// Handles both string content and array-of-blocks content.
 /// Encode a cwd path to match Claude Code's project directory naming.
 /// Claude Code replaces '/', '_', and '.' with '-'.
+/// True iff a `user`-role transcript message is a tool_result wrapper
+/// (Claude Code returns tool outputs to the model as user-role messages
+/// whose content blocks are `{type: "tool_result", ...}`). Used to keep
+/// tool loops from flickering the Thinking status: only real prompts
+/// should open a new thinking window.
+///
+/// Conservative: returns true only when the message has content blocks
+/// AND every block is a tool_result. A mixed block message is treated
+/// as a real prompt so we never silently swallow user input.
+fn is_tool_result_user_msg(message: Option<&Value>) -> bool {
+    let Some(message) = message else { return false };
+    let Some(Value::Array(arr)) = message.get("content") else {
+        return false;
+    };
+    if arr.is_empty() {
+        return false;
+    }
+    arr.iter().all(|block| {
+        block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+    })
+}
+
 fn encode_cwd_path(cwd: &str) -> String {
     cwd.chars()
         .map(|c| match c {
@@ -1653,6 +1734,35 @@ mod tests {
         assert_eq!(result.last_user_ts_ms, 0);
         assert_eq!(result.last_assistant_ts_ms, 0);
         assert!(result.new_offset > 0, "non-turn lines still advance offset");
+    }
+
+    #[test]
+    fn test_parse_transcript_tool_result_does_not_open_thinking_window() {
+        // Regression: status used to flicker Think ↔ Wait during tool
+        // loops because tool_result lines come back as `user`-role
+        // messages, and the parser treated them as the start of a new
+        // thinking window. Real flow:
+        //   1. assistant(tool_use) → last_user cleared (Wait)
+        //   2. user(tool_result)   → last_user set    (Think) ← bug
+        //   3. assistant(next)     → last_user cleared (Wait)
+        // Fix: skip tool_result wrappers when updating last_user_ts_ms.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Bash","id":"t1","input":{"command":"ls"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"a\nb"}]}}"#,
+        ]);
+
+        let result = parse_transcript(file.path(), 0);
+
+        assert!(result.saw_turn);
+        // After the tool_result line, last_user_ts_ms must STILL be 0
+        // — the assistant turn at 15:00:01 cleared it, and the
+        // tool_result wrapper at 15:00:02 must not re-open the window.
+        assert_eq!(
+            result.last_user_ts_ms, 0,
+            "tool_result user-role line must not reopen the thinking window",
+        );
     }
 
     #[test]
@@ -2181,6 +2291,38 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     }
 
     #[test]
+    fn test_parse_transcript_file_accesses_sliding_window() {
+        // Regression: parse_transcript used to gate pushes on a `< MAX`
+        // check, so once the cap was hit during a single parse the latest
+        // tool_use entries were silently dropped — leaving the audit log
+        // frozen on the *oldest* file accesses. The fix moves the cap to
+        // a sliding window applied at end-of-parse, so the last
+        // MAX_FILE_ACCESSES entries always survive.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let extra = 5usize;
+        let total = MAX_FILE_ACCESSES + extra;
+        let mut lines: Vec<String> = Vec::with_capacity(total);
+        for i in 0..total {
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"tool_use","name":"Edit","input":{{"file_path":"src/file_{}.rs"}}}}]}}}}"#,
+                i
+            ));
+        }
+        let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_lines(&mut file, &line_refs);
+
+        let result = parse_transcript(file.path(), 0);
+
+        assert_eq!(result.file_accesses.len(), MAX_FILE_ACCESSES);
+        // Oldest `extra` entries must have been dropped, newest must survive.
+        assert_eq!(result.file_accesses[0].path, format!("src/file_{}.rs", extra));
+        assert_eq!(
+            result.file_accesses[MAX_FILE_ACCESSES - 1].path,
+            format!("src/file_{}.rs", total - 1),
+        );
+    }
+
+    #[test]
     fn test_parse_transcript_tool_use_current_task() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write_lines(
@@ -2566,6 +2708,117 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             &std::collections::HashSet::new(),
         );
         assert_eq!(sid.as_deref(), Some("within-grace"));
+    }
+
+    #[test]
+    fn test_load_session_stale_transcript_is_waiting_even_when_cpu_busy() {
+        // Regression: lifetime `%cpu` from ps doesn't tell us whether the
+        // agent is doing work *right now* — long-running sessions can
+        // average over 1% even when fully idle. Status must drive off
+        // recent transcript activity, not lifetime CPU. Here the
+        // transcript timestamps are months stale and there is no active
+        // descendant; even with cpu_pct=42 the session must read as
+        // Waiting.
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 9101;
+        let sid = "stale";
+        let session_path = sessions_dir.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, sid, &cwd);
+        // write_transcript hardcodes timestamps in 2026-03 → stale by
+        // the time the test runs. last_activity reflects the
+        // timestamp, not the file mtime, so this is the right way to
+        // simulate "no recent activity".
+        let _ = write_transcript(&projects, &cwd, sid, "hello");
+
+        let config = ConfigDir::new(profile.clone());
+        let mut process_info = make_proc_info(pid, "claude");
+        // Lifetime CPU > 1 — would have flipped the previous version
+        // to Thinking even though nothing is happening.
+        process_info.get_mut(&pid).unwrap().cpu_pct = 42.0;
+
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config.clone()];
+
+        let session_paths = vec![(session_path, config)];
+        let ctx = build_discovery_context(&session_paths, &process_info);
+        let sessions = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].status,
+            SessionStatus::Waiting,
+            "stale transcript + idle descendants must be Waiting regardless of lifetime cpu_pct",
+        );
+    }
+
+    #[test]
+    fn test_load_session_recent_transcript_activity_is_thinking() {
+        // Counterpart: when the transcript has just been written
+        // (timestamp within the last few seconds), the agent is actually
+        // emitting something — Thinking is the correct status.
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 9102;
+        let sid = "fresh";
+        let session_path = sessions_dir.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, sid, &cwd);
+
+        // Hand-build a transcript with a "now"-ish timestamp so
+        // last_activity lands inside the 5s active window.
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript = transcript_dir.join(format!("{}.jsonl", sid));
+        std::fs::write(
+            &transcript,
+            format!(
+                r#"{{"type":"user","timestamp":"{}","message":{{"role":"user","content":"go"}}}}
+"#,
+                now_iso
+            ),
+        )
+        .unwrap();
+
+        let config = ConfigDir::new(profile.clone());
+        // cpu_pct intentionally 0 — status must come from transcript
+        // freshness alone, not CPU.
+        let process_info = make_proc_info(pid, "claude");
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config.clone()];
+
+        let session_paths = vec![(session_path, config)];
+        let ctx = build_discovery_context(&session_paths, &process_info);
+        let sessions = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Thinking);
     }
 
     #[test]

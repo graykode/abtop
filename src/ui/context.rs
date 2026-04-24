@@ -31,7 +31,7 @@ pub(crate) fn draw_context_panel(f: &mut Frame, app: &App, area: Rect, theme: &T
         let tokens_per_min: f64 = rates.iter().rev().take(ticks_per_min).sum();
         let total: u64 = app.sessions.iter().map(|s| s.total_tokens()).sum();
         let active = app.sessions.iter()
-            .filter(|s| matches!(s.status, crate::model::SessionStatus::Working))
+            .filter(|s| s.status.is_active())
             .count();
 
         let line = Line::from(vec![

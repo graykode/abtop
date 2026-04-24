@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::model::{AgentSession, ChildProcess, OrphanPort, RateLimitInfo, SessionStatus, SubAgent, ToolCall};
+use crate::model::{AgentSession, ChildProcess, FileAccess, FileOp, OrphanPort, RateLimitInfo, SessionStatus, SubAgent, ToolCall};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> u64 {
@@ -25,7 +25,7 @@ pub fn populate_demo(app: &mut App) {
             cwd: "/Users/demo/webshop".into(),
             project_name: "webshop".into(),
             started_at: now - 2 * 3600 * 1000, // 2h ago
-            status: SessionStatus::Working,
+            status: SessionStatus::Executing,
             model: "claude-opus-4-6".into(),
             effort: String::new(),
             context_percent: 72.0,
@@ -110,11 +110,23 @@ pub fn populate_demo(app: &mut App) {
                 ToolCall { name: "Bash".into(), arg: "cargo clippy".into(), duration_ms: 5100 },
                 ToolCall { name: "Edit".into(), arg: "src/checkout/payment.rs".into(), duration_ms: 145 },
                 ToolCall { name: "Bash".into(), arg: "cargo test".into(), duration_ms: 7800 },
-                // Currently running — timeline bar grows in real time.
+                // Currently running: timeline bar grows in real time.
                 ToolCall { name: "WebSearch".into(), arg: "stripe webhook best practice".into(), duration_ms: 0 },
             ],
-            pending_since_ms: now - 6_000, // 6s ago → bar animates
+            pending_since_ms: now - 6_000, // 6s ago => bar animates
             thinking_since_ms: 0,
+            file_accesses: vec![
+                FileAccess { path: "src/checkout/payment.rs".into(), operation: FileOp::Read, turn_index: 2 },
+                FileAccess { path: "src/checkout/mod.rs".into(), operation: FileOp::Read, turn_index: 3 },
+                FileAccess { path: "src/checkout/payment.rs".into(), operation: FileOp::Edit, turn_index: 5 },
+                FileAccess { path: "src/config/stripe.rs".into(), operation: FileOp::Write, turn_index: 7 },
+                FileAccess { path: "src/checkout/payment.rs".into(), operation: FileOp::Edit, turn_index: 10 },
+                FileAccess { path: "tests/checkout_test.rs".into(), operation: FileOp::Write, turn_index: 12 },
+                FileAccess { path: "src/models/order.rs".into(), operation: FileOp::Read, turn_index: 15 },
+                FileAccess { path: "src/checkout/payment.rs".into(), operation: FileOp::Edit, turn_index: 18 },
+                FileAccess { path: "Cargo.toml".into(), operation: FileOp::Read, turn_index: 20 },
+                FileAccess { path: "tests/checkout_test.rs".into(), operation: FileOp::Edit, turn_index: 22 },
+            ],
         },
         AgentSession {
             agent_cli: "claude",
@@ -163,6 +175,7 @@ pub fn populate_demo(app: &mut App) {
             tool_calls: vec![],
             pending_since_ms: 0,
             thinking_since_ms: 0,
+            file_accesses: vec![],
         },
         AgentSession {
             agent_cli: "claude",
@@ -171,7 +184,7 @@ pub fn populate_demo(app: &mut App) {
             cwd: "/Users/demo/api-server".into(),
             project_name: "api-server".into(),
             started_at: now - 15 * 60 * 1000, // 15m ago
-            status: SessionStatus::Working,
+            status: SessionStatus::Executing,
             model: "claude-haiku-4-5".into(),
             effort: String::new(),
             context_percent: 42.0,
@@ -228,10 +241,11 @@ pub fn populate_demo(app: &mut App) {
                 ToolCall { name: "Bash".into(), arg: "npm run dev".into(), duration_ms: 1500 },
             ],
             pending_since_ms: 0,
-            // Model is generating its next reply — virtual "Thinking" row
+            // Model is generating its next reply - virtual "Thinking" row
             // animates. 1s offset keeps the bar visibly growing against the
             // session's 2.8s max tool duration before it caps at 100%.
             thinking_since_ms: now - 1_000,
+            file_accesses: vec![],
         },
         AgentSession {
             agent_cli: "codex",
@@ -240,7 +254,7 @@ pub fn populate_demo(app: &mut App) {
             cwd: "/Users/demo/data-viz".into(),
             project_name: "data-viz".into(),
             started_at: now - 5 * 60 * 1000, // 5m ago
-            status: SessionStatus::Working,
+            status: SessionStatus::Thinking,
             model: "gpt-5.4".into(),
             effort: "medium".into(),
             context_percent: 18.0,
@@ -278,6 +292,7 @@ pub fn populate_demo(app: &mut App) {
             tool_calls: vec![],
             pending_since_ms: 0,
             thinking_since_ms: 0,
+            file_accesses: vec![],
         },
     ];
 

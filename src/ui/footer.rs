@@ -50,6 +50,8 @@ pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     spans.push(Span::styled(" timeline ", Style::default().fg(theme.main_fg)));
     spans.push(Span::styled("1-5", Style::default().fg(theme.hi_fg)));
     spans.push(Span::styled(" panels ", Style::default().fg(theme.main_fg)));
+    spans.push(Span::styled("f", Style::default().fg(theme.hi_fg)));
+    spans.push(Span::styled(" files ", Style::default().fg(theme.main_fg)));
     spans.push(Span::styled("c", Style::default().fg(theme.hi_fg)));
     spans.push(Span::styled(" config ", Style::default().fg(theme.main_fg)));
 

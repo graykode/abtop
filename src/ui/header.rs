@@ -11,7 +11,7 @@ pub(crate) fn draw_header(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let active = app
         .sessions
         .iter()
-        .filter(|s| matches!(s.status, crate::model::SessionStatus::Working))
+        .filter(|s| s.status.is_active())
         .count();
 
     let now = chrono::Local::now().format("%H:%M").to_string();

@@ -158,6 +158,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, demo_mode: boo
                             KeyCode::Char('c') => app.toggle_config(),
                             KeyCode::Char('/') => app.filter_active = true,
                             KeyCode::Esc if !app.filter_text.is_empty() => app.clear_filter(),
+                            KeyCode::Char('f') | KeyCode::Char('F') => app.toggle_file_audit(),
                             KeyCode::Enter if !demo_mode => {
                                 match app.jump_to_session() {
                                     JumpOutcome::Jumped if exit_on_jump => app.quit(),
@@ -212,8 +213,10 @@ fn print_snapshot(app: &App) {
     println!("abtop — {} sessions\n", app.sessions.len());
     for session in &app.sessions {
         let status = match &session.status {
-            model::SessionStatus::Working => "● Work",
+            model::SessionStatus::Thinking => "◉ Think",
+            model::SessionStatus::Executing => "● Exec",
             model::SessionStatus::Waiting => "◌ Wait",
+            model::SessionStatus::RateLimited => "⏳ Rate",
             model::SessionStatus::Done => "✓ Done",
         };
         let sid_short = if session.session_id.len() >= 7 {

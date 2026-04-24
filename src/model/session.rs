@@ -1,5 +1,36 @@
 use serde::Deserialize;
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Type of file operation performed by the agent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileOp {
+    Read,
+    Write,
+    Edit,
+}
+
+impl fmt::Display for FileOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FileOp::Read => write!(f, "R"),
+            FileOp::Write => write!(f, "W"),
+            FileOp::Edit => write!(f, "E"),
+        }
+    }
+}
+
+/// A single file access event recorded from agent tool usage.
+#[derive(Debug, Clone)]
+pub struct FileAccess {
+    pub path: String,
+    pub operation: FileOp,
+    #[allow(dead_code)]
+    pub turn_index: u32,
+}
+
+/// Maximum file access entries kept per session to bound memory.
+pub const MAX_FILE_ACCESSES: usize = 1000;
 
 /// Account-level rate limit info (shared across all sessions).
 #[derive(Debug, Clone, Default)]
@@ -20,9 +51,23 @@ pub struct RateLimitInfo {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
-    Working,
+    /// Agent is generating (no active tool, CPU active)
+    Thinking,
+    /// Running a tool (current_task is non-empty)
+    Executing,
+    /// Idle, waiting for user input
     Waiting,
+    /// Waiting due to rate limit
+    RateLimited,
+    /// Session finished
     Done,
+}
+
+impl SessionStatus {
+    /// Returns true for states where the agent is actively doing work.
+    pub fn is_active(&self) -> bool {
+        matches!(self, SessionStatus::Thinking | SessionStatus::Executing)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +158,8 @@ pub struct AgentSession {
     /// the last transcript entry was an assistant turn. Used to render a
     /// live "Thinking" row while the model is generating its next reply.
     pub thinking_since_ms: u64,
+    /// File access audit log: every file read/written/edited by the agent.
+    pub file_accesses: Vec<FileAccess>,
 }
 
 impl AgentSession {
@@ -216,6 +263,7 @@ mod tests {
             tool_calls: Vec::new(),
             pending_since_ms: 0,
             thinking_since_ms: 0,
+            file_accesses: Vec::new(),
         }
     }
 
