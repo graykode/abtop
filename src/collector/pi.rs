@@ -381,7 +381,7 @@ impl PiCollector {
             mem_line_count: 0,
             children,
             initial_prompt,
-            first_assistant_text: truncate_field(&result.first_assistant_text, 200),
+            first_assistant_text: super::redact_secrets(&truncate_field(&result.first_assistant_text, 200)),
             tool_calls: vec![],
             pending_since_ms: 0,
             thinking_since_ms: 0,
@@ -544,11 +544,8 @@ fn parse_pi_jsonl(path: &Path) -> Option<PiJSONLResult> {
                                     + result.total_output
                                     + result.total_cache_write;
                                 let delta = new_total.saturating_sub(prev_total);
-                                if delta > 0 {
+                                if delta > 0 && result.token_history.len() < 10_000 {
                                     result.token_history.push(delta);
-                                    if result.token_history.len() > 200 {
-                                        result.token_history.remove(0);
-                                    }
                                 }
                             }
                         }
