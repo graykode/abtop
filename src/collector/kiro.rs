@@ -280,12 +280,10 @@ fn apply_log_entry(val: &Value, result: &mut KiroLogResult) {
     let Some(kind) = val.get("kind").and_then(|k| k.as_str()) else { return };
     let data = val.get("data");
     match kind {
-        "Prompt" => {
+        "Prompt" if result.initial_prompt.is_empty() => {
             // First prompt → initial_prompt (for fallback when metadata.title absent).
-            if result.initial_prompt.is_empty() {
-                if let Some(text) = first_text_block(data) {
-                    result.initial_prompt = clean_prompt_text(&text);
-                }
+            if let Some(text) = first_text_block(data) {
+                result.initial_prompt = clean_prompt_text(&text);
             }
         }
         "AssistantMessage" => {
