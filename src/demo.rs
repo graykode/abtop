@@ -294,6 +294,39 @@ pub fn populate_demo(app: &mut App) {
             thinking_since_ms: 0,
             file_accesses: vec![],
         },
+        AgentSession {
+            agent_cli: "opencode",
+            pid: 9500,
+            session_id: "ses_e5f6a7b8-9abc-def0-1234-555555555555".into(),
+            cwd: "/Users/demo/infra".into(),
+            project_name: "infra".into(),
+            started_at: now - 8 * 60 * 1000, // 8m ago
+            status: SessionStatus::Working,
+            model: "ollama/qwen3:14b".into(),
+            effort: String::new(),
+            context_percent: 35.0,
+            total_input_tokens: 14_200,
+            total_output_tokens: 3_800,
+            total_cache_read: 0,
+            total_cache_create: 0,
+            turn_count: 9,
+            current_tasks: vec!["thinking...".into()],
+            mem_mb: 156,
+            version: "1.4.0".into(),
+            git_branch: "main".into(),
+            git_added: 1,
+            git_modified: 3,
+            token_history: vec![
+                3000, 5000, 8000, 6000, 9000, 7000, 11000, 8000, 10000,
+            ],
+            subagents: vec![],
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: vec![],
+
+            first_assistant_text: String::new(),
+            initial_prompt: "Refactor Terraform modules for multi-region".into(),
+        },
     ];
 
     // --- Summaries (pre-populated, no LLM calls) ---
@@ -312,6 +345,10 @@ pub fn populate_demo(app: &mut App) {
     app.summaries.insert(
         "d4e5f6a7-89ab-cdef-0123-444444444444".into(),
         "D3 heatmap component".into(),
+    );
+    app.summaries.insert(
+        "ses_e5f6a7b8-9abc-def0-1234-555555555555".into(),
+        "Terraform multi-region refactor".into(),
     );
 
     // --- Rate limits ---
