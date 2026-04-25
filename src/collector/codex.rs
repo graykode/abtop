@@ -462,6 +462,37 @@ fn parse_codex_tool_arg(arguments: &str) -> String {
     String::new()
 }
 
+fn parse_codex_tool_session_id(arguments: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(arguments).ok()?;
+    let raw = &value["session_id"];
+    if let Some(s) = raw.as_str() {
+        return Some(s.to_string());
+    }
+    raw.as_u64().map(|n| n.to_string())
+}
+
+fn running_process_session_id(output: &str) -> Option<String> {
+    let marker = "Process running with session ID ";
+    let after = output
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix(marker))?;
+    let id = after.split_whitespace().next()?;
+    if id.is_empty() {
+        None
+    } else {
+        Some(
+            id.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                .to_string(),
+        )
+    }
+}
+
+fn output_reports_process_exit(output: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.trim_start().starts_with("Process exited"))
+}
+
 fn close_codex_tool_call(
     call_id: &str,
     end_ms: u64,
@@ -522,6 +553,9 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
     };
     let mut call_indices: HashMap<String, usize> = HashMap::new();
     let mut call_starts: HashMap<String, u64> = HashMap::new();
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    let mut write_stdin_targets: HashMap<String, String> = HashMap::new();
+    let mut running_exec_by_session: HashMap<String, String> = HashMap::new();
     let mut pending_tasks: Vec<(String, String)> = Vec::new();
 
     // Match Claude transcript cap: a malformed/hostile line beyond this size
@@ -721,6 +755,15 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
 
                         if let Some(call_id) = payload["call_id"].as_str() {
                             let start_ms = event_timestamp_ms(&val).unwrap_or(0);
+                            call_names.insert(call_id.to_string(), name.to_string());
+                            if name == "write_stdin" {
+                                if let Some(session_id) = payload["arguments"]
+                                    .as_str()
+                                    .and_then(parse_codex_tool_session_id)
+                                {
+                                    write_stdin_targets.insert(call_id.to_string(), session_id);
+                                }
+                            }
                             call_starts.insert(call_id.to_string(), start_ms);
                             pending_tasks.retain(|(id, _)| id != call_id);
                             pending_tasks.push((call_id.to_string(), task));
@@ -737,20 +780,59 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                     }
                 } else if payload["type"].as_str() == Some("function_call_output") {
                     if let Some(call_id) = payload["call_id"].as_str() {
-                        let keep_open_for_exec = call_indices
-                            .get(call_id)
-                            .and_then(|idx| result.tool_calls.get(*idx))
-                            .is_some_and(|tc| tc.name == "exec_command");
-                        if !keep_open_for_exec {
-                            let end_ms = event_timestamp_ms(&val).unwrap_or(0);
-                            close_codex_tool_call(
-                                call_id,
-                                end_ms,
-                                &mut result.tool_calls,
-                                &call_indices,
-                                &mut call_starts,
-                                &mut pending_tasks,
-                            );
+                        let end_ms = event_timestamp_ms(&val).unwrap_or(0);
+                        let output = payload["output"].as_str().unwrap_or_default();
+                        match call_names.get(call_id).map(String::as_str) {
+                            Some("exec_command") => {
+                                if let Some(session_id) = running_process_session_id(output) {
+                                    running_exec_by_session.insert(session_id, call_id.to_string());
+                                } else {
+                                    close_codex_tool_call(
+                                        call_id,
+                                        end_ms,
+                                        &mut result.tool_calls,
+                                        &call_indices,
+                                        &mut call_starts,
+                                        &mut pending_tasks,
+                                    );
+                                }
+                            }
+                            Some("write_stdin") => {
+                                close_codex_tool_call(
+                                    call_id,
+                                    end_ms,
+                                    &mut result.tool_calls,
+                                    &call_indices,
+                                    &mut call_starts,
+                                    &mut pending_tasks,
+                                );
+                                if output_reports_process_exit(output) {
+                                    if let Some(exec_call_id) =
+                                        write_stdin_targets.get(call_id).and_then(|session_id| {
+                                            running_exec_by_session.remove(session_id)
+                                        })
+                                    {
+                                        close_codex_tool_call(
+                                            &exec_call_id,
+                                            end_ms,
+                                            &mut result.tool_calls,
+                                            &call_indices,
+                                            &mut call_starts,
+                                            &mut pending_tasks,
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {
+                                close_codex_tool_call(
+                                    call_id,
+                                    end_ms,
+                                    &mut result.tool_calls,
+                                    &call_indices,
+                                    &mut call_starts,
+                                    &mut pending_tasks,
+                                );
+                            }
                         }
                     }
                 }
@@ -1047,6 +1129,97 @@ mod tests {
         assert_eq!(session.current_tasks, vec!["waiting for input".to_string()]);
         assert_eq!(session.tool_calls.len(), 1);
         assert_eq!(session.tool_calls[0].duration_ms, 3_000);
+        assert_eq!(session.pending_since_ms, 0);
+    }
+
+    #[test]
+    fn test_codex_exec_command_output_closes_task_without_end_event() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                SESSION_META,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:06Z","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}","call_id":"call_1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:09Z","payload":{"type":"function_call_output","call_id":"call_1","output":"Chunk ID: abc\nWall time: 0.1000 seconds\nProcess exited with code 0\nOutput:\nok"}}"#,
+            ],
+        );
+
+        let collector = CodexCollector::new();
+        let mut process_info = HashMap::new();
+        process_info.insert(
+            42,
+            ProcInfo {
+                pid: 42,
+                ppid: 1,
+                rss_kb: 1024,
+                cpu_pct: 0.0,
+                command: "codex".to_string(),
+            },
+        );
+
+        let (session, _) = collector
+            .load_session_with_rate_limit(
+                Some(42),
+                false,
+                file.path(),
+                &process_info,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
+
+        assert_eq!(session.status, SessionStatus::Waiting);
+        assert_eq!(session.current_tasks, vec!["waiting for input".to_string()]);
+        assert_eq!(session.tool_calls.len(), 1);
+        assert_eq!(session.tool_calls[0].duration_ms, 3_000);
+        assert_eq!(session.pending_since_ms, 0);
+    }
+
+    #[test]
+    fn test_codex_running_exec_closes_when_write_stdin_reports_exit() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                SESSION_META,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:06Z","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}","call_id":"call_1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:07Z","payload":{"type":"function_call_output","call_id":"call_1","output":"Chunk ID: abc\nWall time: 1.0000 seconds\nProcess running with session ID 12345\nOutput:\ncompiling"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:08Z","payload":{"type":"function_call","name":"write_stdin","arguments":"{\"session_id\":12345,\"chars\":\"\"}","call_id":"call_2"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:12Z","payload":{"type":"function_call_output","call_id":"call_2","output":"Chunk ID: abc\nWall time: 0.0000 seconds\nProcess exited with code 0\nOutput:\nok"}}"#,
+            ],
+        );
+
+        let collector = CodexCollector::new();
+        let mut process_info = HashMap::new();
+        process_info.insert(
+            42,
+            ProcInfo {
+                pid: 42,
+                ppid: 1,
+                rss_kb: 1024,
+                cpu_pct: 0.0,
+                command: "codex".to_string(),
+            },
+        );
+
+        let (session, _) = collector
+            .load_session_with_rate_limit(
+                Some(42),
+                false,
+                file.path(),
+                &process_info,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
+
+        assert_eq!(session.status, SessionStatus::Waiting);
+        assert_eq!(session.current_tasks, vec!["waiting for input".to_string()]);
+        assert_eq!(session.tool_calls.len(), 2);
+        assert_eq!(session.tool_calls[0].name, "exec_command");
+        assert_eq!(session.tool_calls[0].duration_ms, 6_000);
+        assert_eq!(session.tool_calls[1].name, "write_stdin");
+        assert_eq!(session.tool_calls[1].duration_ms, 4_000);
         assert_eq!(session.pending_since_ms, 0);
     }
 
