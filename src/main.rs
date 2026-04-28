@@ -146,7 +146,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, demo_mode: boo
                         }
                     } else if app.config_open {
                         match key.code {
-                            KeyCode::Esc | KeyCode::Char('q') => app.toggle_config(),
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') => app.toggle_config(),
                             KeyCode::Down | KeyCode::Char('j') => app.config_select_next(),
                             KeyCode::Up | KeyCode::Char('k') => app.config_select_prev(),
                             KeyCode::Enter | KeyCode::Char(' ') => app.config_toggle_selected(),
