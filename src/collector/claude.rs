@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-#[cfg(all(not(target_os = "linux"), not(target_vendor = "apple")))]
+#[cfg(all(not(target_os = "linux"), not(target_vendor = "apple"), not(target_os = "windows")))]
 use std::process::Command;
 
 /// A single Claude config directory (sessions + projects + transcripts).
@@ -244,7 +244,12 @@ impl ClaudeCollector {
             map_pid_to_libproc_open_paths(pids)
         }
 
-        #[cfg(all(not(target_os = "linux"), not(target_vendor = "apple")))]
+        #[cfg(target_os = "windows")]
+        {
+            map_pid_to_sysinfo_open_paths(pids)
+        }
+
+        #[cfg(all(not(target_os = "linux"), not(target_vendor = "apple"), not(target_os = "windows")))]
         {
             map_pid_to_lsof_open_paths(pids)
         }
@@ -776,7 +781,36 @@ fn map_pid_to_libproc_open_paths(pids: &[u32]) -> HashMap<u32, ProcessOpenPaths>
     map
 }
 
-#[cfg(all(not(target_os = "linux"), not(target_vendor = "apple")))]
+#[cfg(target_os = "windows")]
+fn map_pid_to_sysinfo_open_paths(pids: &[u32]) -> HashMap<u32, ProcessOpenPaths> {
+    use sysinfo::{System, ProcessRefreshKind, ProcessesToUpdate};
+
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything()
+    );
+
+    let mut map = HashMap::new();
+    let pid_set: std::collections::HashSet<u32> = pids.iter().copied().collect();
+
+    for (pid, proc) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+        if !pid_set.contains(&pid_u32) {
+            continue;
+        }
+
+        let cwd: Option<PathBuf> = proc.cwd().map(|p| p.to_path_buf());
+        // sysinfo 0.32 doesn't have fd_list, use empty paths list
+        // open file tracking is less critical - discovery via session files works
+        map.insert(pid_u32, ProcessOpenPaths { cwd, paths: Vec::new() });
+    }
+
+    map
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_vendor = "apple"), not(target_os = "windows")))]
 fn map_pid_to_lsof_open_paths(pids: &[u32]) -> HashMap<u32, ProcessOpenPaths> {
     let pid_args: Vec<String> = pids.iter().map(|p| format!("-p{}", p)).collect();
     let mut args = vec!["-F", "ftn"];
@@ -790,7 +824,7 @@ fn map_pid_to_lsof_open_paths(pids: &[u32]) -> HashMap<u32, ProcessOpenPaths> {
         .unwrap_or_default()
 }
 
-#[cfg_attr(any(target_os = "linux", target_vendor = "apple"), allow(dead_code))]
+#[cfg_attr(any(target_os = "linux", target_vendor = "apple", target_os = "windows"), allow(dead_code))]
 fn parse_lsof_process_info(output: &str) -> HashMap<u32, ProcessOpenPaths> {
     let mut map: HashMap<u32, ProcessOpenPaths> = HashMap::new();
     let mut current_pid: Option<u32> = None;
@@ -1097,6 +1131,7 @@ fn is_symlink(path: &Path) -> bool {
 }
 
 /// Get file identity as (inode, mtime_nanos) for detecting file replacement.
+#[cfg(unix)]
 fn file_identity(path: &Path) -> (u64, u64) {
     fs::metadata(path)
         .ok()
@@ -1109,6 +1144,24 @@ fn file_identity(path: &Path) -> (u64, u64) {
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
             (ino, mtime_ns)
+        })
+        .unwrap_or((0, 0))
+}
+
+/// Windows fallback: use file size + mtime as identity
+#[cfg(windows)]
+fn file_identity(path: &Path) -> (u64, u64) {
+    fs::metadata(path)
+        .ok()
+        .map(|m| {
+            let size = m.len();
+            let mtime_ns = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            (size, mtime_ns)
         })
         .unwrap_or((0, 0))
 }

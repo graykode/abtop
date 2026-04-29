@@ -101,7 +101,7 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
     map
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
 pub fn get_process_info() -> HashMap<u32, ProcInfo> {
     let mut map = HashMap::new();
     let output = Command::new("ps")
@@ -131,6 +131,42 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
                 }
             }
         }
+    }
+    map
+}
+
+#[cfg(target_os = "windows")]
+pub fn get_process_info() -> HashMap<u32, ProcInfo> {
+    use sysinfo::{System, ProcessRefreshKind, ProcessesToUpdate};
+
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything()
+    );
+
+    let mut map = HashMap::new();
+    for (pid, proc) in sys.processes() {
+        let pid_u32 = pid.as_u32();
+        // On Windows, cmd() may be empty but name() has the executable
+        let cmd: Vec<String> = proc.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        let command = if cmd.is_empty() {
+            // Use name() as fallback when cmdline is empty
+            proc.name().to_string_lossy().into_owned()
+        } else {
+            cmd.join(" ")
+        };
+        if command.is_empty() {
+            continue;
+        }
+        map.insert(pid_u32, ProcInfo {
+            pid: pid_u32,
+            ppid: proc.parent().map(|p| p.as_u32()).unwrap_or(0),
+            rss_kb: proc.memory() / 1024,
+            cpu_pct: proc.cpu_usage() as f64,
+            command,
+        });
     }
     map
 }
@@ -228,7 +264,7 @@ pub fn get_listening_ports() -> HashMap<u32, Vec<u16>> {
     map
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
 pub fn get_listening_ports() -> HashMap<u32, Vec<u16>> {
     let mut map: HashMap<u32, Vec<u16>> = HashMap::new();
     let output = Command::new("lsof")
@@ -258,14 +294,44 @@ pub fn get_listening_ports() -> HashMap<u32, Vec<u16>> {
     map
 }
 
+#[cfg(target_os = "windows")]
+pub fn get_listening_ports() -> HashMap<u32, Vec<u16>> {
+    let mut map: HashMap<u32, Vec<u16>> = HashMap::new();
+
+    let output = Command::new("netstat")
+        .args(["-ano"])
+        .output()
+        .ok();
+
+    if let Some(output) = output {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines().skip(4) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 5 && parts[0] == "TCP" && parts[3] == "LISTENING" {
+                let addr = parts[1];
+                if let Some(port_str) = addr.rsplit(':').next() {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        if let Ok(pid) = parts[4].parse::<u32>() {
+                            map.entry(pid).or_default().push(port);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
 /// Check if a command string has a given binary name in executable position.
 /// Checks the first two argv tokens only (covers direct invocation and
 /// interpreter-wrapped scripts like `node /path/to/codex ...`).
+/// Also accepts process name on Windows when command is empty.
 pub fn cmd_has_binary(cmd: &str, name: &str) -> bool {
     let mut tokens = cmd.split_whitespace().take(2);
     tokens.any(|tok| {
-        let base = tok.rsplit('/').next().unwrap_or(tok);
-        base == name
+        let base = tok.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(tok);
+        let base = base.strip_suffix(".exe").unwrap_or(base);
+        base.eq_ignore_ascii_case(name)
     })
 }
 
