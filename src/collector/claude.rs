@@ -478,8 +478,12 @@ impl ClaudeCollector {
         let status = {
             let has_active_descendant =
                 process::has_active_descendant(sf.pid, children_map, process_info, 5.0);
+            // Non-empty current_task = latest assistant turn left a tool_use
+            // unanswered. Catches fast tools (`Bash rm ...`) that finish
+            // between CPU samples, so has_active_descendant alone misses them.
+            let pending_tool = !cached.current_task.is_empty();
             let model_generating = cached.last_user_ts_ms > 0;
-            if has_active_descendant {
+            if has_active_descendant || pending_tool {
                 SessionStatus::Executing
             } else if model_generating {
                 SessionStatus::Thinking
@@ -2819,6 +2823,63 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].status, SessionStatus::Thinking);
+    }
+
+    #[test]
+    fn test_load_session_pending_tool_use_is_executing() {
+        // Regression: when the last assistant turn ends with a tool_use that
+        // hasn't been answered yet, the agent is still mid-turn even if no
+        // descendant is burning CPU (fast tools like `Bash rm` finish before
+        // the next sample). Status must read as Executing, not Waiting.
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 9103;
+        let sid = "pending-tool";
+        let session_path = sessions_dir.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, sid, &cwd);
+
+        // Trailing assistant tool_use with no following tool_result.
+        let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript = transcript_dir.join(format!("{}.jsonl", sid));
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"go"}}
+{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Bash","id":"t1","input":{"command":"rm -v /tmp/x"}}]}}
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigDir::new(profile.clone());
+        // cpu_pct = 0 → has_active_descendant is false; Executing must come
+        // from the pending-tool branch alone.
+        let process_info = make_proc_info(pid, "claude");
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config.clone()];
+
+        let session_paths = vec![(session_path, config)];
+        let ctx = build_discovery_context(&session_paths, &process_info);
+        let sessions = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].status,
+            SessionStatus::Executing,
+            "pending tool_use must read as Executing even with idle descendants",
+        );
     }
 
     #[test]
