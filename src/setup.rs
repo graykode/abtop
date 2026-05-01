@@ -20,15 +20,34 @@ rl = data.get('rate_limits')
 if not rl:
     sys.exit(0)
 out = {'source': 'claude', 'updated_at': int(time.time())}
-fh = rl.get('five_hour')
+fh = rl.get('five_hour') or rl.get('session')
 if fh:
     out['five_hour'] = {'used_percentage': fh.get('used_percentage', 0), 'resets_at': fh.get('resets_at', 0)}
-sd = rl.get('seven_day')
+sd = rl.get('seven_day') or rl.get('weekly')
 if sd:
     out['seven_day'] = {'used_percentage': sd.get('used_percentage', 0), 'resets_at': sd.get('resets_at', 0)}
-config_dir = os.environ.get('CLAUDE_CONFIG_DIR', os.path.join(os.path.expanduser('~'), '.claude'))
-with open(os.path.join(config_dir, 'abtop-rate-limits.json'), 'w') as f:
+if 'five_hour' not in out and 'seven_day' not in out:
+    sys.exit(0)
+config_dir = None
+transcript_path = data.get('transcript_path')
+if transcript_path:
+    p = os.path.abspath(transcript_path)
+    parts = p.split(os.sep)
+    if 'projects' in parts:
+        idx = parts.index('projects')
+        inferred = os.sep.join(parts[:idx])
+        if inferred:
+            config_dir = inferred
+if not config_dir:
+    config_dir = os.environ.get('CLAUDE_CONFIG_DIR')
+if not config_dir:
+    config_dir = os.path.join(os.path.expanduser('~'), '.claude')
+path = os.path.join(config_dir, 'abtop-rate-limits.json')
+tmp = path + '.tmp'
+os.makedirs(config_dir, exist_ok=True)
+with open(tmp, 'w') as f:
     json.dump(out, f)
+os.replace(tmp, path)
 " 2>/dev/null
 "#;
 

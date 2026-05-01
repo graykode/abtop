@@ -12,9 +12,6 @@ use super::{btop_block, fmt_tokens, grad_at, make_gradient, remaining_bar, style
 /// Data considered "stale" when its updated_at is older than this many seconds.
 const STALE_SECS: u64 = 600;
 
-/// Fixed source order so columns stay stable across runs.
-const SOURCES: &[&str] = &["claude", "codex"];
-
 pub(crate) fn draw_quota_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let cpu_grad = make_gradient(theme.cpu_grad.start, theme.cpu_grad.mid, theme.cpu_grad.end);
 
@@ -34,14 +31,16 @@ pub(crate) fn draw_quota_panel(f: &mut Frame, app: &App, area: Rect, theme: &The
     let ticks_per_min = 30usize;
     let tokens_per_min: f64 = rates.iter().rev().take(ticks_per_min).sum();
 
-    // Split into side-by-side columns: one per known source (CLAUDE | CODEX).
-    // Columns are always rendered so the panel layout stays stable even when a
-    // source has no data yet.
-    let num_sources = SOURCES.len() as u16;
+    // Split into side-by-side columns: one per known source. Multiple Claude
+    // Code config dirs are rendered as distinct sources (for example
+    // claude-work and claude-personal) so account quotas do not overwrite each
+    // other.
+    let sources = quota_sources(&app.rate_limits);
+    let num_sources = sources.len() as u16;
     let col_w = inner.width / num_sources;
     let content_h = inner.height.saturating_sub(1); // reserve last row for totals
 
-    for (i, source) in SOURCES.iter().enumerate() {
+    for (i, source) in sources.iter().enumerate() {
         let col_x = inner.x + (i as u16) * col_w;
         let this_w = if i as u16 == num_sources - 1 {
             inner.width - (i as u16) * col_w
@@ -67,6 +66,45 @@ pub(crate) fn draw_quota_panel(f: &mut Frame, app: &App, area: Rect, theme: &The
     ])]), bottom_area);
 }
 
+fn quota_sources(rate_limits: &[RateLimitInfo]) -> Vec<String> {
+    let mut sources: Vec<String> = rate_limits
+        .iter()
+        .map(|r| r.source.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    if !sources.iter().any(|s| is_claude_source(s)) {
+        sources.push("claude".to_string());
+    }
+    if !sources.iter().any(|s| s.eq_ignore_ascii_case("codex")) {
+        sources.push("codex".to_string());
+    }
+
+    sources.sort_by(|a, b| {
+        source_sort_key(a)
+            .cmp(&source_sort_key(b))
+            .then_with(|| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()))
+    });
+    sources.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    sources
+}
+
+fn source_sort_key(source: &str) -> u8 {
+    if is_claude_source(source) {
+        0
+    } else if source.eq_ignore_ascii_case("codex") {
+        1
+    } else {
+        2
+    }
+}
+
+fn is_claude_source(source: &str) -> bool {
+    let source = source.to_ascii_lowercase();
+    source == "claude" || source.starts_with("claude-")
+}
+
 fn draw_source_column(
     f: &mut Frame,
     area: Rect,
@@ -79,7 +117,7 @@ fn draw_source_column(
     let bar_w = col_w_usize.saturating_sub(10).clamp(2, 8);
 
     let Some(rl) = rl else {
-        let hint = if source.eq_ignore_ascii_case("claude") {
+        let hint = if is_claude_source(source) {
             "  abtop --setup"
         } else {
             "  run codex once"
@@ -175,5 +213,30 @@ pub(crate) fn format_reset_time(reset_ts: u64) -> String {
         format!("{}h {}m", diff / 3600, (diff % 3600) / 60)
     } else {
         format!("{}d {}h", diff / 86400, (diff % 86400) / 3600)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rate_limit(source: &str) -> RateLimitInfo {
+        RateLimitInfo { source: source.to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn quota_sources_expands_profiled_claude_accounts() {
+        let sources = quota_sources(&[
+            rate_limit("claude-personal"),
+            rate_limit("codex"),
+            rate_limit("claude-work"),
+        ]);
+
+        assert_eq!(sources, vec!["claude-personal", "claude-work", "codex"]);
+    }
+
+    #[test]
+    fn quota_sources_keeps_default_empty_state() {
+        assert_eq!(quota_sources(&[]), vec!["claude", "codex"]);
     }
 }

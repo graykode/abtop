@@ -1,5 +1,6 @@
 use crate::model::RateLimitInfo;
 use serde::Deserialize;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// File written by the StatusLine hook: ~/.claude/abtop-rate-limits.json
@@ -49,8 +50,9 @@ pub fn read_rate_limits(extra_dirs: &[PathBuf]) -> Vec<RateLimitInfo> {
         if !dir.is_dir() || !seen.insert(dir.clone()) {
             continue;
         }
+        let source = claude_source_for_dir(&dir);
         let path = dir.join(CLAUDE_RATE_FILE);
-        if let Some(info) = read_rate_file(&path, "claude") {
+        if let Some(info) = read_rate_file(&path, &source) {
             results.push(info);
         }
     }
@@ -109,7 +111,7 @@ fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
         return None;
     }
 
-    let source = if file.source.is_empty() {
+    let source = if file.source.is_empty() || file.source.eq_ignore_ascii_case("claude") {
         default_source.to_string()
     } else {
         file.source
@@ -123,4 +125,80 @@ fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
         seven_day_resets_at: file.seven_day.as_ref().map(|w| w.resets_at),
         updated_at: file.updated_at,
     })
+}
+
+fn claude_source_for_dir(dir: &Path) -> String {
+    let name = dir.file_name().and_then(OsStr::to_str).unwrap_or("claude");
+    let label = name.trim_start_matches('.');
+
+    if label == "claude" {
+        return "claude".to_string();
+    }
+
+    if let Some(profile) = label.strip_prefix("claude-") {
+        if !profile.is_empty() {
+            return format!("claude-{profile}");
+        }
+    }
+
+    format!("claude-{label}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_rate_file(dir: &Path, source: &str, used: f64) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(CLAUDE_RATE_FILE),
+            format!(
+                r#"{{"source":"{}","five_hour":{{"used_percentage":{},"resets_at":123}},"updated_at":456}}"#,
+                source, used
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn labels_profiled_claude_config_dirs() {
+        assert_eq!(claude_source_for_dir(Path::new("/home/me/.claude")), "claude");
+        assert_eq!(
+            claude_source_for_dir(Path::new("/home/me/.claude-work")),
+            "claude-work"
+        );
+        assert_eq!(
+            claude_source_for_dir(Path::new("/home/me/.claude-personal")),
+            "claude-personal"
+        );
+    }
+
+    #[test]
+    fn read_rate_limits_keeps_profiled_claude_accounts_separate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join(".claude-work");
+        let personal = tmp.path().join(".claude-personal");
+
+        // abtop --setup writes "source":"claude" in each config dir. The
+        // reader should label the file by config directory so multiple Claude
+        // Code accounts do not collapse into one quota source.
+        write_rate_file(&work, "claude", 10.0);
+        write_rate_file(&personal, "claude", 20.0);
+
+        let rates = read_rate_limits(&[work, personal]);
+        let sources: Vec<_> = rates.iter().map(|r| r.source.as_str()).collect();
+
+        assert!(sources.contains(&"claude-work"));
+        assert!(sources.contains(&"claude-personal"));
+    }
+
+    #[test]
+    fn read_rate_file_preserves_explicit_custom_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_rate_file(tmp.path(), "team-claude", 10.0);
+
+        let rate = read_rate_file(&tmp.path().join(CLAUDE_RATE_FILE), "claude-work").unwrap();
+
+        assert_eq!(rate.source, "team-claude");
+    }
 }

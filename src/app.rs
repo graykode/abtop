@@ -757,7 +757,7 @@ fn promote_waiting_to_rate_limited(
             continue;
         }
         let over = rate_limits.iter().any(|rl| {
-            rl.source == s.agent_cli
+            rate_limit_source_matches_agent(&rl.source, s.agent_cli)
                 && (rl.five_hour_pct.unwrap_or(0.0) > RATE_LIMITED_PCT
                     || rl.seven_day_pct.unwrap_or(0.0) > RATE_LIMITED_PCT)
         });
@@ -765,6 +765,19 @@ fn promote_waiting_to_rate_limited(
             s.status = SessionStatus::RateLimited;
         }
     }
+}
+
+fn rate_limit_source_matches_agent(source: &str, agent_cli: &str) -> bool {
+    if source.eq_ignore_ascii_case(agent_cli) {
+        return true;
+    }
+
+    if !agent_cli.eq_ignore_ascii_case("claude") {
+        return false;
+    }
+
+    let source = source.to_ascii_lowercase();
+    source.starts_with("claude-")
 }
 
 #[cfg(test)]
@@ -839,6 +852,15 @@ mod tests {
         let limits = vec![rate_limit("claude", 89.9)];
         promote_waiting_to_rate_limited(&mut sessions, &limits);
         assert_eq!(sessions[0].status, SessionStatus::Waiting);
+    }
+
+    #[test]
+    fn test_rate_limited_promotion_matches_profiled_claude_sources() {
+        let mut sessions = vec![waiting_session("claude"), waiting_session("codex")];
+        let limits = vec![rate_limit("claude-work", 95.0)];
+        promote_waiting_to_rate_limited(&mut sessions, &limits);
+        assert_eq!(sessions[0].status, SessionStatus::RateLimited);
+        assert_eq!(sessions[1].status, SessionStatus::Waiting);
     }
 
     #[test]
