@@ -336,32 +336,32 @@ mod tests {
     #[test]
     fn with_hidden_empty_keeps_all_collectors() {
         let mc = MultiCollector::with_hidden(&[]);
-        assert_eq!(mc.collectors.len(), 2);
+        assert_eq!(mc.collectors.len(), 3);
     }
 
     #[test]
     fn with_hidden_codex_drops_codex_only() {
         let mc = MultiCollector::with_hidden(&["codex".to_string()]);
-        assert_eq!(mc.collectors.len(), 1);
+        assert_eq!(mc.collectors.len(), 2);
     }
 
     #[test]
     fn with_hidden_is_case_insensitive() {
         let mc = MultiCollector::with_hidden(&["CODEX".to_string()]);
-        assert_eq!(mc.collectors.len(), 1);
+        assert_eq!(mc.collectors.len(), 2);
         let mc = MultiCollector::with_hidden(&["Claude".to_string()]);
-        assert_eq!(mc.collectors.len(), 1);
+        assert_eq!(mc.collectors.len(), 2);
     }
 
     #[test]
     fn with_hidden_unknown_names_are_ignored() {
         let mc = MultiCollector::with_hidden(&["kiro".to_string(), "gemini".to_string()]);
-        assert_eq!(mc.collectors.len(), 2);
+        assert_eq!(mc.collectors.len(), 3);
     }
 
     #[test]
     fn with_hidden_all_agents_yields_empty() {
-        let mc = MultiCollector::with_hidden(&["claude".to_string(), "codex".to_string()]);
+        let mc = MultiCollector::with_hidden(&["claude".to_string(), "codex".to_string(), "opencode".to_string()]);
         assert!(mc.collectors.is_empty());
     }
 }
