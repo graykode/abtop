@@ -227,6 +227,13 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("config.off", "off");
     m.insert("config.change", "Enter/Space to change");
     m.insert("config.close", "Esc to close");
+    m.insert("config.context_panel", "Context panel (1)");
+    m.insert("config.quota_panel", "Quota panel (2)");
+    m.insert("config.tokens_panel", "Tokens panel (3)");
+    m.insert("config.projects_panel", "Projects panel (4)");
+    m.insert("config.ports_panel", "Ports panel (5)");
+    m.insert("config.sessions_panel", "Sessions panel (6)");
+    m.insert("config.mcp_panel", "MCP servers (7)");
 
     // Terminal size too small
     m.insert("term.too_small", "Terminal size too small:");
@@ -462,6 +469,13 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("config.off", "关");
     m.insert("config.change", "Enter/空格 更改");
     m.insert("config.close", "Esc 关闭");
+    m.insert("config.context_panel", "上下文面板 (1)");
+    m.insert("config.quota_panel", "配额面板 (2)");
+    m.insert("config.tokens_panel", "令牌面板 (3)");
+    m.insert("config.projects_panel", "项目面板 (4)");
+    m.insert("config.ports_panel", "端口面板 (5)");
+    m.insert("config.sessions_panel", "会话面板 (6)");
+    m.insert("config.mcp_panel", "MCP 服务器 (7)");
 
     // Terminal size too small
     m.insert("term.too_small", "终端尺寸过小:");

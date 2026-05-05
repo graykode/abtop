@@ -115,7 +115,11 @@ mod tests {
 
     #[test]
     fn fmt_age_buckets() {
-        // This would need t() to be callable in tests, which it isn't
-        // So we just test the logic without i18n
+        // t() defaults to English when ABTOP_LANG is unset, so the strings
+        // here match the en-US locale values for `time.{s,m,h,d}_ago`.
+        assert_eq!(fmt_age(5), "5s ago");
+        assert_eq!(fmt_age(125), "2m ago");
+        assert_eq!(fmt_age(7_200), "2h ago");
+        assert_eq!(fmt_age(172_800), "2d ago");
     }
 }

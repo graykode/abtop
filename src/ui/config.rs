@@ -48,28 +48,32 @@ pub(crate) fn draw_config_overlay(f: &mut Frame, app: &App, theme: &Theme) {
     let items: Vec<(String, String)> = vec![
         (theme_label, app.theme.name.to_string()),
         (
-            format!("Context panel (1)"),
+            t("config.context_panel"),
             toggle_str(&on_str, &off_str, app.show_context),
         ),
         (
-            format!("Quota panel (2)"),
+            t("config.quota_panel"),
             toggle_str(&on_str, &off_str, app.show_quota),
         ),
         (
-            format!("Tokens panel (3)"),
+            t("config.tokens_panel"),
             toggle_str(&on_str, &off_str, app.show_tokens),
         ),
         (
-            format!("Projects panel (4)"),
+            t("config.projects_panel"),
             toggle_str(&on_str, &off_str, app.show_projects),
         ),
         (
-            format!("Ports panel (5)"),
+            t("config.ports_panel"),
             toggle_str(&on_str, &off_str, app.show_ports),
         ),
         (
-            format!("Sessions panel (6)"),
+            t("config.sessions_panel"),
             toggle_str(&on_str, &off_str, app.show_sessions),
+        ),
+        (
+            t("config.mcp_panel"),
+            toggle_str(&on_str, &off_str, app.show_mcp),
         ),
     ];
 
