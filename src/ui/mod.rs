@@ -11,7 +11,7 @@ mod sessions;
 mod tokens;
 mod view_menu;
 
-use crate::app::App;
+use crate::app::{App, NarrowSection, NarrowTab};
 use crate::locale::t;
 use crate::theme::Theme;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -238,12 +238,18 @@ pub(crate) fn braille_graph_multirow(
 
 // ── btop-style block with notch title: ──┐¹title┌────── ─────────────────────
 
-pub(crate) fn btop_block(
+pub(crate) fn btop_block_active(
     title: &str,
     number: &str,
     box_color: Color,
     theme: &Theme,
+    active: bool,
 ) -> Block<'static> {
+    let title = if active {
+        format!("{title}(*)")
+    } else {
+        title.to_string()
+    };
     Block::default()
         .title(Line::from(vec![
             Span::styled("┐", Style::default().fg(box_color)),
@@ -254,7 +260,7 @@ pub(crate) fn btop_block(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                title.to_string(),
+                title,
                 Style::default()
                     .fg(theme.title)
                     .add_modifier(Modifier::BOLD),
@@ -272,8 +278,26 @@ pub(crate) fn styled_label(text: &str, graph_text: Color) -> Span<'static> {
 
 // ── main draw ────────────────────────────────────────────────────────────────
 
-const MIN_WIDTH: u16 = 100;
-const MIN_HEIGHT: u16 = 24;
+const MIN_WIDTH: u16 = 60;
+const MIN_HEIGHT: u16 = 18;
+pub(crate) const DESKTOP_WIDTH: u16 = 100;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClickTarget {
+    NarrowTab(NarrowTab),
+    NarrowSection(NarrowSection),
+    NarrowZoom(NarrowSection),
+    Session(usize),
+    KillOrphanPorts,
+}
+
+struct DesktopLayout {
+    header: Rect,
+    context: Option<Rect>,
+    mid: Vec<(NarrowSection, Rect)>,
+    sessions: Option<Rect>,
+    footer: Rect,
+}
 
 pub fn draw(f: &mut Frame, app: &App) {
     let theme = &app.theme;
@@ -353,14 +377,61 @@ pub fn draw(f: &mut Frame, app: &App) {
         return;
     }
 
-    // Layout priority: sessions first → mid → context (only with surplus space)
+    if w < DESKTOP_WIDTH {
+        draw_narrow(f, app, area, theme);
+        draw_overlays(f, app, theme);
+        return;
+    }
 
+    let layout = desktop_layout(app, area);
+    header::draw_header(f, app, layout.header, theme);
+
+    if let Some(area) = layout.context {
+        context::draw_context_panel(f, app, area, theme);
+    }
+
+    for (section, area) in layout.mid {
+        match section {
+            NarrowSection::Quota => quota::draw_quota_panel(f, app, area, theme),
+            NarrowSection::Tokens => tokens::draw_tokens_panel(f, app, area, theme),
+            NarrowSection::Projects => projects::draw_projects_panel(f, app, area, theme),
+            NarrowSection::Ports => ports::draw_ports_panel(f, app, area, theme),
+            NarrowSection::Mcp => mcp::draw_mcp_panel(f, app, area, theme),
+            NarrowSection::Sessions | NarrowSection::Context => {}
+        }
+    }
+
+    if let Some(area) = layout.sessions {
+        sessions::draw_sessions_panel(f, app, area, theme);
+    }
+    footer::draw_footer(f, app, layout.footer, theme);
+
+    draw_overlays(f, app, theme);
+}
+
+fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     const CONTEXT_MIN: u16 = 5;
     const FIXED: u16 = 2; // header + footer
+    const MID_MIN: u16 = 6;
 
-    let any_mid =
-        app.show_quota || app.show_tokens || app.show_projects || app.show_ports || app.show_mcp;
+    let mut mid_sections = Vec::new();
+    if app.show_quota {
+        mid_sections.push(NarrowSection::Quota);
+    }
+    if app.show_tokens {
+        mid_sections.push(NarrowSection::Tokens);
+    }
+    if app.show_projects {
+        mid_sections.push(NarrowSection::Projects);
+    }
+    if app.show_ports {
+        mid_sections.push(NarrowSection::Ports);
+    }
+    if app.show_mcp {
+        mid_sections.push(NarrowSection::Mcp);
+    }
 
+    let any_mid = !mid_sections.is_empty();
     let mid_h_ideal: u16 = 8;
     let sessions_ideal: u16 = if app.show_sessions {
         (app.sessions.len() as u16 * 2 + 7).max(8)
@@ -369,8 +440,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     };
     let context_ideal: u16 = (app.sessions.len() as u16 + 4).clamp(5, 10);
 
-    let available = h.saturating_sub(FIXED);
-    const MID_MIN: u16 = 6;
+    let available = area.height.saturating_sub(FIXED);
     let mid_reserved = if any_mid { MID_MIN.min(available) } else { 0 };
     let sessions_budget = available.saturating_sub(mid_reserved);
     let sessions_h = if app.show_sessions {
@@ -400,7 +470,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let mut constraints = [Constraint::Length(0); 5];
     let mut n = 0;
     constraints[n] = Constraint::Length(1);
-    n += 1; // header
+    n += 1;
     if context_h > 0 {
         constraints[n] = Constraint::Length(context_h);
         n += 1;
@@ -413,7 +483,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         constraints[n] = Constraint::Min(sessions_h);
         n += 1;
     }
-    constraints[n] = Constraint::Length(1); // footer
+    constraints[n] = Constraint::Length(1);
     n += 1;
 
     let chunks = Layout::default()
@@ -422,69 +492,214 @@ pub fn draw(f: &mut Frame, app: &App) {
         .split(area);
 
     let mut idx = 0;
-    header::draw_header(f, app, chunks[idx], theme);
+    let header = chunks[idx];
     idx += 1;
 
-    if context_h > 0 {
-        context::draw_context_panel(f, app, chunks[idx], theme);
+    let context = if context_h > 0 {
+        let area = chunks[idx];
         idx += 1;
-    }
+        Some(area)
+    } else {
+        None
+    };
 
-    if mid_h > 0 {
-        let mut mid_constraints: Vec<Constraint> = Vec::new();
-        if app.show_quota {
-            mid_constraints.push(Constraint::Length(0));
-        }
-        if app.show_tokens {
-            mid_constraints.push(Constraint::Length(0));
-        }
-        if app.show_projects {
-            mid_constraints.push(Constraint::Length(0));
-        }
-        if app.show_ports {
-            mid_constraints.push(Constraint::Length(0));
-        }
-        if app.show_mcp {
-            mid_constraints.push(Constraint::Length(0));
-        }
-        let count = mid_constraints.len() as u32;
+    let mid = if mid_h > 0 {
+        let count = mid_sections.len() as u32;
         let mid_constraints: Vec<Constraint> =
             (0..count).map(|_| Constraint::Ratio(1, count)).collect();
-
         let mid_panels = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(mid_constraints)
             .split(chunks[idx]);
-
-        let mut mi = 0;
-        if app.show_quota {
-            quota::draw_quota_panel(f, app, mid_panels[mi], theme);
-            mi += 1;
-        }
-        if app.show_tokens {
-            tokens::draw_tokens_panel(f, app, mid_panels[mi], theme);
-            mi += 1;
-        }
-        if app.show_projects {
-            projects::draw_projects_panel(f, app, mid_panels[mi], theme);
-            mi += 1;
-        }
-        if app.show_ports {
-            ports::draw_ports_panel(f, app, mid_panels[mi], theme);
-            mi += 1;
-        }
-        if app.show_mcp {
-            mcp::draw_mcp_panel(f, app, mid_panels[mi], theme);
-        }
         idx += 1;
+        mid_sections
+            .into_iter()
+            .zip(mid_panels.iter().copied())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let sessions = if sessions_h > 0 {
+        let area = chunks[idx];
+        idx += 1;
+        Some(area)
+    } else {
+        None
+    };
+
+    DesktopLayout {
+        header,
+        context,
+        mid,
+        sessions,
+        footer: chunks[idx],
+    }
+}
+
+fn draw_narrow(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    header::draw_header(f, app, chunks[0], theme);
+
+    let body = chunks[1];
+    draw_active_narrow_panel(f, app, body, theme);
+
+    draw_narrow_tabs(f, app, chunks[2], theme);
+    footer::draw_footer(f, app, chunks[3], theme);
+}
+
+fn draw_narrow_tabs(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    let active = app.active_narrow_tab();
+    let tab_areas = narrow_tab_layout(app, area);
+    let used = narrow_tab_group_width(&tab_areas);
+    let pad = area.width.saturating_sub(used) as usize;
+    let mut spans: Vec<Span> = Vec::new();
+    if pad > 0 {
+        spans.push(Span::styled(
+            " ".repeat(pad),
+            Style::default().bg(theme.main_bg),
+        ));
+    }
+    for (i, (tab, _)) in tab_areas.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" ", Style::default().bg(theme.main_bg)));
+        }
+        let selected = Some(tab) == active;
+        let mut style = Style::default()
+            .bg(if selected {
+                theme.selected_bg
+            } else {
+                theme.main_bg
+            })
+            .fg(if selected {
+                theme.selected_fg
+            } else {
+                theme.inactive_fg
+            });
+        if selected {
+            style = style.add_modifier(Modifier::BOLD);
+        };
+        spans.push(Span::styled(narrow_tab_label(tab), style));
     }
 
-    if sessions_h > 0 {
-        sessions::draw_sessions_panel(f, app, chunks[idx], theme);
-        idx += 1;
-    }
-    footer::draw_footer(f, app, chunks[idx], theme);
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.main_bg)),
+        area,
+    );
+}
 
+fn narrow_tab_label(tab: NarrowTab) -> String {
+    format!(" {}({}) ", tab.label(), tab.shortcut())
+}
+
+fn narrow_tab_width(tab: NarrowTab) -> u16 {
+    narrow_tab_label(tab).chars().count() as u16
+}
+
+fn narrow_tab_group_width(tab_areas: &[(NarrowTab, Rect)]) -> u16 {
+    let labels = tab_areas.iter().map(|(_, area)| area.width).sum::<u16>();
+    labels + tab_areas.len().saturating_sub(1) as u16
+}
+
+fn draw_active_narrow_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    let Some(tab) = app.active_narrow_tab() else {
+        return;
+    };
+
+    for (section, section_area) in narrow_section_areas(app, tab, area) {
+        draw_narrow_section(f, app, section_area, theme, section);
+        draw_narrow_zoom_button(f, app, section_area, theme, section);
+    }
+}
+
+fn narrow_section_areas(app: &App, tab: NarrowTab, area: Rect) -> Vec<(NarrowSection, Rect)> {
+    let sections = if let Some(section) = app.maximized_narrow_section() {
+        if section.tab() == tab {
+            vec![section]
+        } else {
+            app.visible_narrow_sections(tab)
+        }
+    } else {
+        app.visible_narrow_sections(tab)
+    };
+    if sections.is_empty() {
+        return Vec::new();
+    }
+
+    if sections.len() == 1 {
+        return vec![(sections[0], area)];
+    }
+
+    let count = sections.len() as u32;
+    let constraints: Vec<Constraint> = (0..count).map(|_| Constraint::Ratio(1, count)).collect();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    sections.into_iter().zip(chunks.iter().copied()).collect()
+}
+
+fn draw_narrow_section(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    theme: &Theme,
+    section: NarrowSection,
+) {
+    let active = app.active_narrow_section() == Some(section);
+    match section {
+        NarrowSection::Sessions => {
+            sessions::draw_sessions_panel_active(f, app, area, theme, active)
+        }
+        NarrowSection::Projects => {
+            projects::draw_projects_panel_active(f, app, area, theme, active)
+        }
+        NarrowSection::Context => context::draw_context_panel_active(f, app, area, theme, active),
+        NarrowSection::Quota => quota::draw_quota_panel_active(f, app, area, theme, active),
+        NarrowSection::Tokens => tokens::draw_tokens_panel_active(f, app, area, theme, active),
+        NarrowSection::Ports => ports::draw_ports_panel_active(f, app, area, theme, active),
+        NarrowSection::Mcp => mcp::draw_mcp_panel_active(f, app, area, theme, active),
+    }
+}
+
+fn draw_narrow_zoom_button(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    theme: &Theme,
+    section: NarrowSection,
+) {
+    let Some(button_area) = zoom_button_area(area) else {
+        return;
+    };
+    let label = if app.maximized_narrow_section() == Some(section) {
+        " - "
+    } else {
+        " + "
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default()
+                .bg(theme.main_bg)
+                .fg(theme.hi_fg)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        button_area,
+    );
+}
+
+fn draw_overlays(f: &mut Frame, app: &App, theme: &Theme) {
     if app.config_open {
         config::draw_config_overlay(f, app, theme);
     }
@@ -494,6 +709,228 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.help_open {
         help::draw_help_overlay(f, theme);
     }
+}
+
+pub(crate) fn click_target(app: &App, area: Rect, column: u16, row: u16) -> Option<ClickTarget> {
+    if area.width >= DESKTOP_WIDTH {
+        let layout = desktop_layout(app, area);
+        if let Some(sessions_area) = layout.sessions {
+            if contains(sessions_area, column, row) {
+                return session_at(app, sessions_area, row).map(ClickTarget::Session);
+            }
+        }
+        for (section, section_area) in layout.mid {
+            if section == NarrowSection::Ports
+                && contains(section_area, column, row)
+                && ports_kill_at(app, section_area, row)
+            {
+                return Some(ClickTarget::KillOrphanPorts);
+            }
+        }
+        return None;
+    }
+
+    let chunks = narrow_chunks(area);
+    if contains(chunks[2], column, row) {
+        return narrow_tab_at(app, chunks[2], column).map(ClickTarget::NarrowTab);
+    }
+
+    let tab = app.active_narrow_tab()?;
+
+    if contains(chunks[1], column, row) {
+        for (section, section_area) in narrow_section_areas(app, tab, chunks[1]) {
+            if !contains(section_area, column, row) {
+                continue;
+            }
+            if zoom_button_at(section_area, column, row) {
+                return Some(ClickTarget::NarrowZoom(section));
+            }
+            if section == NarrowSection::Sessions {
+                if let Some(index) = session_at(app, section_area, row) {
+                    return Some(ClickTarget::Session(index));
+                }
+            }
+            if section == NarrowSection::Ports && ports_kill_at(app, section_area, row) {
+                return Some(ClickTarget::KillOrphanPorts);
+            }
+            return Some(ClickTarget::NarrowSection(section));
+        }
+    }
+
+    None
+}
+
+fn zoom_button_area(area: Rect) -> Option<Rect> {
+    if area.width < 5 || area.height == 0 {
+        return None;
+    }
+    Some(Rect {
+        x: area.x + area.width - 4,
+        y: area.y,
+        width: 3,
+        height: 1,
+    })
+}
+
+fn zoom_button_at(area: Rect, column: u16, row: u16) -> bool {
+    zoom_button_area(area).is_some_and(|button| contains(button, column, row))
+}
+
+fn narrow_chunks(area: Rect) -> Vec<Rect> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area)
+        .to_vec()
+}
+
+fn narrow_tab_at(app: &App, area: Rect, column: u16) -> Option<NarrowTab> {
+    for (tab, tab_area) in narrow_tab_layout(app, area) {
+        if contains(tab_area, column, area.y) {
+            return Some(tab);
+        }
+    }
+    None
+}
+
+fn narrow_tab_layout(app: &App, area: Rect) -> Vec<(NarrowTab, Rect)> {
+    let tabs = app.visible_narrow_tabs();
+    if tabs.is_empty() {
+        return Vec::new();
+    }
+    let labels_width = tabs.iter().map(|&tab| narrow_tab_width(tab)).sum::<u16>();
+    let gaps = tabs.len().saturating_sub(1) as u16;
+    let total = labels_width.saturating_add(gaps).min(area.width);
+    let mut x = area.x + area.width.saturating_sub(total);
+    let mut out = Vec::with_capacity(tabs.len());
+    for (i, tab) in tabs.into_iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(1);
+        }
+        let width = narrow_tab_width(tab).min(area.x + area.width - x);
+        if width == 0 {
+            break;
+        }
+        out.push((
+            tab,
+            Rect {
+                x,
+                y: area.y,
+                width,
+                height: 1,
+            },
+        ));
+        x = x.saturating_add(width);
+        if x >= area.x + area.width {
+            break;
+        }
+    }
+    out
+}
+
+fn session_at(app: &App, area: Rect, row: u16) -> Option<usize> {
+    if area.height < 4 || row <= area.y + 1 {
+        return None;
+    }
+
+    let inner_h = area.height.saturating_sub(2);
+    let visible = app.visible_indices();
+    let session_rows: u16 = visible
+        .iter()
+        .map(|&i| {
+            let base = 2u16;
+            if app.tree_view {
+                base + app.sessions[i].subagents.len() as u16
+            } else {
+                base
+            }
+        })
+        .sum();
+    let detail_reserve: u16 = if app.show_timeline {
+        (inner_h * 2 / 3).min(inner_h.saturating_sub(5))
+    } else if inner_h <= 12 {
+        6.min(inner_h.saturating_sub(3))
+    } else {
+        10.min(inner_h / 2)
+    };
+    let max_table = inner_h.saturating_sub(detail_reserve);
+    let table_h = (1 + session_rows).min(max_table);
+    let table_y = area.y + 1;
+    if row >= table_y.saturating_add(table_h) {
+        return None;
+    }
+
+    let visible_rows = table_h.saturating_sub(1) as usize;
+    let selected_pos = visible.iter().position(|&i| i == app.selected).unwrap_or(0);
+    let selected_row_start: usize = visible
+        .iter()
+        .take(selected_pos)
+        .map(|&i| {
+            let base = 2;
+            if app.tree_view {
+                base + app.sessions[i].subagents.len()
+            } else {
+                base
+            }
+        })
+        .sum();
+    let selected_session_rows = if app.tree_view {
+        2 + app
+            .sessions
+            .get(app.selected)
+            .map_or(0, |s| s.subagents.len())
+    } else {
+        2
+    };
+    let scroll_offset = (selected_row_start + selected_session_rows).saturating_sub(visible_rows);
+    let target_row = scroll_offset + row.saturating_sub(table_y + 1) as usize;
+    let mut offset = 0usize;
+    for &idx in &visible {
+        let rows = if app.tree_view {
+            2 + app.sessions[idx].subagents.len()
+        } else {
+            2
+        };
+        if target_row >= offset && target_row < offset + rows {
+            return Some(idx);
+        }
+        offset += rows;
+    }
+
+    None
+}
+
+fn ports_kill_at(app: &App, area: Rect, row: u16) -> bool {
+    if app.orphan_ports.is_empty() || area.height < 3 {
+        return false;
+    }
+
+    let live_ports = app
+        .sessions
+        .iter()
+        .map(|session| {
+            session
+                .children
+                .iter()
+                .filter(|child| child.port.is_some())
+                .count()
+        })
+        .sum::<usize>() as u16;
+    let kill_line = 1 + live_ports + app.orphan_ports.len() as u16;
+    let kill_row = area.y + 1 + kill_line;
+    row == kill_row && kill_row < area.y + area.height.saturating_sub(1)
+}
+
+fn contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
 }
 
 // ── utility functions ────────────────────────────────────────────────────────
@@ -546,6 +983,9 @@ pub(crate) fn truncate_str(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PanelVisibility;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
     fn fmt_age_buckets() {
@@ -559,5 +999,341 @@ mod tests {
         // Regression: the quota panel used to render this raw as "341493ago"
         // because it formatted seconds without unit conversion.
         assert_eq!(fmt_age(341_493), "3d ago");
+    }
+
+    #[test]
+    fn compact_sizes_render_sessions_instead_of_too_small() {
+        for (w, h) in [(69, 27), (80, 24)] {
+            let text = render_demo(w, h);
+            assert!(text.contains("Work"), "{w}x{h} should render tabs\n{text}");
+            assert!(
+                text.contains("Usage"),
+                "{w}x{h} should expose grouped panels as tabs\n{text}"
+            );
+            assert!(
+                text.contains("System(s)"),
+                "{w}x{h} should render system tab shortcut\n{text}"
+            );
+            assert!(
+                text.contains("sessions"),
+                "{w}x{h} should render sessions panel\n{text}"
+            );
+            assert!(
+                text.contains("sessions(*)"),
+                "{w}x{h} should mark the active section in the title\n{text}"
+            );
+            assert!(
+                text.contains("projects"),
+                "{w}x{h} should pair sessions with projects\n{text}"
+            );
+            assert!(
+                text.contains("SESSION"),
+                "{w}x{h} should render selected-session detail\n{text}"
+            );
+            assert!(
+                !text.contains("Terminal size too small"),
+                "{w}x{h} should be supported\n{text}"
+            );
+            assert!(
+                !text.contains("quota"),
+                "{w}x{h} should not spend first screen on mid panels\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_tab_switch_renders_selected_panel() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.set_narrow_tab(NarrowTab::Usage);
+
+        let backend = TestBackend::new(69, 27);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("quota"),
+            "usage tab should render quota panel\n{text}"
+        );
+        assert!(
+            text.contains("tokens"),
+            "usage tab should render tokens panel\n{text}"
+        );
+        assert!(
+            !text.contains("SESSION"),
+            "usage tab should not keep sessions detail in body\n{text}"
+        );
+    }
+
+    #[test]
+    fn compact_click_targets_tabs_and_sessions() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 69,
+            height: 27,
+        };
+        let chunks = narrow_chunks(area);
+        let tab_area = chunks[2];
+        let tab_areas = narrow_tab_layout(&app, tab_area);
+        let usage_area = tab_areas
+            .iter()
+            .find(|(tab, _)| *tab == NarrowTab::Usage)
+            .map(|(_, area)| *area)
+            .unwrap();
+        let separator_x = usage_area.x - 1;
+
+        assert_eq!(
+            click_target(&app, area, usage_area.x, tab_area.y),
+            Some(ClickTarget::NarrowTab(NarrowTab::Usage))
+        );
+        assert_eq!(click_target(&app, area, separator_x, tab_area.y), None);
+        assert_eq!(click_target(&app, area, 3, tab_area.y), None);
+        assert_eq!(
+            click_target(&app, area, 3, 4),
+            Some(ClickTarget::Session(0))
+        );
+
+        assert_eq!(
+            click_target(&app, area, 3, 16),
+            Some(ClickTarget::NarrowSection(NarrowSection::Projects))
+        );
+
+        let sessions_area = narrow_section_areas(&app, NarrowTab::Work, chunks[1])
+            .into_iter()
+            .find(|(section, _)| *section == NarrowSection::Sessions)
+            .map(|(_, area)| area)
+            .unwrap();
+        assert_eq!(
+            click_target(
+                &app,
+                area,
+                sessions_area.x + sessions_area.width - 3,
+                sessions_area.y
+            ),
+            Some(ClickTarget::NarrowZoom(NarrowSection::Sessions))
+        );
+    }
+
+    #[test]
+    fn compact_tabs_highlight_only_active_tab() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 69,
+            height: 27,
+        };
+        let tab_area = narrow_chunks(area)[2];
+        let tab_areas = narrow_tab_layout(&app, tab_area);
+
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let work = tab_areas
+            .iter()
+            .find(|(tab, _)| *tab == NarrowTab::Work)
+            .map(|(_, area)| *area)
+            .unwrap();
+        let usage = tab_areas
+            .iter()
+            .find(|(tab, _)| *tab == NarrowTab::Usage)
+            .map(|(_, area)| *area)
+            .unwrap();
+        let system = tab_areas
+            .iter()
+            .find(|(tab, _)| *tab == NarrowTab::System)
+            .map(|(_, area)| *area)
+            .unwrap();
+
+        assert_eq!(
+            buffer.cell((work.x, work.y)).unwrap().bg,
+            app.theme.selected_bg
+        );
+        assert_eq!(
+            buffer.cell((usage.x, usage.y)).unwrap().bg,
+            app.theme.main_bg
+        );
+        assert_eq!(
+            buffer.cell((system.x, system.y)).unwrap().bg,
+            app.theme.main_bg
+        );
+        assert_eq!(
+            buffer.cell((work.x, work.y)).unwrap().fg,
+            app.theme.selected_fg
+        );
+        assert_eq!(
+            buffer.cell((usage.x, usage.y)).unwrap().fg,
+            app.theme.inactive_fg
+        );
+        assert_eq!(
+            buffer.cell((usage.x - 1, usage.y)).unwrap().bg,
+            app.theme.main_bg
+        );
+        assert_eq!(
+            buffer.cell((system.x - 1, system.y)).unwrap().bg,
+            app.theme.main_bg
+        );
+    }
+
+    #[test]
+    fn compact_sections_split_evenly_and_ports_kill_is_clickable() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 69,
+            height: 27,
+        };
+        let body = narrow_chunks(area)[1];
+
+        let usage_sections = narrow_section_areas(&app, NarrowTab::Usage, body);
+        assert_eq!(usage_sections.len(), 3);
+        let min_h = usage_sections
+            .iter()
+            .map(|(_, area)| area.height)
+            .min()
+            .unwrap();
+        let max_h = usage_sections
+            .iter()
+            .map(|(_, area)| area.height)
+            .max()
+            .unwrap();
+        assert!(max_h - min_h <= 1, "usage sections should be even");
+
+        app.set_narrow_tab(NarrowTab::System);
+        let ports_area = narrow_section_areas(&app, NarrowTab::System, body)
+            .into_iter()
+            .find(|(section, _)| *section == NarrowSection::Ports)
+            .map(|(_, area)| area)
+            .unwrap();
+        let live_ports = app
+            .sessions
+            .iter()
+            .map(|session| {
+                session
+                    .children
+                    .iter()
+                    .filter(|child| child.port.is_some())
+                    .count()
+            })
+            .sum::<usize>() as u16;
+        let kill_row = ports_area.y + 1 + 1 + live_ports + app.orphan_ports.len() as u16;
+        assert_eq!(
+            click_target(&app, area, ports_area.x + 2, kill_row),
+            Some(ClickTarget::KillOrphanPorts)
+        );
+    }
+
+    #[test]
+    fn compact_zoom_renders_only_selected_section() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 69,
+            height: 27,
+        };
+        let body = narrow_chunks(area)[1];
+
+        app.toggle_narrow_section_zoom(NarrowSection::Quota);
+        let sections = narrow_section_areas(&app, NarrowTab::Usage, body);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0], (NarrowSection::Quota, body));
+
+        let backend = TestBackend::new(69, 27);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(
+            text.contains("quota(*)"),
+            "zoomed section should stay active\n{text}"
+        );
+        assert!(
+            !text.contains("tokens"),
+            "zoomed tab should hide peer sections\n{text}"
+        );
+    }
+
+    #[test]
+    fn desktop_click_targets_sessions_and_ports() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        for session in &mut app.sessions {
+            session.children.clear();
+        }
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let layout = desktop_layout(&app, area);
+        let sessions_area = layout.sessions.unwrap();
+        assert_eq!(
+            click_target(&app, area, sessions_area.x + 2, sessions_area.y + 2),
+            Some(ClickTarget::Session(0))
+        );
+
+        let ports_area = layout
+            .mid
+            .iter()
+            .find(|(section, _)| *section == NarrowSection::Ports)
+            .map(|(_, area)| *area)
+            .unwrap();
+        let kill_row = ports_area.y + 1 + 1 + app.orphan_ports.len() as u16;
+        assert_eq!(
+            click_target(&app, area, ports_area.x + 2, kill_row),
+            Some(ClickTarget::KillOrphanPorts)
+        );
+    }
+
+    #[test]
+    fn desktop_timeline_uses_full_width_when_left_detail_is_empty() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.sessions[app.selected].children.clear();
+        app.sessions[app.selected].subagents.clear();
+
+        let backend = TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        let timeline_col = text
+            .lines()
+            .find_map(|line| line.find("TIMELINE"))
+            .expect("timeline should render");
+        assert!(
+            timeline_col < 20,
+            "timeline should use the empty left detail area\n{text}"
+        );
+    }
+
+    #[test]
+    fn desktop_size_keeps_mid_panels() {
+        let text = render_demo(120, 40);
+        for label in ["quota", "tokens", "projects", "ports", "sessions"] {
+            assert!(
+                text.contains(label),
+                "desktop should render {label}\n{text}"
+            );
+        }
+    }
+
+    fn render_demo(width: u16, height: u16) -> String {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        format!("{}", terminal.backend())
     }
 }

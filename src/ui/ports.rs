@@ -7,9 +7,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::{btop_block, grad_at, make_gradient};
+use super::{btop_block_active, grad_at, make_gradient};
 
 pub(crate) fn draw_ports_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    draw_ports_panel_active(f, app, area, theme, false);
+}
+
+pub(crate) fn draw_ports_panel_active(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    theme: &Theme,
+    active: bool,
+) {
     // Collect (port, project_name, session_id_short)
     let mut all_ports: Vec<(u16, String, String)> = Vec::new();
     for session in &app.sessions {
@@ -93,6 +103,6 @@ pub(crate) fn draw_ports_panel(f: &mut Frame, app: &App, area: Rect, theme: &The
         )));
     }
 
-    let block = btop_block("ports", "⁵", theme.net_box, theme);
+    let block = btop_block_active("ports", "⁵", theme.net_box, theme, active);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }

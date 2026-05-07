@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::{btop_block, fmt_tokens, grad_at, make_gradient, remaining_bar, styled_label};
+use super::{btop_block_active, fmt_tokens, grad_at, make_gradient, remaining_bar, styled_label};
 
 /// Data considered "stale" when its updated_at is older than this many seconds.
 const STALE_SECS: u64 = 600;
@@ -17,9 +17,19 @@ const STALE_SECS: u64 = 600;
 const SOURCES: &[&str] = &["claude", "codex"];
 
 pub(crate) fn draw_quota_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    draw_quota_panel_active(f, app, area, theme, false);
+}
+
+pub(crate) fn draw_quota_panel_active(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    theme: &Theme,
+    active: bool,
+) {
     let cpu_grad = make_gradient(theme.cpu_grad.start, theme.cpu_grad.mid, theme.cpu_grad.end);
 
-    let block = btop_block("quota", "²", theme.cpu_box, theme);
+    let block = btop_block_active("quota", "²", theme.cpu_box, theme, active);
     f.render_widget(block, area);
 
     let inner = Rect {

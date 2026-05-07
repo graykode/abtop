@@ -23,7 +23,11 @@ pub(crate) fn draw_header(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     // Width budget: prefer host + agents; fall back to agents-only; then to nothing.
     let width = area.width as usize;
     let base = title.len() + right.len() + 4; // 4 = separators / padding
-    let (host_render, agent_render) = pick_metrics(host_str.as_deref(), &agent_str, width, base);
+    let (host_render, agent_render) = if width <= 80 {
+        (None, None)
+    } else {
+        pick_metrics(host_str.as_deref(), &agent_str, width, base)
+    };
 
     let mut spans: Vec<Span> = Vec::with_capacity(8);
     spans.push(Span::styled(

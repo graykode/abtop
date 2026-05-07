@@ -10,7 +10,10 @@ mod theme;
 mod ui;
 
 use app::{App, JumpOutcome};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -102,6 +105,7 @@ fn main() -> io::Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
+    stdout().execute(EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let app_result = run_app(
@@ -114,11 +118,12 @@ fn main() -> io::Result<()> {
     );
 
     // Always attempt both cleanup steps regardless of app result
-    let r1 = disable_raw_mode();
-    let r2 = stdout().execute(LeaveAlternateScreen).map(|_| ());
+    let r1 = stdout().execute(DisableMouseCapture).map(|_| ());
+    let r2 = disable_raw_mode();
+    let r3 = stdout().execute(LeaveAlternateScreen).map(|_| ());
 
     // Return app error first, then cleanup errors
-    app_result.and(r1).and(r2)
+    app_result.and(r1).and(r2).and(r3)
 }
 
 fn run_app(
@@ -145,8 +150,8 @@ fn run_app(
 
         // Poll at 500ms for smooth animations; data tick every 2s
         let had_input = if event::poll(render_interval)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if app.help_open {
                         // Any key dismisses help.
                         app.help_open = false;
@@ -187,6 +192,15 @@ fn run_app(
                             KeyCode::Char('r') if !demo_mode => app.tick(),
                             KeyCode::Down | KeyCode::Char('j') => app.select_next(),
                             KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
+                            KeyCode::Right | KeyCode::Tab => app.select_next_narrow_tab(),
+                            KeyCode::Left | KeyCode::BackTab => app.select_prev_narrow_tab(),
+                            KeyCode::Char('w') => app.set_narrow_tab(app::NarrowTab::Work),
+                            KeyCode::Char('u') => app.set_narrow_tab(app::NarrowTab::Usage),
+                            KeyCode::Char('s') => app.set_narrow_tab(app::NarrowTab::System),
+                            KeyCode::Char('+') | KeyCode::Char('=') => {
+                                app.maximize_active_narrow_section()
+                            }
+                            KeyCode::Char('-') => app.restore_narrow_sections(),
                             KeyCode::Char('x') if !demo_mode => app.kill_selected(),
                             KeyCode::Char('X') if !demo_mode => app.kill_orphan_ports(),
                             KeyCode::Char('t') => app.cycle_theme(),
@@ -209,6 +223,12 @@ fn run_app(
                         }
                     }
                 }
+                Event::Mouse(mouse) => {
+                    let size = terminal.size()?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    handle_mouse_event(&mut app, mouse, area);
+                }
+                _ => {}
             }
             true
         } else {
@@ -232,6 +252,41 @@ fn run_app(
     }
 
     Ok(())
+}
+
+fn handle_mouse_event(app: &mut App, mouse: MouseEvent, area: Rect) {
+    if app.help_open || app.view_open || app.config_open || app.filter_active {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::Down(_) => {
+            if let Some(target) = ui::click_target(app, area, mouse.column, mouse.row) {
+                match target {
+                    ui::ClickTarget::NarrowTab(tab) => app.set_narrow_tab(tab),
+                    ui::ClickTarget::NarrowSection(section) => {
+                        app.set_active_narrow_section(section);
+                    }
+                    ui::ClickTarget::NarrowZoom(section) => {
+                        app.toggle_narrow_section_zoom(section);
+                    }
+                    ui::ClickTarget::Session(index) => {
+                        app.select_session(index);
+                        app.set_active_narrow_section(app::NarrowSection::Sessions);
+                    }
+                    ui::ClickTarget::KillOrphanPorts => {
+                        app.set_active_narrow_section(app::NarrowSection::Ports);
+                        app.kill_orphan_ports();
+                    }
+                }
+            }
+        }
+        MouseEventKind::ScrollDown => app.select_next(),
+        MouseEventKind::ScrollUp => app.select_prev(),
+        MouseEventKind::ScrollRight => app.select_next_narrow_tab(),
+        MouseEventKind::ScrollLeft => app.select_prev_narrow_tab(),
+        _ => {}
+    }
 }
 
 /// Strip control characters (including ANSI escapes) and Unicode bidi

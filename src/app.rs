@@ -34,6 +34,54 @@ pub enum JumpOutcome {
     NoOp,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NarrowTab {
+    Work,
+    Usage,
+    System,
+}
+
+impl NarrowTab {
+    pub const ALL: [Self; 3] = [Self::Work, Self::Usage, Self::System];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Work => "Work",
+            Self::Usage => "Usage",
+            Self::System => "System",
+        }
+    }
+
+    pub fn shortcut(self) -> char {
+        match self {
+            Self::Work => 'w',
+            Self::Usage => 'u',
+            Self::System => 's',
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NarrowSection {
+    Sessions,
+    Projects,
+    Context,
+    Quota,
+    Tokens,
+    Ports,
+    Mcp,
+}
+
+impl NarrowSection {
+    pub fn tab(self) -> NarrowTab {
+        match self {
+            Self::Sessions | Self::Projects => NarrowTab::Work,
+            Self::Context | Self::Quota | Self::Tokens => NarrowTab::Usage,
+            Self::Ports | Self::Mcp => NarrowTab::System,
+        }
+    }
+}
+
 pub struct App {
     pub sessions: Vec<AgentSession>,
     pub selected: usize,
@@ -71,6 +119,9 @@ pub struct App {
     pub show_ports: bool,
     pub show_sessions: bool,
     pub show_mcp: bool,
+    pub narrow_tab: NarrowTab,
+    pub active_narrow_section: Option<NarrowSection>,
+    pub maximized_narrow_section: Option<NarrowSection>,
     /// MCP servers detected on the most recent tick (sourced from
     /// MultiCollector). Populated regardless of `show_mcp` so panel
     /// toggling doesn't cost a discovery roundtrip.
@@ -133,6 +184,9 @@ impl App {
             show_ports: panels.ports,
             show_sessions: panels.sessions,
             show_mcp: panels.mcp,
+            narrow_tab: NarrowTab::Work,
+            active_narrow_section: Some(NarrowSection::Sessions),
+            maximized_narrow_section: None,
             mcp_servers: Vec::new(),
             mcp_suppress_sessions: true,
             config_open: false,
@@ -177,6 +231,7 @@ impl App {
             _ => return,
         }
         self.persist_panel_visibility();
+        self.clamp_narrow_tab();
     }
 
     /// Toggle whether mcp-server-owned rollouts are hidden from the
@@ -249,6 +304,153 @@ impl App {
             _ => return,
         }
         self.persist_panel_visibility();
+        self.clamp_narrow_tab();
+    }
+
+    pub fn narrow_tab_visible(&self, tab: NarrowTab) -> bool {
+        match tab {
+            NarrowTab::Work => self.show_sessions || self.show_projects,
+            NarrowTab::Usage => self.show_context || self.show_quota || self.show_tokens,
+            NarrowTab::System => self.show_ports || self.show_mcp,
+        }
+    }
+
+    pub fn visible_narrow_tabs(&self) -> Vec<NarrowTab> {
+        NarrowTab::ALL
+            .into_iter()
+            .filter(|&tab| self.narrow_tab_visible(tab))
+            .collect()
+    }
+
+    pub fn active_narrow_tab(&self) -> Option<NarrowTab> {
+        if self.narrow_tab_visible(self.narrow_tab) {
+            Some(self.narrow_tab)
+        } else {
+            NarrowTab::ALL
+                .into_iter()
+                .find(|&tab| self.narrow_tab_visible(tab))
+        }
+    }
+
+    pub fn set_narrow_tab(&mut self, tab: NarrowTab) {
+        if self.narrow_tab_visible(tab) {
+            self.narrow_tab = tab;
+            self.clamp_narrow_section();
+        }
+    }
+
+    pub fn select_next_narrow_tab(&mut self) {
+        let tabs = self.visible_narrow_tabs();
+        if tabs.is_empty() {
+            return;
+        }
+        let current = self.active_narrow_tab().unwrap_or(tabs[0]);
+        let pos = tabs.iter().position(|&tab| tab == current).unwrap_or(0);
+        self.narrow_tab = tabs[(pos + 1) % tabs.len()];
+        self.clamp_narrow_section();
+    }
+
+    pub fn select_prev_narrow_tab(&mut self) {
+        let tabs = self.visible_narrow_tabs();
+        if tabs.is_empty() {
+            return;
+        }
+        let current = self.active_narrow_tab().unwrap_or(tabs[0]);
+        let pos = tabs.iter().position(|&tab| tab == current).unwrap_or(0);
+        self.narrow_tab = tabs[(pos + tabs.len() - 1) % tabs.len()];
+        self.clamp_narrow_section();
+    }
+
+    fn clamp_narrow_tab(&mut self) {
+        if let Some(tab) = self.active_narrow_tab() {
+            self.narrow_tab = tab;
+        }
+        self.clamp_narrow_section();
+    }
+
+    pub fn narrow_section_visible(&self, section: NarrowSection) -> bool {
+        match section {
+            NarrowSection::Sessions => self.show_sessions,
+            NarrowSection::Projects => self.show_projects,
+            NarrowSection::Context => self.show_context,
+            NarrowSection::Quota => self.show_quota,
+            NarrowSection::Tokens => self.show_tokens,
+            NarrowSection::Ports => self.show_ports,
+            NarrowSection::Mcp => self.show_mcp,
+        }
+    }
+
+    pub fn visible_narrow_sections(&self, tab: NarrowTab) -> Vec<NarrowSection> {
+        let sections: &[NarrowSection] = match tab {
+            NarrowTab::Work => &[NarrowSection::Sessions, NarrowSection::Projects],
+            NarrowTab::Usage => &[
+                NarrowSection::Context,
+                NarrowSection::Quota,
+                NarrowSection::Tokens,
+            ],
+            NarrowTab::System => &[NarrowSection::Ports, NarrowSection::Mcp],
+        };
+        sections
+            .iter()
+            .copied()
+            .filter(|&section| self.narrow_section_visible(section))
+            .collect()
+    }
+
+    pub fn active_narrow_section(&self) -> Option<NarrowSection> {
+        let tab = self.active_narrow_tab()?;
+        if let Some(section) = self.active_narrow_section {
+            if section.tab() == tab && self.narrow_section_visible(section) {
+                return Some(section);
+            }
+        }
+        self.visible_narrow_sections(tab).into_iter().next()
+    }
+
+    pub fn set_active_narrow_section(&mut self, section: NarrowSection) {
+        if self.narrow_section_visible(section) {
+            self.narrow_tab = section.tab();
+            self.active_narrow_section = Some(section);
+            self.clamp_narrow_section();
+        }
+    }
+
+    pub fn maximized_narrow_section(&self) -> Option<NarrowSection> {
+        let section = self.maximized_narrow_section?;
+        if self.active_narrow_tab() == Some(section.tab()) && self.narrow_section_visible(section) {
+            Some(section)
+        } else {
+            None
+        }
+    }
+
+    pub fn toggle_narrow_section_zoom(&mut self, section: NarrowSection) {
+        if !self.narrow_section_visible(section) {
+            return;
+        }
+        self.set_active_narrow_section(section);
+        self.maximized_narrow_section = if self.maximized_narrow_section() == Some(section) {
+            None
+        } else {
+            Some(section)
+        };
+    }
+
+    pub fn maximize_active_narrow_section(&mut self) {
+        if let Some(section) = self.active_narrow_section() {
+            self.maximized_narrow_section = Some(section);
+        }
+    }
+
+    pub fn restore_narrow_sections(&mut self) {
+        self.maximized_narrow_section = None;
+    }
+
+    fn clamp_narrow_section(&mut self) {
+        self.active_narrow_section = self.active_narrow_section();
+        if self.maximized_narrow_section().is_none() {
+            self.maximized_narrow_section = None;
+        }
     }
 
     pub fn toggle_timeline(&mut self) {
@@ -471,6 +673,12 @@ impl App {
             }
         } else {
             self.selected = *visible.last().unwrap();
+        }
+    }
+
+    pub fn select_session(&mut self, index: usize) {
+        if index < self.sessions.len() && self.visible_indices().contains(&index) {
+            self.selected = index;
         }
     }
 

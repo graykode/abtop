@@ -8,13 +8,24 @@ use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use super::{
-    braille_graph_multirow, btop_block, fmt_tokens, grad_at, make_gradient, meter_bar, truncate_str,
+    braille_graph_multirow, btop_block_active, fmt_tokens, grad_at, make_gradient, meter_bar,
+    truncate_str,
 };
 
 pub(crate) fn draw_context_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    draw_context_panel_active(f, app, area, theme, false);
+}
+
+pub(crate) fn draw_context_panel_active(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    theme: &Theme,
+    active: bool,
+) {
     let cpu_grad = make_gradient(theme.cpu_grad.start, theme.cpu_grad.mid, theme.cpu_grad.end);
 
-    let block = btop_block("context", "¹", theme.cpu_box, theme);
+    let block = btop_block_active("context", "¹", theme.cpu_box, theme, active);
     f.render_widget(block, area);
 
     let inner = Rect {

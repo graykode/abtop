@@ -9,9 +9,19 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use std::time::SystemTime;
 
-use super::{btop_block, fmt_age, grad_at, make_gradient};
+use super::{btop_block_active, fmt_age, grad_at, make_gradient};
 
 pub(crate) fn draw_mcp_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    draw_mcp_panel_active(f, app, area, theme, false);
+}
+
+pub(crate) fn draw_mcp_panel_active(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    theme: &Theme,
+    active: bool,
+) {
     let header_style = Style::default()
         .fg(theme.main_fg)
         .add_modifier(Modifier::BOLD);
@@ -32,7 +42,7 @@ pub(crate) fn draw_mcp_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme
             format!(" {}", no_servers),
             Style::default().fg(theme.inactive_fg),
         )));
-        let block = btop_block("mcp servers", "⁷", theme.net_box, theme);
+        let block = btop_block_active("mcp servers", "⁷", theme.net_box, theme, active);
         f.render_widget(Paragraph::new(lines).block(block), area);
         return;
     }
@@ -92,7 +102,6 @@ pub(crate) fn draw_mcp_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme
         )));
     }
 
-    let block = btop_block("mcp servers", "⁷", theme.net_box, theme);
+    let block = btop_block_active("mcp servers", "⁷", theme.net_box, theme, active);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
-

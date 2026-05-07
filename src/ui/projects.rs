@@ -7,9 +7,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::{btop_block, grad_at, make_gradient, truncate_str};
+use super::{btop_block_active, grad_at, make_gradient, truncate_str};
 
 pub(crate) fn draw_projects_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    draw_projects_panel_active(f, app, area, theme, false);
+}
+
+pub(crate) fn draw_projects_panel_active(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    theme: &Theme,
+    active: bool,
+) {
     let mut lines = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let no_git = t("projects.no_git");
@@ -77,6 +87,6 @@ pub(crate) fn draw_projects_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         )));
     }
 
-    let block = btop_block("projects", "⁴", theme.mem_box, theme);
+    let block = btop_block_active("projects", "⁴", theme.mem_box, theme, active);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }

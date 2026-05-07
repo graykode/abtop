@@ -8,11 +8,21 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use super::{
-    braille_sparkline, btop_block, fmt_tokens, grad_at, make_gradient, meter_bar, styled_label,
-    truncate_str,
+    braille_sparkline, btop_block_active, fmt_tokens, grad_at, make_gradient, meter_bar,
+    styled_label, truncate_str,
 };
 
 pub(crate) fn draw_tokens_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    draw_tokens_panel_active(f, app, area, theme, false);
+}
+
+pub(crate) fn draw_tokens_panel_active(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    theme: &Theme,
+    active: bool,
+) {
     let selected = app.sessions.get(app.selected);
     let total_in: u64 = selected.map(|s| s.total_input_tokens).unwrap_or(0);
     let total_out: u64 = selected.map(|s| s.total_output_tokens).unwrap_or(0);
@@ -162,6 +172,6 @@ pub(crate) fn draw_tokens_panel(f: &mut Frame, app: &App, area: Rect, theme: &Th
     } else {
         "tokens".to_string()
     };
-    let block = btop_block(&panel_title, "³", theme.mem_box, theme);
+    let block = btop_block_active(&panel_title, "³", theme.mem_box, theme, active);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
