@@ -1301,6 +1301,7 @@ mod tests {
         crate::demo::populate_demo(&mut app);
         app.sessions[app.selected].children.clear();
         app.sessions[app.selected].subagents.clear();
+        app.toggle_timeline();
 
         let backend = TestBackend::new(160, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1313,6 +1314,32 @@ mod tests {
         assert!(
             timeline_col < 20,
             "timeline should use the empty left detail area\n{text}"
+        );
+    }
+
+    #[test]
+    fn desktop_default_detail_shows_chat_instead_of_timeline() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.sessions[app.selected].children.clear();
+        app.sessions[app.selected].subagents.clear();
+
+        let backend = TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("CHAT"),
+            "chat should render by default\n{text}"
+        );
+        assert!(
+            text.contains("webhook signatures"),
+            "recent chat tail should render selected session messages\n{text}"
+        );
+        assert!(
+            !text.contains("TIMELINE"),
+            "timeline should be opt-in via l toggle\n{text}"
         );
     }
 

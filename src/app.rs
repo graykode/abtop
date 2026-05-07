@@ -1101,6 +1101,7 @@ mod tests {
             children: vec![],
             initial_prompt: String::new(),
             first_assistant_text: String::new(),
+            chat_messages: vec![],
             tool_calls: vec![],
             pending_since_ms: 0,
             thinking_since_ms: 0,

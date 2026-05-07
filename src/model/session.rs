@@ -105,6 +105,22 @@ pub struct ToolCall {
     pub duration_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChatRole {
+    User,
+    Assistant,
+}
+
+/// A compact, redacted chat line from the session transcript.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub text: String,
+}
+
+/// Maximum chat messages kept per session to bound memory and UI noise.
+pub const MAX_CHAT_MESSAGES: usize = 12;
+
 #[derive(Debug, Clone)]
 pub struct AgentSession {
     /// Which CLI tool this session belongs to: "claude", "codex", etc.
@@ -148,6 +164,8 @@ pub struct AgentSession {
     pub initial_prompt: String,
     /// First assistant response text (text blocks only) — used as summary fallback
     pub first_assistant_text: String,
+    /// Recent user/assistant chat tail, excluding tool results and tool inputs.
+    pub chat_messages: Vec<ChatMessage>,
     /// Timeline of tool calls extracted from transcript.
     pub tool_calls: Vec<ToolCall>,
     /// Unix-epoch ms of the assistant turn whose `tool_use` blocks are still
@@ -265,6 +283,7 @@ mod tests {
             children: Vec::new(),
             initial_prompt: String::new(),
             first_assistant_text: String::new(),
+            chat_messages: Vec::new(),
             tool_calls: Vec::new(),
             pending_since_ms: 0,
             thinking_since_ms: 0,

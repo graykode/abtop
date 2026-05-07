@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::model::{
-    AgentSession, ChildProcess, FileAccess, FileOp, OrphanPort, RateLimitInfo, SessionStatus,
-    SubAgent, ToolCall,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, OrphanPort,
+    RateLimitInfo, SessionStatus, SubAgent, ToolCall,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -89,6 +89,24 @@ pub fn populate_demo(app: &mut App) {
             ],
 
             first_assistant_text: String::new(),
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Implement Stripe payment integration for checkout flow".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "I'll inspect checkout and config paths first, then wire the smallest payment boundary.".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Keep webhook handling minimal and make tests cover declined cards.".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "Payment code is in place; current pass is tightening test failures around webhook signatures.".into(),
+                },
+            ],
             initial_prompt: "Implement Stripe payment integration for checkout flow".into(),
             tool_calls: vec![
                 ToolCall {
@@ -273,6 +291,16 @@ pub fn populate_demo(app: &mut App) {
             children: vec![],
 
             first_assistant_text: String::new(),
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Add batch inference endpoint with GPU scheduling".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "Endpoint is implemented; waiting on your choice for queue priority behavior.".into(),
+                },
+            ],
             initial_prompt: "Add batch inference endpoint with GPU scheduling".into(),
             tool_calls: vec![],
             pending_since_ms: 0,
@@ -332,6 +360,16 @@ pub fn populate_demo(app: &mut App) {
             ],
 
             first_assistant_text: String::new(),
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Fix CORS headers and add rate limiting middleware".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "I'll patch middleware order, then run the API smoke tests.".into(),
+                },
+            ],
             initial_prompt: "Fix CORS headers and add rate limiting middleware".into(),
             tool_calls: vec![
                 ToolCall {
@@ -409,6 +447,16 @@ pub fn populate_demo(app: &mut App) {
             }],
 
             first_assistant_text: String::new(),
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Create interactive heatmap component with D3.js".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "Building the component now; next check is responsive canvas sizing.".into(),
+                },
+            ],
             initial_prompt: "Create interactive heatmap component with D3.js".into(),
             tool_calls: vec![],
             pending_since_ms: 0,

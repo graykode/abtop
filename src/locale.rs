@@ -92,6 +92,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("detail.turns", "turns");
     m.insert("detail.effort", "effort");
     m.insert("detail.timeline", "TIMELINE");
+    m.insert("detail.chat", "CHAT");
     m.insert("detail.calls", "calls");
     m.insert("detail.running", "running");
     m.insert("detail.thinking", "thinking");
@@ -336,6 +337,7 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("detail.turns", "轮");
     m.insert("detail.effort", "投入");
     m.insert("detail.timeline", "时间线");
+    m.insert("detail.chat", "聊天");
     m.insert("detail.calls", "调用");
     m.insert("detail.running", "运行中");
     m.insert("detail.thinking", "思考中");
