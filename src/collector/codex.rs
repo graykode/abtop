@@ -457,6 +457,8 @@ struct CodexJSONLResult {
     last_activity: std::time::SystemTime,
     initial_prompt: String,
     chat_messages: Vec<ChatMessage>,
+    /// Input tokens excluding cached input, matching AgentSession's additive
+    /// token accounting where cache reads are stored separately.
     total_input: u64,
     total_output: u64,
     total_cache_read: u64,
@@ -741,7 +743,9 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                     }
                     Some("token_count") => {
                         let info = &payload["info"];
-                        // Use total_token_usage as cumulative snapshot for totals
+                        // Codex input_tokens already includes cached_input_tokens.
+                        // Store only the non-cached input portion so
+                        // AgentSession::total_tokens() does not double-count cache.
                         let total = &info["total_token_usage"];
                         if total.is_object() {
                             let inp = total["input_tokens"].as_u64().unwrap_or(0);
@@ -750,22 +754,20 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                                 .as_u64()
                                 .or_else(|| total["cache_read_input_tokens"].as_u64())
                                 .unwrap_or(0);
-                            result.total_input = inp;
+                            result.total_input = inp.saturating_sub(cache);
                             result.total_output = out;
                             result.total_cache_read = cache;
                         }
-                        // Use last_token_usage for context % and sparkline
+                        // Use last_token_usage input as the current context window.
+                        // cached_input_tokens is a subset of input_tokens, not extra
+                        // context after compaction.
                         let last = &info["last_token_usage"];
                         if last.is_object() {
                             let inp = last["input_tokens"].as_u64().unwrap_or(0);
                             let out = last["output_tokens"].as_u64().unwrap_or(0);
-                            let cache = last["cached_input_tokens"]
-                                .as_u64()
-                                .or_else(|| last["cache_read_input_tokens"].as_u64())
-                                .unwrap_or(0);
-                            result.last_context_tokens = inp + cache;
+                            result.last_context_tokens = inp;
                             if result.token_history.len() < 10_000 {
-                                result.token_history.push(inp + out + cache);
+                                result.token_history.push(inp + out);
                             }
                         }
                         // Context window may also appear inside info
@@ -1010,17 +1012,33 @@ mod tests {
             &mut file,
             &[
                 SESSION_META,
-                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"output_tokens":200,"cached_input_tokens":100},"last_token_usage":{"input_tokens":50,"output_tokens":20,"cached_input_tokens":10},"model_context_window":128000}}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"output_tokens":200,"cached_input_tokens":100,"total_tokens":700},"last_token_usage":{"input_tokens":50,"output_tokens":20,"cached_input_tokens":10,"total_tokens":70},"model_context_window":128000}}}"#,
             ],
         );
         let result = parse_codex_jsonl(file.path()).unwrap();
-        assert_eq!(result.total_input, 500);
+        assert_eq!(result.total_input, 400);
         assert_eq!(result.total_output, 200);
         assert_eq!(result.total_cache_read, 100);
-        assert_eq!(result.last_context_tokens, 60); // 50 + 10
+        assert_eq!(result.last_context_tokens, 50);
         assert_eq!(result.context_window, 128000);
         assert_eq!(result.token_history.len(), 1);
-        assert_eq!(result.token_history[0], 80); // 50 + 20 + 10
+        assert_eq!(result.token_history[0], 70);
+    }
+
+    #[test]
+    fn test_parse_codex_context_does_not_double_count_cached_input() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":58140501,"cached_input_tokens":55267712,"output_tokens":114278,"total_tokens":58254779},"last_token_usage":{"input_tokens":151839,"cached_input_tokens":146816,"output_tokens":621,"total_tokens":152460},"model_context_window":258400}}}"#,
+            ],
+        );
+        let result = parse_codex_jsonl(file.path()).unwrap();
+        assert_eq!(result.last_context_tokens, 151_839);
+        assert_eq!(result.context_window, 258_400);
+        assert!(result.last_context_tokens < result.context_window);
     }
 
     #[test]
@@ -1052,7 +1070,7 @@ mod tests {
         );
         let result = parse_codex_jsonl(file.path()).unwrap();
         assert_eq!(result.total_cache_read, 30);
-        assert_eq!(result.last_context_tokens, 25); // 20 + 5
+        assert_eq!(result.last_context_tokens, 20);
     }
 
     #[test]
