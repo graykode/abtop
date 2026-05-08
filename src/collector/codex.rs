@@ -312,6 +312,25 @@ impl CodexCollector {
                 pids.push((*pid, is_exec));
             }
         }
+
+        // Windows npm/Git shims can create a chain like:
+        // sh.exe -> node.exe ...\codex.js -> codex.exe.
+        // Once the real codex child exists, keep that child and drop wrapper
+        // ancestors; otherwise Windows rollout fallback maps each candidate PID
+        // to a different recent JSONL file and historical sessions look live.
+        let candidates = pids.clone();
+        pids.retain(|(pid, _)| {
+            process::cmd_first_token_has_binary(
+                process_info
+                    .get(pid)
+                    .map(|info| info.command.as_str())
+                    .unwrap_or_default(),
+                "codex",
+            ) || !candidates.iter().any(|(other_pid, _)| {
+                *other_pid != *pid && process::is_descendant_of(*other_pid, *pid, process_info)
+            })
+        });
+
         pids
     }
 
@@ -950,6 +969,54 @@ mod tests {
             writeln!(file, "{}", line).unwrap();
         }
         file.flush().unwrap();
+    }
+
+    #[cfg(windows)]
+    fn proc_info(pid: u32, ppid: u32, command: &str) -> ProcInfo {
+        ProcInfo {
+            pid,
+            ppid,
+            rss_kb: 0,
+            cpu_pct: 0.0,
+            command: command.to_string(),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn find_codex_pids_windows_keeps_real_child_over_wrappers() {
+        let mut process_info = HashMap::new();
+        process_info.insert(
+            10,
+            proc_info(
+                10,
+                1,
+                r#""C:\Program Files\Git\usr\bin\sh.exe" /c/Users/GK/AppData/Roaming/npm/codex -m gpt-5.5"#,
+            ),
+        );
+        process_info.insert(
+            20,
+            proc_info(
+                20,
+                10,
+                r#""C:\Program Files\nodejs\node.exe" C:\Users\GK\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js -m gpt-5.5"#,
+            ),
+        );
+        process_info.insert(
+            30,
+            proc_info(
+                30,
+                20,
+                r#"C:\Users\GK\AppData\Roaming\npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex\codex.exe -m gpt-5.5"#,
+            ),
+        );
+
+        let pids = CodexCollector::find_codex_pids_from_shared(
+            &process_info,
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(pids, vec![(30, false)]);
     }
 
     #[test]

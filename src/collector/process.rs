@@ -132,7 +132,7 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
         sysinfo::ProcessRefreshKind::new()
             .with_cpu()
             .with_memory()
-            .with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
+            .with_cmd(sysinfo::UpdateKind::Always),
     );
 
     let mut map = HashMap::new();
@@ -406,41 +406,89 @@ pub fn last_path_segment(s: &str) -> Option<&str> {
 #[cfg(not(windows))]
 pub fn cmd_has_binary(cmd: &str, name: &str) -> bool {
     let mut tokens = cmd.split_whitespace().take(2);
-    tokens.any(|tok| {
-        let mut iter = tok.rsplit('/');
-        let base = iter.next().unwrap_or(tok);
-        if base == name {
-            return true;
-        }
-        matches!((iter.next(), iter.next()), (Some("versions"), Some(parent)) if parent == name)
-    })
+    tokens.any(|tok| unix_token_has_binary(tok, name))
 }
 
-/// Windows variant: also splits on `\`, strips a trailing `.exe` and common
-/// script extensions (`.js`, `.sh`, `.py`), and matches case-insensitively.
+#[cfg(not(windows))]
+pub fn cmd_first_token_has_binary(cmd: &str, name: &str) -> bool {
+    cmd.split_whitespace()
+        .next()
+        .is_some_and(|tok| unix_token_has_binary(tok, name))
+}
+
+#[cfg(not(windows))]
+fn unix_token_has_binary(tok: &str, name: &str) -> bool {
+    let mut iter = tok.rsplit('/');
+    let base = iter.next().unwrap_or(tok);
+    if base == name {
+        return true;
+    }
+    matches!((iter.next(), iter.next()), (Some("versions"), Some(parent)) if parent == name)
+}
+
+/// Windows variant: checks executable-position tokens, splits on `\`, strips a
+/// trailing `.exe` and common script extensions (`.js`, `.sh`, `.py`), and
+/// matches case-insensitively.
 /// Kept separate from the unix impl so non-Windows matching stays exact
 /// (`Claude` must not match `claude` on linux/macOS).
 #[cfg(windows)]
 pub fn cmd_has_binary(cmd: &str, name: &str) -> bool {
-    let mut tokens = cmd.split_whitespace().take(2);
-    tokens.any(|tok| {
-        let mut iter = tok.rsplit(['/', '\\']);
-        let base = iter.next().unwrap_or(tok);
-        let base = base
-            .strip_suffix(".exe")
-            .or_else(|| base.strip_suffix(".js"))
-            .or_else(|| base.strip_suffix(".sh"))
-            .or_else(|| base.strip_suffix(".py"))
-            .unwrap_or(base);
-        if base.eq_ignore_ascii_case(name) {
-            return true;
+    windows_command_tokens(cmd)
+        .into_iter()
+        .take(2)
+        .any(|tok| windows_token_has_binary(&tok, name))
+}
+
+#[cfg(windows)]
+pub fn cmd_first_token_has_binary(cmd: &str, name: &str) -> bool {
+    windows_command_tokens(cmd)
+        .first()
+        .is_some_and(|tok| windows_token_has_binary(tok, name))
+}
+
+#[cfg(windows)]
+fn windows_token_has_binary(tok: &str, name: &str) -> bool {
+    let mut iter = tok.rsplit(['/', '\\']);
+    let base = iter.next().unwrap_or(tok);
+    let base = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".js"))
+        .or_else(|| base.strip_suffix(".sh"))
+        .or_else(|| base.strip_suffix(".py"))
+        .unwrap_or(base);
+    if base.eq_ignore_ascii_case(name) {
+        return true;
+    }
+    matches!(
+        (iter.next(), iter.next()),
+        (Some(versions), Some(parent))
+            if versions.eq_ignore_ascii_case("versions") && parent.eq_ignore_ascii_case(name)
+    )
+}
+
+#[cfg(windows)]
+fn windows_command_tokens(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in cmd.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
         }
-        matches!(
-            (iter.next(), iter.next()),
-            (Some(versions), Some(parent))
-                if versions.eq_ignore_ascii_case("versions") && parent.eq_ignore_ascii_case(name)
-        )
-    })
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
 }
 
 pub fn collect_git_stats(cwd: &str) -> (u32, u32) {
@@ -507,6 +555,24 @@ mod tests {
         ));
         // A `versions/` dir not under `<name>/` shouldn't match either.
         assert!(!cmd_has_binary("/some/versions/2.1.121", "claude"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_has_binary_windows_detects_node_wrapped_codex() {
+        assert!(cmd_has_binary(
+            r#""C:\Program Files\nodejs\node.exe" C:\Users\GK\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js -m gpt-5.5"#,
+            "codex",
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_has_binary_windows_ignores_codex_in_later_args() {
+        assert!(!cmd_has_binary(
+            r#""C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile "C:\Users\GK\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js""#,
+            "codex",
+        ));
     }
 
     fn proc(pid: u32, ppid: u32) -> ProcInfo {
