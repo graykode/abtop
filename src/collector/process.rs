@@ -132,7 +132,7 @@ pub fn get_process_info() -> HashMap<u32, ProcInfo> {
         sysinfo::ProcessRefreshKind::new()
             .with_cpu()
             .with_memory()
-            .with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
+            .with_cmd(sysinfo::UpdateKind::Always),
     );
 
     let mut map = HashMap::new();
@@ -211,6 +211,31 @@ pub fn get_children_map(procs: &HashMap<u32, ProcInfo>) -> HashMap<u32, Vec<u32>
         children.entry(proc.ppid).or_default().push(proc.pid);
     }
     children
+}
+
+/// Walk the ppid chain from `pid` and return true if `ancestor` is reached.
+/// Used to identify processes spawned by abtop itself (e.g. `claude --print`
+/// summary children) so they can be filtered without dropping unrelated
+/// non-interactive sessions started by the user.
+pub fn is_descendant_of(pid: u32, ancestor: u32, process_info: &HashMap<u32, ProcInfo>) -> bool {
+    if pid == 0 || ancestor == 0 || pid == ancestor {
+        return false;
+    }
+    let mut current = pid;
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(current) {
+        let Some(info) = process_info.get(&current) else {
+            return false;
+        };
+        if info.ppid == ancestor {
+            return true;
+        }
+        if info.ppid == 0 || info.ppid == 1 {
+            return false;
+        }
+        current = info.ppid;
+    }
+    false
 }
 
 pub fn has_active_descendant(
@@ -381,41 +406,89 @@ pub fn last_path_segment(s: &str) -> Option<&str> {
 #[cfg(not(windows))]
 pub fn cmd_has_binary(cmd: &str, name: &str) -> bool {
     let mut tokens = cmd.split_whitespace().take(2);
-    tokens.any(|tok| {
-        let mut iter = tok.rsplit('/');
-        let base = iter.next().unwrap_or(tok);
-        if base == name {
-            return true;
-        }
-        matches!((iter.next(), iter.next()), (Some("versions"), Some(parent)) if parent == name)
-    })
+    tokens.any(|tok| unix_token_has_binary(tok, name))
 }
 
-/// Windows variant: also splits on `\`, strips a trailing `.exe` and common
-/// script extensions (`.js`, `.sh`, `.py`), and matches case-insensitively.
+#[cfg(not(windows))]
+pub fn cmd_first_token_has_binary(cmd: &str, name: &str) -> bool {
+    cmd.split_whitespace()
+        .next()
+        .is_some_and(|tok| unix_token_has_binary(tok, name))
+}
+
+#[cfg(not(windows))]
+fn unix_token_has_binary(tok: &str, name: &str) -> bool {
+    let mut iter = tok.rsplit('/');
+    let base = iter.next().unwrap_or(tok);
+    if base == name {
+        return true;
+    }
+    matches!((iter.next(), iter.next()), (Some("versions"), Some(parent)) if parent == name)
+}
+
+/// Windows variant: checks executable-position tokens, splits on `\`, strips a
+/// trailing `.exe` and common script extensions (`.js`, `.sh`, `.py`), and
+/// matches case-insensitively.
 /// Kept separate from the unix impl so non-Windows matching stays exact
 /// (`Claude` must not match `claude` on linux/macOS).
 #[cfg(windows)]
 pub fn cmd_has_binary(cmd: &str, name: &str) -> bool {
-    let mut tokens = cmd.split_whitespace().take(2);
-    tokens.any(|tok| {
-        let mut iter = tok.rsplit(['/', '\\']);
-        let base = iter.next().unwrap_or(tok);
-        let base = base
-            .strip_suffix(".exe")
-            .or_else(|| base.strip_suffix(".js"))
-            .or_else(|| base.strip_suffix(".sh"))
-            .or_else(|| base.strip_suffix(".py"))
-            .unwrap_or(base);
-        if base.eq_ignore_ascii_case(name) {
-            return true;
+    windows_command_tokens(cmd)
+        .into_iter()
+        .take(2)
+        .any(|tok| windows_token_has_binary(&tok, name))
+}
+
+#[cfg(windows)]
+pub fn cmd_first_token_has_binary(cmd: &str, name: &str) -> bool {
+    windows_command_tokens(cmd)
+        .first()
+        .is_some_and(|tok| windows_token_has_binary(tok, name))
+}
+
+#[cfg(windows)]
+fn windows_token_has_binary(tok: &str, name: &str) -> bool {
+    let mut iter = tok.rsplit(['/', '\\']);
+    let base = iter.next().unwrap_or(tok);
+    let base = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".js"))
+        .or_else(|| base.strip_suffix(".sh"))
+        .or_else(|| base.strip_suffix(".py"))
+        .unwrap_or(base);
+    if base.eq_ignore_ascii_case(name) {
+        return true;
+    }
+    matches!(
+        (iter.next(), iter.next()),
+        (Some(versions), Some(parent))
+            if versions.eq_ignore_ascii_case("versions") && parent.eq_ignore_ascii_case(name)
+    )
+}
+
+#[cfg(windows)]
+fn windows_command_tokens(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in cmd.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
         }
-        matches!(
-            (iter.next(), iter.next()),
-            (Some(versions), Some(parent))
-                if versions.eq_ignore_ascii_case("versions") && parent.eq_ignore_ascii_case(name)
-        )
-    })
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
 }
 
 pub fn collect_git_stats(cwd: &str) -> (u32, u32) {
@@ -482,5 +555,89 @@ mod tests {
         ));
         // A `versions/` dir not under `<name>/` shouldn't match either.
         assert!(!cmd_has_binary("/some/versions/2.1.121", "claude"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_has_binary_windows_detects_node_wrapped_codex() {
+        assert!(cmd_has_binary(
+            r#""C:\Program Files\nodejs\node.exe" C:\Users\GK\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js -m gpt-5.5"#,
+            "codex",
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_has_binary_windows_ignores_codex_in_later_args() {
+        assert!(!cmd_has_binary(
+            r#""C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile "C:\Users\GK\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js""#,
+            "codex",
+        ));
+    }
+
+    fn proc(pid: u32, ppid: u32) -> ProcInfo {
+        ProcInfo {
+            pid,
+            ppid,
+            rss_kb: 0,
+            cpu_pct: 0.0,
+            command: "x".to_string(),
+        }
+    }
+
+    #[test]
+    fn is_descendant_of_direct_child() {
+        let mut m = HashMap::new();
+        m.insert(10, proc(10, 1));
+        m.insert(20, proc(20, 10));
+        assert!(is_descendant_of(20, 10, &m));
+    }
+
+    #[test]
+    fn is_descendant_of_walks_chain() {
+        let mut m = HashMap::new();
+        m.insert(10, proc(10, 1));
+        m.insert(20, proc(20, 10));
+        m.insert(30, proc(30, 20));
+        assert!(is_descendant_of(30, 10, &m));
+    }
+
+    #[test]
+    fn is_descendant_of_unrelated_returns_false() {
+        let mut m = HashMap::new();
+        m.insert(10, proc(10, 1));
+        m.insert(20, proc(20, 1));
+        assert!(!is_descendant_of(20, 10, &m));
+    }
+
+    #[test]
+    fn is_descendant_of_self_returns_false() {
+        let mut m = HashMap::new();
+        m.insert(10, proc(10, 1));
+        assert!(!is_descendant_of(10, 10, &m));
+    }
+
+    #[test]
+    fn is_descendant_of_zero_ancestor_or_pid_returns_false() {
+        let m: HashMap<u32, ProcInfo> = HashMap::new();
+        assert!(!is_descendant_of(0, 10, &m));
+        assert!(!is_descendant_of(10, 0, &m));
+    }
+
+    #[test]
+    fn is_descendant_of_handles_cycle() {
+        // Synthetic cycle (real /proc shouldn't produce one, but be safe).
+        let mut m = HashMap::new();
+        m.insert(10, proc(10, 20));
+        m.insert(20, proc(20, 10));
+        assert!(!is_descendant_of(10, 99, &m));
+    }
+
+    #[test]
+    fn is_descendant_of_missing_ancestor_in_chain() {
+        // ppid points at a PID that no longer exists (parent already exited).
+        let mut m = HashMap::new();
+        m.insert(20, proc(20, 99));
+        assert!(!is_descendant_of(20, 7, &m));
     }
 }

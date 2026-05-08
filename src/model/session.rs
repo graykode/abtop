@@ -51,11 +51,11 @@ pub struct RateLimitInfo {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
-    /// Agent is generating (no active tool, CPU active)
+    /// Model is generating a response (last_user_ts_ms > 0)
     Thinking,
-    /// Running a tool (current_task is non-empty)
+    /// Running a tool (descendant CPU active OR current_task non-empty)
     Executing,
-    /// Idle, waiting for user input
+    /// Idle, waiting for user input or permission prompt
     Waiting,
     /// Waiting due to rate limit
     RateLimited,

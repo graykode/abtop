@@ -9,7 +9,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use std::time::SystemTime;
 
-use super::{btop_block, grad_at, make_gradient};
+use super::{btop_block, fmt_age, grad_at, make_gradient};
 
 pub(crate) fn draw_mcp_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let header_style = Style::default()
@@ -96,30 +96,3 @@ pub(crate) fn draw_mcp_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// Format a duration into a compact "Xs / Xm / Xh" label.
-fn fmt_age(secs: u64) -> String {
-    if secs < 60 {
-        format!("{}{}", secs, t("time.s_ago"))
-    } else if secs < 3600 {
-        format!("{}{}", secs / 60, t("time.m_ago"))
-    } else if secs < 86400 {
-        format!("{}{}", secs / 3600, t("time.h_ago"))
-    } else {
-        format!("{}{}", secs / 86400, t("time.d_ago"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fmt_age_buckets() {
-        // t() defaults to English when ABTOP_LANG is unset, so the strings
-        // here match the en-US locale values for `time.{s,m,h,d}_ago`.
-        assert_eq!(fmt_age(5), "5s ago");
-        assert_eq!(fmt_age(125), "2m ago");
-        assert_eq!(fmt_age(7_200), "2h ago");
-        assert_eq!(fmt_age(172_800), "2d ago");
-    }
-}

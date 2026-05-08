@@ -128,37 +128,42 @@ fn draw_source_column(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let ago_secs = rl.updated_at.map(|ts| now.saturating_sub(ts));
-    let is_stale = ago_secs.is_some_and(|s| s > STALE_SECS);
+    let is_stale = rl
+        .updated_at
+        .is_some_and(|ts| now.saturating_sub(ts) > STALE_SECS);
 
-    let ago_label = t("quota.ago");
-    let fresh_str = ago_secs
-        .map(|s| format!("{}{}", s, ago_label))
-        .unwrap_or_default();
-    let fresh_color = if is_stale {
+    // Stale data → dim the source name. Drops the unlabeled "Xs ago" row
+    // we used to render here; keeping a distinct freshness color but no
+    // explicit number is enough to signal "values may be out of date"
+    // without competing with the reset countdown for the user's attention.
+    let source_color = if is_stale {
         theme.inactive_fg
     } else {
-        theme.graph_text
+        theme.title
     };
 
     let mut lines: Vec<Line> = Vec::new();
-    let mut label_spans = vec![Span::styled(
+    lines.push(Line::from(Span::styled(
         format!(" {}", rl.source.to_uppercase()),
         Style::default()
-            .fg(theme.title)
+            .fg(source_color)
             .add_modifier(Modifier::BOLD),
-    )];
-    if !fresh_str.is_empty() {
-        label_spans.push(Span::styled(fresh_str, Style::default().fg(fresh_color)));
-    }
-    lines.push(Line::from(label_spans));
+    )));
+
+    // Reset countdown is only meaningful when the data is fresh enough
+    // that the reported `resets_at` is still in the future. Stale sources
+    // get the bar (the % is approximately correct) but no countdown row.
+    let show_reset = !is_stale;
 
     if let Some(used_pct) = rl.five_hour_pct {
         let remaining = (100.0 - used_pct).clamp(0.0, 100.0);
-        let reset = rl
-            .five_hour_resets_at
-            .map(format_reset_time)
-            .unwrap_or_default();
+        let reset = if show_reset {
+            rl.five_hour_resets_at
+                .map(format_reset_time)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let c = grad_at(cpu_grad, used_pct);
         let label_5h = t("quota.5h");
         let mut s = vec![styled_label(
@@ -171,19 +176,27 @@ fn draw_source_column(
             Style::default().fg(c),
         ));
         lines.push(Line::from(s));
-        if !reset.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", reset),
-                Style::default().fg(theme.graph_text),
-            )));
-        }
+        // Always reserve the row so both columns line up vertically;
+        // when there's nothing meaningful to show (stale source or the
+        // cached reset moment is past), render it blank.
+        lines.push(Line::from(Span::styled(
+            if reset.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", reset)
+            },
+            Style::default().fg(theme.graph_text),
+        )));
     }
     if let Some(used_pct) = rl.seven_day_pct {
         let remaining = (100.0 - used_pct).clamp(0.0, 100.0);
-        let reset = rl
-            .seven_day_resets_at
-            .map(format_reset_time)
-            .unwrap_or_default();
+        let reset = if show_reset {
+            rl.seven_day_resets_at
+                .map(format_reset_time)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let c = grad_at(cpu_grad, used_pct);
         let label_7d = t("quota.7d");
         let mut s = vec![styled_label(
@@ -196,42 +209,50 @@ fn draw_source_column(
             Style::default().fg(c),
         ));
         lines.push(Line::from(s));
-        if !reset.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", reset),
-                Style::default().fg(theme.graph_text),
-            )));
-        }
+        // Always reserve the row so both columns line up vertically;
+        // when there's nothing meaningful to show (stale source or the
+        // cached reset moment is past), render it blank.
+        lines.push(Line::from(Span::styled(
+            if reset.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", reset)
+            },
+            Style::default().fg(theme.graph_text),
+        )));
     }
 
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// Format a reset timestamp as relative time (e.g., "1h 23m")
+/// Format a reset timestamp as a human countdown labeled "in X" so the
+/// row reads as a time-until-reset. Returns an empty string when the
+/// reset is already in the past — the actual next reset depends on the
+/// window length which the caller doesn't track, and showing a "now"
+/// sentinel was misleading on stale sources where the window had
+/// already rolled over multiple times. Callers skip the row when this
+/// returns empty.
 pub(crate) fn format_reset_time(reset_ts: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     if reset_ts <= now {
-        return t("quota.now");
+        return String::new();
     }
     let diff = reset_ts - now;
+    let prefix = t("quota.in");
     if diff < 60 {
-        format!("{}{}", diff, t("time.s"))
+        format!("{} {}{}", prefix, diff, t("time.s"))
     } else if diff < 3600 {
-        format!("{}{}", diff / 60, t("time.m"))
+        format!("{} {}{}", prefix, diff / 60, t("time.m"))
     } else if diff < 86400 {
         let h = diff / 3600;
         let m = (diff % 3600) / 60;
-        let h_label = t("time.h");
-        let m_label = t("time.m");
-        format!("{}{} {}{}", h, h_label, m, m_label)
+        format!("{} {}{} {}{}", prefix, h, t("time.h"), m, t("time.m"))
     } else {
         let d = diff / 86400;
         let h = (diff % 86400) / 3600;
-        let d_label = t("time.d");
-        let h_label = t("time.h");
-        format!("{}{} {}{}", d, d_label, h, h_label)
+        format!("{} {}{} {}{}", prefix, d, t("time.d"), h, t("time.h"))
     }
 }

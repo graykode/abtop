@@ -518,6 +518,19 @@ pub(crate) fn fmt_tokens(n: u64) -> String {
     }
 }
 
+/// Format a duration in seconds into a compact "Ns / Nm / Nh / Nd ago" label.
+pub(crate) fn fmt_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}{}", secs, t("time.s_ago"))
+    } else if secs < 3600 {
+        format!("{}{}", secs / 60, t("time.m_ago"))
+    } else if secs < 86400 {
+        format!("{}{}", secs / 3600, t("time.h_ago"))
+    } else {
+        format!("{}{}", secs / 86400, t("time.d_ago"))
+    }
+}
+
 pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -527,5 +540,24 @@ pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max - 1).collect();
         format!("{}…", truncated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_age_buckets() {
+        // t() defaults to English when ABTOP_LANG is unset, so the strings
+        // here match the en-US locale values for `time.{s,m,h,d}_ago`.
+        assert_eq!(fmt_age(5), "5s ago");
+        assert_eq!(fmt_age(59), "59s ago");
+        assert_eq!(fmt_age(60), "1m ago");
+        assert_eq!(fmt_age(125), "2m ago");
+        assert_eq!(fmt_age(7_200), "2h ago");
+        // Regression: the quota panel used to render this raw as "341493ago"
+        // because it formatted seconds without unit conversion.
+        assert_eq!(fmt_age(341_493), "3d ago");
     }
 }

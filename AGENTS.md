@@ -92,7 +92,7 @@ Session file format:
 ```
 - ~170 bytes. Created on start, deleted on exit.
 - Verify PID alive with shared `ps` data containing a `claude` binary.
-- Skip `--print` sessions (abtop's own LLM calls for summary generation).
+- Skip sessions whose PID descends from abtop's own `claude --print` summary children without hiding user-spawned non-interactive sessions.
 
 ### 2. Claude Code transcript: `{config-root}/projects/{encoded-path}/{sessionId}.jsonl`
 Path encoding: `/Users/foo/bar` → `-Users-foo-bar`
