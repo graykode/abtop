@@ -107,8 +107,9 @@ pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &
         let marker = if selected { "►" } else { " " };
 
         let (agent_label, agent_color) = match session.agent_cli {
-            "claude" => ("*CC", Color::Rgb(217, 119, 87)), // #D97757 terracotta
-            "codex" => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
+            "claude" => ("*CC", Color::Rgb(217, 119, 87)),  // #D97757 terracotta
+            "codex" => (">CD", Color::Rgb(122, 157, 255)),  // #7A9DFF periwinkle
+            "copilot" => ("^CP", Color::Rgb(45, 212, 191)), // #2DD4BF teal
             other => {
                 let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
                 (

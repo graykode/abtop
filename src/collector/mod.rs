@@ -1,11 +1,13 @@
 pub mod claude;
 pub mod codex;
+pub mod copilot;
 pub mod mcp;
 pub mod process;
 pub mod rate_limit;
 
 pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
+pub use copilot::CopilotCollector;
 pub use mcp::McpServer;
 pub use rate_limit::read_rate_limits;
 
@@ -170,6 +172,9 @@ impl MultiCollector {
         if !is_hidden("codex") {
             collectors.push(Box::new(CodexCollector::new()));
         }
+        if !is_hidden("copilot") {
+            collectors.push(Box::new(CopilotCollector::new()));
+        }
         Self {
             collectors,
             tick_count: SLOW_POLL_INTERVAL, // trigger on first tick
@@ -331,32 +336,36 @@ mod tests {
     #[test]
     fn with_hidden_empty_keeps_all_collectors() {
         let mc = MultiCollector::with_hidden(&[]);
-        assert_eq!(mc.collectors.len(), 2);
+        assert_eq!(mc.collectors.len(), 3);
     }
 
     #[test]
     fn with_hidden_codex_drops_codex_only() {
         let mc = MultiCollector::with_hidden(&["codex".to_string()]);
-        assert_eq!(mc.collectors.len(), 1);
+        assert_eq!(mc.collectors.len(), 2);
     }
 
     #[test]
     fn with_hidden_is_case_insensitive() {
         let mc = MultiCollector::with_hidden(&["CODEX".to_string()]);
-        assert_eq!(mc.collectors.len(), 1);
+        assert_eq!(mc.collectors.len(), 2);
         let mc = MultiCollector::with_hidden(&["Claude".to_string()]);
-        assert_eq!(mc.collectors.len(), 1);
+        assert_eq!(mc.collectors.len(), 2);
     }
 
     #[test]
     fn with_hidden_unknown_names_are_ignored() {
         let mc = MultiCollector::with_hidden(&["kiro".to_string(), "gemini".to_string()]);
-        assert_eq!(mc.collectors.len(), 2);
+        assert_eq!(mc.collectors.len(), 3);
     }
 
     #[test]
     fn with_hidden_all_agents_yields_empty() {
-        let mc = MultiCollector::with_hidden(&["claude".to_string(), "codex".to_string()]);
+        let mc = MultiCollector::with_hidden(&[
+            "claude".to_string(),
+            "codex".to_string(),
+            "copilot".to_string(),
+        ]);
         assert!(mc.collectors.is_empty());
     }
 }
