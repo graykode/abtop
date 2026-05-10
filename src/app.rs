@@ -494,12 +494,11 @@ impl App {
                     .ok()
                     .map(|output| {
                         let cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        crate::collector::process::cmd_has_binary(&cmd, "claude")
-                            || crate::collector::process::cmd_has_binary(&cmd, "codex")
+                        is_supported_agent_command(&cmd)
                     })
                     .unwrap_or(false);
                 if !verified {
-                    self.set_status(format!("PID {} is no longer a claude/codex process", pid));
+                    self.set_status(format!("PID {} is no longer a known agent process", pid));
                     return;
                 }
                 let _ = std::process::Command::new("kill")
@@ -858,6 +857,12 @@ fn promote_waiting_to_rate_limited(sessions: &mut [AgentSession], rate_limits: &
     }
 }
 
+fn is_supported_agent_command(cmd: &str) -> bool {
+    crate::collector::process::cmd_has_binary(cmd, "claude")
+        || crate::collector::process::cmd_has_binary(cmd, "codex")
+        || crate::collector::process::cmd_has_binary(cmd, "opencode")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,5 +944,13 @@ mod tests {
         let limits = vec![rate_limit("claude", 99.0)];
         promote_waiting_to_rate_limited(&mut sessions, &limits);
         assert_eq!(sessions[0].status, SessionStatus::Thinking);
+    }
+
+    #[test]
+    fn supported_agent_command_accepts_opencode() {
+        assert!(is_supported_agent_command("/usr/local/bin/claude"));
+        assert!(is_supported_agent_command("codex --resume abc"));
+        assert!(is_supported_agent_command("/opt/homebrew/bin/opencode"));
+        assert!(!is_supported_agent_command("node server.js"));
     }
 }

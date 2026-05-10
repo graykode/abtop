@@ -2,8 +2,8 @@
 
 **Like [btop](https://github.com/aristocratos/btop), but for your AI coding agents.**
 
-See every Claude Code and Codex CLI session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
-Claude Code and Codex CLI sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
+See every Claude Code, Codex CLI, and OpenCode session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
+Claude Code, Codex CLI, and OpenCode sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
 
 ![demo](https://raw.githubusercontent.com/graykode/abtop/main/assets/demo.gif)
 
@@ -69,18 +69,20 @@ tmux new -s work
 
 ## Supported Agents
 
-| Feature           | Claude Code | Codex CLI |
-| ----------------- | :---------: | :-------: |
-| Session Discovery |     ✅      |    ✅     |
-| Token Tracking    |     ✅      |    ✅     |
-| Context Window %  |     ✅      |    ✅     |
-| Status Detection  |     ✅      |    ✅     |
-| Current Task      |     ✅      |    ✅     |
-| Rate Limit        |     ✅      |    ✅     |
-| Git Status        |     ✅      |    ✅     |
-| Children / Ports  |     ✅      |    ✅     |
-| Subagents         |     ✅      |    ❌     |
-| Memory Status     |     ✅      |    ❌     |
+| Feature           | Claude Code | Codex CLI | OpenCode |
+| ----------------- | :---------: | :-------: | :------: |
+| Session Discovery |     ✅      |    ✅     |    ✅    |
+| Token Tracking    |     ✅      |    ✅     |    ✅    |
+| Context Window %  |     ✅      |    ✅     |    ❌    |
+| Status Detection  |     ✅      |    ✅     |    ✅    |
+| Current Task      |     ✅      |    ✅     |    ❌    |
+| Rate Limit        |     ✅      |    ✅     |    ❌    |
+| Git Status        |     ✅      |    ✅     |    ✅    |
+| Children / Ports  |     ✅      |    ✅     |    ✅    |
+| Subagents         |     ✅      |    ❌     |    ❌    |
+| Memory Status     |     ✅      |    ❌     |    ❌    |
+
+OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` and requires `sqlite3` in `PATH`.
 
 ## Themes
 
