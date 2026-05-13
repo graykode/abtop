@@ -947,9 +947,19 @@ pub(crate) fn fmt_mem_kb(kb: u64) -> String {
 
 pub(crate) fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
+        let v = n as f64 / 1_000_000.0;
+        if v == v.floor() {
+            format!("{}M", v as u64)
+        } else {
+            format!("{:.1}M", v)
+        }
     } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
+        let v = n as f64 / 1_000.0;
+        if v == v.floor() {
+            format!("{}k", v as u64)
+        } else {
+            format!("{:.1}k", v)
+        }
     } else {
         format!("{}", n)
     }
