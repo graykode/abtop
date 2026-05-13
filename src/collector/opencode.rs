@@ -426,8 +426,10 @@ fn get_process_cwd(pid: u32) -> Option<String> {
 
 #[cfg(not(target_os = "linux"))]
 fn get_process_cwd(pid: u32) -> Option<String> {
+    // -a ANDs the selection terms; without it, lsof ORs `-p <pid>` with
+    // `-d cwd` and returns cwd entries for unrelated processes too.
     let output = Command::new("lsof")
-        .args(["-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
         .output()
         .ok()?;
     if !output.status.success() {
