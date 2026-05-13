@@ -147,7 +147,7 @@ pub(crate) fn draw_sessions_panel_active(
             crate::model::SessionStatus::Done => (t("sess.done"), theme.inactive_fg),
         };
 
-        let is_1m = session.total_tokens() > 200_000 || session.model.contains("[1m]");
+        let is_1m = session.context_window >= 1_000_000 || session.model.contains("[1m]");
         let model_short = shorten_model(&session.model, is_1m);
         let ctx_color = grad_at(&proc_grad, session.context_percent);
 
@@ -1220,6 +1220,10 @@ fn draw_timeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PanelVisibility;
+    use crate::model::SessionStatus;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
     fn codex_exec_command_uses_bash_color() {
@@ -1235,5 +1239,76 @@ mod tests {
         assert_eq!(tool_label("exec_command"), "Exec");
         assert_eq!(tool_label("update_plan"), "Plan");
         assert!(tool_label("exec_command").len() <= 6);
+    }
+
+    #[test]
+    fn codex_non_1m_context_window_does_not_show_1m_suffix() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        app.sessions.push(AgentSession {
+            agent_cli: "codex",
+            pid: 42,
+            session_id: "codex-session".into(),
+            cwd: "/tmp/project".into(),
+            project_name: "project".into(),
+            started_at: 0,
+            status: SessionStatus::Waiting,
+            model: "gpt-5".into(),
+            effort: String::new(),
+            context_percent: 58.7,
+            total_input_tokens: 1_000,
+            total_output_tokens: 500,
+            total_cache_read: 0,
+            total_cache_create: 0,
+            turn_count: 1,
+            current_tasks: vec!["waiting for input".into()],
+            mem_mb: 0,
+            version: String::new(),
+            git_branch: String::new(),
+            git_added: 0,
+            git_modified: 0,
+            token_history: Vec::new(),
+            context_history: Vec::new(),
+            compaction_count: 0,
+            context_window: 258_400,
+            subagents: Vec::new(),
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: Vec::new(),
+            initial_prompt: "prompt".into(),
+            first_assistant_text: String::new(),
+            chat_messages: Vec::new(),
+            tool_calls: Vec::new(),
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            file_accesses: Vec::new(),
+        });
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_sessions_panel(
+                    f,
+                    &app,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 120,
+                        height: 20,
+                    },
+                    &app.theme,
+                )
+            })
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("gpt5"),
+            "model should render in session row\n{text}"
+        );
+        assert!(
+            !text.contains("[1m]"),
+            "non-1M Codex context windows must not be labeled as 1M\n{text}"
+        );
     }
 }
