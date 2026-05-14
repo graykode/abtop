@@ -90,6 +90,30 @@ In compact/narrow layouts, press `a` to open the Agentic Workspace tab. It
 shows a read-only project rollup with live agent counts, context pressure,
 tokens, git changes, ports, and `.dw` workflow hints.
 
+In desktop layouts, the same `a` shortcut opens the Agentic Workspace focus
+view. This is covered by the `desktop_workspace_focus_renders_workspace_panel`
+test.
+
+Workspace verification:
+
+```powershell
+cargo test workspace
+cargo run -- --demo
+```
+
+After the demo TUI opens, press `a`. The view should switch to the Workspace
+project rollup.
+
+Workspace GIF evidence can be regenerated with Charm VHS:
+
+```powershell
+cargo build
+cd assets
+vhs workspace-demo.tape
+```
+
+This writes `assets/workspace-demo.gif`.
+
 ## Diagnostics Logging
 
 Runtime logging is file-based so it does not corrupt the TUI screen. Logging is
