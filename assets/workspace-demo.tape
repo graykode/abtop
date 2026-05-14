@@ -20,7 +20,11 @@ Sleep 2s
 # Open Agentic Workspace focus. This verifies the `a` shortcut in wide
 # desktop layouts, not only in compact/narrow layouts.
 Type "a"
-Sleep 4s
+Sleep 3s
+
+# Toggle back to the regular desktop layout.
+Type "a"
+Sleep 2s
 
 Hide
 Type "q"

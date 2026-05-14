@@ -440,6 +440,22 @@ impl App {
         }
     }
 
+    pub fn toggle_workspace_focus(&mut self) {
+        if self.workspace_focus {
+            self.workspace_focus = false;
+            if self.narrow_tab == NarrowTab::Workspace {
+                self.narrow_tab = if self.narrow_tab_visible(NarrowTab::Work) {
+                    NarrowTab::Work
+                } else {
+                    self.active_narrow_tab().unwrap_or(NarrowTab::Workspace)
+                };
+            }
+            self.clamp_narrow_section();
+        } else {
+            self.set_narrow_tab(NarrowTab::Workspace);
+        }
+    }
+
     pub fn select_next_narrow_tab(&mut self) {
         let tabs = self.visible_narrow_tabs();
         if tabs.is_empty() {
@@ -1245,6 +1261,23 @@ mod tests {
             seven_day_resets_at: None,
             updated_at: None,
         }
+    }
+
+    #[test]
+    fn workspace_focus_toggle_returns_to_work_tab() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+
+        app.toggle_workspace_focus();
+        assert!(app.workspace_focus);
+        assert_eq!(app.narrow_tab, NarrowTab::Workspace);
+
+        app.toggle_workspace_focus();
+        assert!(!app.workspace_focus);
+        assert_eq!(app.narrow_tab, NarrowTab::Work);
     }
 
     #[test]

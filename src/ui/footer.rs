@@ -85,6 +85,11 @@ pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         Style::default().fg(theme.main_fg),
     ));
     if !ultra_compact {
+        spans.push(Span::styled("a", Style::default().fg(theme.hi_fg)));
+        spans.push(Span::styled(
+            format!(" {} ", t("footer.workspace")),
+            Style::default().fg(theme.main_fg),
+        ));
         spans.push(Span::styled("v", Style::default().fg(theme.hi_fg)));
         spans.push(Span::styled(
             format!(" {} ", t("footer.view")),

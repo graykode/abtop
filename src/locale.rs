@@ -136,6 +136,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("footer.select", "select");
     m.insert("footer.kill", "kill");
     m.insert("footer.filter", "filter");
+    m.insert("footer.workspace", "workspace");
     m.insert("footer.view", "view");
     m.insert("footer.config", "config");
     m.insert("footer.help", "help");

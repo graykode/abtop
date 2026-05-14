@@ -1412,6 +1412,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn desktop_footer_shows_workspace_shortcut() {
+        let text = render_demo(120, 40);
+        assert!(
+            text.contains("workspace"),
+            "desktop footer should advertise the workspace shortcut\n{text}"
+        );
+    }
+
     fn render_demo(width: u16, height: u16) -> String {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
