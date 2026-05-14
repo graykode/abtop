@@ -1,0 +1,114 @@
+# Development Guide
+
+This fork is developed primarily on native Windows while keeping upstream
+compatibility with macOS and Linux.
+
+## Repository Model
+
+- `origin`: fork owned by `huygdv`.
+- `upstream`: original `graykode/abtop` repository.
+- `upstream` push URL is intentionally disabled locally to avoid accidental
+  pushes to the original project.
+
+Use feature branches for all work:
+
+```powershell
+git checkout main
+git fetch upstream
+git merge upstream/main
+git checkout -b codex/<short-feature-name>
+```
+
+Push feature branches to the fork:
+
+```powershell
+git push -u origin codex/<short-feature-name>
+```
+
+## Local Windows Toolchain
+
+Required:
+
+- Git
+- Rustup with `stable-x86_64-pc-windows-msvc`
+- Visual Studio Build Tools 2022 with C++ build tools
+- Cargo bin in `PATH`: `%USERPROFILE%\.cargo\bin`
+
+In a fresh PowerShell session, Cargo may be available only after adding:
+
+```powershell
+$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
+```
+
+If Cargo cannot find `link.exe`, run cargo commands through the Visual Studio
+developer environment:
+
+```powershell
+cmd /c "call ""C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"" -arch=x64 -host_arch=x64 >nul && set PATH=%USERPROFILE%\.cargo\bin;%PATH% && cargo test"
+```
+
+## Quality Gates
+
+Run these before pushing behavior changes:
+
+```powershell
+cargo fmt -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo build --release
+abtop --once
+```
+
+For dependency review:
+
+```powershell
+cargo audit
+```
+
+Current known audit warnings are documented in
+`docs/WINDOWS_LOCAL_DEV_DOD.md`.
+
+## Runtime Checks
+
+Snapshot mode verifies collector output without opening the TUI:
+
+```powershell
+abtop --once
+abtop --demo --once
+```
+
+Interactive mode verifies the full realtime UI:
+
+```powershell
+abtop
+```
+
+Use Windows Terminal or another real interactive terminal. Recommended size is
+120x40 or larger.
+
+## Baseline Architecture
+
+Core loop:
+
+- TUI redraw: every 500 ms.
+- Agent data refresh: every 2 seconds.
+- Slow process, port, git, and rate-limit refresh: every 10 seconds.
+
+Main areas:
+
+- `src/main.rs`: CLI flags, terminal lifecycle, event loop.
+- `src/app.rs`: app state, tick logic, selection, summaries.
+- `src/collector/`: Claude, Codex, OpenCode, MCP, process and rate-limit data.
+- `src/ui/`: panel rendering and interaction surfaces.
+- `src/model/`: shared session and rate-limit structures.
+- `src/setup.rs`: Claude StatusLine hook installer.
+
+## Windows Notes
+
+The main monitor path works on native Windows. The `--setup` path needs special
+attention before it is considered first-class Windows UX: it currently installs
+a shell script that expects `bash` and `python3`.
+
+Until that is improved, treat `abtop --setup` as a manual opt-in and verify the
+generated Claude `settings.json` before relying on Claude rate-limit telemetry.
+
