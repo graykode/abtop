@@ -209,6 +209,8 @@ pub(crate) fn draw_workspace_panel_active(
                 project.child_count.to_string(),
                 Style::default().fg(theme.main_fg),
             ),
+            Span::styled("  enter ", Style::default().fg(theme.graph_text)),
+            Span::styled("open", Style::default().fg(theme.main_fg)),
         ]));
         lines.push(Line::from(vec![
             Span::styled(" cwd ", Style::default().fg(theme.graph_text)),

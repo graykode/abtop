@@ -24,10 +24,10 @@ Sleep 1s
 
 # Move project selection inside the Workspace focus view.
 Type "j"
-Sleep 3s
+Sleep 2s
 
-# Toggle back to the regular desktop layout.
-Type "a"
+# Open the selected project's first session in the regular sessions view.
+Enter
 Sleep 2s
 
 Hide

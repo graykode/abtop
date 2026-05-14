@@ -103,7 +103,8 @@ cargo run -- --demo
 
 After the demo TUI opens, press `a`. The view should switch to the Workspace
 project rollup. In Workspace focus, use `j/k` or arrow keys to move between
-projects. Press `a` again to return to the regular desktop view.
+projects, then press `Enter` to select that project's first session in the
+sessions panel. Press `a` again to return to the regular desktop view.
 
 Workspace GIF evidence can be regenerated with Charm VHS:
 

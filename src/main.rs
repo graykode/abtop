@@ -237,6 +237,12 @@ fn run_app(
                             KeyCode::Char('/') => app.filter_active = true,
                             KeyCode::Esc if !app.filter_text.is_empty() => app.clear_filter(),
                             KeyCode::Char('f') | KeyCode::Char('F') => app.toggle_file_audit(),
+                            KeyCode::Enter
+                                if app.workspace_focus
+                                    && !app.activate_selected_workspace_project() =>
+                            {
+                                app.set_status("workspace project has no sessions".into());
+                            }
                             KeyCode::Enter if !demo_mode => match app.jump_to_session() {
                                 JumpOutcome::Jumped if exit_on_jump => app.quit(),
                                 JumpOutcome::Failed(msg) => app.set_status(msg),

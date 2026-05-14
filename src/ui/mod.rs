@@ -1462,6 +1462,10 @@ mod tests {
             text.contains("Bash npm run dev"),
             "workspace detail should include redacted current task text\n{text}"
         );
+        assert!(
+            text.contains("enter"),
+            "workspace detail should advertise project activation\n{text}"
+        );
     }
 
     #[test]

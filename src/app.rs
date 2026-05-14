@@ -478,6 +478,25 @@ impl App {
         };
     }
 
+    pub fn activate_selected_workspace_project(&mut self) -> bool {
+        let Some(project) = self.workspace_projects.get(self.workspace_selected) else {
+            return false;
+        };
+        let Some((index, _)) = self
+            .sessions
+            .iter()
+            .enumerate()
+            .find(|(_, session)| session.cwd == project.cwd)
+        else {
+            return false;
+        };
+
+        self.selected = index;
+        self.workspace_focus = false;
+        self.set_active_narrow_section(NarrowSection::Sessions);
+        true
+    }
+
     fn clamp_workspace_selection(&mut self) {
         if self.workspace_projects.is_empty() {
             self.workspace_selected = 0;
@@ -1339,6 +1358,28 @@ mod tests {
         app.workspace_projects.pop();
         app.clamp_workspace_selection();
         assert_eq!(app.workspace_selected, 0);
+    }
+
+    #[test]
+    fn activating_workspace_project_selects_its_first_session() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        crate::demo::populate_demo(&mut app);
+        app.set_narrow_tab(NarrowTab::Workspace);
+        app.workspace_selected = app
+            .workspace_projects
+            .iter()
+            .position(|project| project.name == "api-server")
+            .expect("demo project should exist");
+
+        assert!(app.activate_selected_workspace_project());
+        assert!(!app.workspace_focus);
+        assert_eq!(app.narrow_tab, NarrowTab::Work);
+        assert_eq!(app.active_narrow_section, Some(NarrowSection::Sessions));
+        assert_eq!(app.sessions[app.selected].project_name, "api-server");
     }
 
     #[test]
