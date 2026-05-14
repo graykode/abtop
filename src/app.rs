@@ -215,6 +215,7 @@ pub struct App {
     pub show_mcp: bool,
     pub narrow_tab: NarrowTab,
     pub workspace_focus: bool,
+    pub workspace_selected: usize,
     pub active_narrow_section: Option<NarrowSection>,
     pub maximized_narrow_section: Option<NarrowSection>,
     /// MCP servers detected on the most recent tick (sourced from
@@ -283,6 +284,7 @@ impl App {
             show_mcp: panels.mcp,
             narrow_tab: NarrowTab::Work,
             workspace_focus: false,
+            workspace_selected: 0,
             active_narrow_section: Some(NarrowSection::Sessions),
             maximized_narrow_section: None,
             mcp_servers: Vec::new(),
@@ -456,6 +458,34 @@ impl App {
         }
     }
 
+    pub fn select_next_workspace_project(&mut self) {
+        if self.workspace_projects.is_empty() {
+            self.workspace_selected = 0;
+            return;
+        }
+        self.workspace_selected = (self.workspace_selected + 1) % self.workspace_projects.len();
+    }
+
+    pub fn select_prev_workspace_project(&mut self) {
+        if self.workspace_projects.is_empty() {
+            self.workspace_selected = 0;
+            return;
+        }
+        self.workspace_selected = if self.workspace_selected == 0 {
+            self.workspace_projects.len() - 1
+        } else {
+            self.workspace_selected - 1
+        };
+    }
+
+    fn clamp_workspace_selection(&mut self) {
+        if self.workspace_projects.is_empty() {
+            self.workspace_selected = 0;
+        } else if self.workspace_selected >= self.workspace_projects.len() {
+            self.workspace_selected = self.workspace_projects.len() - 1;
+        }
+    }
+
     pub fn select_next_narrow_tab(&mut self) {
         let tabs = self.visible_narrow_tabs();
         if tabs.is_empty() {
@@ -610,6 +640,7 @@ impl App {
         self.host_metrics = self.host_sampler.sample();
         self.agent_aggregate = AgentAggregate::from_sessions(&self.sessions);
         self.workspace_projects = WorkspaceProject::from_sessions(&self.sessions);
+        self.clamp_workspace_selection();
         if self.selected >= self.sessions.len() && !self.sessions.is_empty() {
             self.selected = self.sessions.len() - 1;
         }
@@ -1278,6 +1309,36 @@ mod tests {
         app.toggle_workspace_focus();
         assert!(!app.workspace_focus);
         assert_eq!(app.narrow_tab, NarrowTab::Work);
+    }
+
+    #[test]
+    fn workspace_project_selection_wraps_and_clamps() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        app.workspace_projects = vec![
+            WorkspaceProject {
+                name: "webshop".into(),
+                ..WorkspaceProject::default()
+            },
+            WorkspaceProject {
+                name: "api".into(),
+                ..WorkspaceProject::default()
+            },
+        ];
+
+        app.select_next_workspace_project();
+        assert_eq!(app.workspace_selected, 1);
+        app.select_next_workspace_project();
+        assert_eq!(app.workspace_selected, 0);
+        app.select_prev_workspace_project();
+        assert_eq!(app.workspace_selected, 1);
+
+        app.workspace_projects.pop();
+        app.clamp_workspace_selection();
+        assert_eq!(app.workspace_selected, 0);
     }
 
     #[test]

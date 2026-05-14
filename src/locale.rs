@@ -500,6 +500,7 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     // Misc
     m.insert("misc.dash", "—");
     m.insert("misc.active", "活跃");
+    m.insert("footer.workspace", "workspace");
 
     m
 });

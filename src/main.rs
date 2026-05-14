@@ -206,6 +206,12 @@ fn run_app(
                         match key.code {
                             KeyCode::Char('q') => app.quit(),
                             KeyCode::Char('r') if !demo_mode => app.tick(),
+                            KeyCode::Down | KeyCode::Char('j') if app.workspace_focus => {
+                                app.select_next_workspace_project()
+                            }
+                            KeyCode::Up | KeyCode::Char('k') if app.workspace_focus => {
+                                app.select_prev_workspace_project()
+                            }
                             KeyCode::Down | KeyCode::Char('j') => app.select_next(),
                             KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
                             KeyCode::Right | KeyCode::Tab => app.select_next_narrow_tab(),

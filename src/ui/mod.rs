@@ -1413,6 +1413,28 @@ mod tests {
     }
 
     #[test]
+    fn desktop_workspace_focus_renders_selected_project_detail() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.set_narrow_tab(NarrowTab::Workspace);
+        app.select_next_workspace_project();
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("selected"),
+            "workspace focus should render selected project detail\n{text}"
+        );
+        assert!(
+            text.contains("/Users/demo"),
+            "workspace detail should include the selected project cwd\n{text}"
+        );
+    }
+
+    #[test]
     fn desktop_footer_shows_workspace_shortcut() {
         let text = render_demo(120, 40);
         assert!(

@@ -71,16 +71,50 @@ pub(crate) fn draw_workspace_panel_active(
         theme.used_grad.mid,
         theme.used_grad.end,
     );
-    let max_projects = area.height.saturating_sub(5) as usize;
-    for project in app.workspace_projects.iter().take(max_projects.max(1)) {
+    let project_rows = 3usize;
+    let detail_rows = if app.workspace_projects.is_empty() {
+        0
+    } else {
+        2
+    };
+    let available_rows = area
+        .height
+        .saturating_sub(5 + detail_rows as u16)
+        .max(project_rows as u16) as usize;
+    let max_projects = (available_rows / project_rows).max(1);
+    let start = if app.workspace_selected >= max_projects {
+        app.workspace_selected + 1 - max_projects
+    } else {
+        0
+    };
+    for (idx, project) in app
+        .workspace_projects
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(max_projects)
+    {
+        let selected = idx == app.workspace_selected;
         let name_w = area.width.saturating_sub(22).clamp(8, 24) as usize;
         let dw = if project.has_dw { " dw" } else { "" };
+        let name_style = if selected {
+            Style::default()
+                .fg(theme.selected_fg)
+                .bg(theme.selected_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme.title)
+                .add_modifier(Modifier::BOLD)
+        };
         lines.push(Line::from(vec![
             Span::styled(
+                if selected { ">" } else { " " },
+                Style::default().fg(theme.hi_fg),
+            ),
+            Span::styled(
                 format!(" {}", truncate_str(&project.name, name_w)),
-                Style::default()
-                    .fg(theme.title)
-                    .add_modifier(Modifier::BOLD),
+                name_style,
             ),
             Span::styled(dw, Style::default().fg(theme.proc_misc)),
         ]));
@@ -152,6 +186,36 @@ pub(crate) fn draw_workspace_panel_active(
             ));
         }
         lines.push(Line::from(flow));
+    }
+
+    if let Some(project) = app.workspace_projects.get(app.workspace_selected) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(" selected ", Style::default().fg(theme.graph_text)),
+            Span::styled(
+                truncate_str(&project.name, 20),
+                Style::default()
+                    .fg(theme.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" sessions ", Style::default().fg(theme.graph_text)),
+            Span::styled(
+                project.session_count.to_string(),
+                Style::default().fg(theme.main_fg),
+            ),
+            Span::styled(" children ", Style::default().fg(theme.graph_text)),
+            Span::styled(
+                project.child_count.to_string(),
+                Style::default().fg(theme.main_fg),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(" cwd ", Style::default().fg(theme.graph_text)),
+            Span::styled(
+                truncate_str(&project.cwd, area.width.saturating_sub(6) as usize),
+                Style::default().fg(theme.inactive_fg),
+            ),
+        ]));
     }
 
     if app.workspace_projects.is_empty() {

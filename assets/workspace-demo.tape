@@ -20,6 +20,10 @@ Sleep 2s
 # Open Agentic Workspace focus. This verifies the `a` shortcut in wide
 # desktop layouts, not only in compact/narrow layouts.
 Type "a"
+Sleep 1s
+
+# Move project selection inside the Workspace focus view.
+Type "j"
 Sleep 3s
 
 # Toggle back to the regular desktop layout.
