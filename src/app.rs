@@ -214,6 +214,7 @@ pub struct App {
     pub show_sessions: bool,
     pub show_mcp: bool,
     pub narrow_tab: NarrowTab,
+    pub workspace_focus: bool,
     pub active_narrow_section: Option<NarrowSection>,
     pub maximized_narrow_section: Option<NarrowSection>,
     /// MCP servers detected on the most recent tick (sourced from
@@ -281,6 +282,7 @@ impl App {
             show_sessions: panels.sessions,
             show_mcp: panels.mcp,
             narrow_tab: NarrowTab::Work,
+            workspace_focus: false,
             active_narrow_section: Some(NarrowSection::Sessions),
             maximized_narrow_section: None,
             mcp_servers: Vec::new(),
@@ -433,6 +435,7 @@ impl App {
     pub fn set_narrow_tab(&mut self, tab: NarrowTab) {
         if self.narrow_tab_visible(tab) {
             self.narrow_tab = tab;
+            self.workspace_focus = tab == NarrowTab::Workspace;
             self.clamp_narrow_section();
         }
     }
@@ -445,6 +448,7 @@ impl App {
         let current = self.active_narrow_tab().unwrap_or(tabs[0]);
         let pos = tabs.iter().position(|&tab| tab == current).unwrap_or(0);
         self.narrow_tab = tabs[(pos + 1) % tabs.len()];
+        self.workspace_focus = self.narrow_tab == NarrowTab::Workspace;
         self.clamp_narrow_section();
     }
 
@@ -456,12 +460,16 @@ impl App {
         let current = self.active_narrow_tab().unwrap_or(tabs[0]);
         let pos = tabs.iter().position(|&tab| tab == current).unwrap_or(0);
         self.narrow_tab = tabs[(pos + tabs.len() - 1) % tabs.len()];
+        self.workspace_focus = self.narrow_tab == NarrowTab::Workspace;
         self.clamp_narrow_section();
     }
 
     fn clamp_narrow_tab(&mut self) {
         if let Some(tab) = self.active_narrow_tab() {
             self.narrow_tab = tab;
+        }
+        if !self.narrow_tab_visible(NarrowTab::Workspace) {
+            self.workspace_focus = false;
         }
         self.clamp_narrow_section();
     }

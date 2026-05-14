@@ -384,6 +384,22 @@ pub fn draw(f: &mut Frame, app: &App) {
         return;
     }
 
+    if app.workspace_focus {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        header::draw_header(f, app, chunks[0], theme);
+        workspace::draw_workspace_panel_active(f, app, chunks[1], theme, true);
+        footer::draw_footer(f, app, chunks[2], theme);
+        draw_overlays(f, app, theme);
+        return;
+    }
+
     let layout = desktop_layout(app, area);
     header::draw_header(f, app, layout.header, theme);
 
@@ -1373,6 +1389,27 @@ mod tests {
                 "desktop should render {label}\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn desktop_workspace_focus_renders_workspace_panel() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.set_narrow_tab(NarrowTab::Workspace);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("workspace(*)"),
+            "desktop workspace focus should render active workspace panel\n{text}"
+        );
+        assert!(
+            text.contains("webshop"),
+            "desktop workspace focus should include project rollups\n{text}"
+        );
     }
 
     fn render_demo(width: u16, height: u16) -> String {
