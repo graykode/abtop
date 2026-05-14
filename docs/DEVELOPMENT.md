@@ -114,6 +114,24 @@ vhs workspace-demo.tape
 
 This writes `assets/workspace-demo.gif`.
 
+On native Windows, install the recorder dependencies with:
+
+```powershell
+winget install --id charmbracelet.vhs --exact
+winget install --id tsl0922.ttyd --exact
+```
+
+If the local VHS/ttyd path hangs in a Windows terminal, use the Docker path that
+matches the repository tape:
+
+```powershell
+docker run --rm -v "${PWD}:/work" -w /work rust:1-bookworm cargo build
+docker run --rm -v "${PWD}:/vhs" -w /vhs/assets ghcr.io/charmbracelet/vhs workspace-demo.tape
+```
+
+The Docker path builds the Linux demo binary used by the tape and then renders
+`assets/workspace-demo.gif`.
+
 ## Diagnostics Logging
 
 Runtime logging is file-based so it does not corrupt the TUI screen. Logging is
