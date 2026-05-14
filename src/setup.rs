@@ -49,11 +49,17 @@ fn settings_path() -> PathBuf {
 }
 
 pub fn run_setup() {
+    crate::log_info!("setup start");
     println!("abtop --setup: configuring Claude Code StatusLine hook\n");
 
     // Ensure ~/.claude directory exists
     let dir = claude_dir();
     if let Err(e) = fs::create_dir_all(&dir) {
+        crate::log_error!(
+            "setup failed to create claude dir path={} error={}",
+            dir.display(),
+            e
+        );
         eprintln!("  ✗ failed to create {}: {}", dir.display(), e);
         std::process::exit(1);
     }
@@ -69,8 +75,14 @@ pub fn run_setup() {
                 let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o700));
             }
             println!("  ✓ wrote {}", script.display());
+            crate::log_info!("setup wrote statusline script path={}", script.display());
         }
         Err(e) => {
+            crate::log_error!(
+                "setup failed to write statusline script path={} error={}",
+                script.display(),
+                e
+            );
             eprintln!("  ✗ failed to write {}: {}", script.display(), e);
             std::process::exit(1);
         }
@@ -82,6 +94,11 @@ pub fn run_setup() {
         let content = match fs::read_to_string(&settings_file) {
             Ok(c) => c,
             Err(e) => {
+                crate::log_error!(
+                    "setup failed to read settings path={} error={}",
+                    settings_file.display(),
+                    e
+                );
                 eprintln!("  ✗ cannot read {}: {}", settings_file.display(), e);
                 std::process::exit(1);
             }
@@ -89,6 +106,11 @@ pub fn run_setup() {
         match serde_json::from_str(&content) {
             Ok(v) => v,
             Err(e) => {
+                crate::log_error!(
+                    "setup invalid settings json path={} error={}",
+                    settings_file.display(),
+                    e
+                );
                 eprintln!(
                     "  ✗ {} contains invalid JSON: {}",
                     settings_file.display(),
@@ -111,6 +133,10 @@ pub fn run_setup() {
             if let Some(cmd) = existing_obj.get("command") {
                 let cmd_str = cmd.as_str().unwrap_or("");
                 if cmd_str != expected_cmd && !cmd_str.is_empty() {
+                    crate::log_warn!(
+                        "setup refused to overwrite statusLine existing_command={}",
+                        cmd_str
+                    );
                     eprintln!("  ⚠ statusLine already configured: {}", cmd_str);
                     eprintln!("    to override, remove the existing statusLine key from:");
                     eprintln!("    {}", settings_file.display());
@@ -133,13 +159,22 @@ pub fn run_setup() {
         &settings_file,
         serde_json::to_string_pretty(&settings).unwrap_or_default(),
     ) {
-        Ok(_) => println!("  ✓ updated {}", settings_file.display()),
+        Ok(_) => {
+            println!("  ✓ updated {}", settings_file.display());
+            crate::log_info!("setup updated settings path={}", settings_file.display());
+        }
         Err(e) => {
+            crate::log_error!(
+                "setup failed to update settings path={} error={}",
+                settings_file.display(),
+                e
+            );
             eprintln!("  ✗ failed to update {}: {}", settings_file.display(), e);
             std::process::exit(1);
         }
     }
 
+    crate::log_info!("setup complete");
     println!("\n  done! rate limit data will appear in abtop after the next Claude response.");
     println!("  restart any running Claude Code sessions to activate.");
 }

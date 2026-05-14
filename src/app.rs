@@ -521,6 +521,15 @@ impl App {
 
         promote_waiting_to_rate_limited(&mut self.sessions, &self.rate_limits);
 
+        crate::log_debug!(
+            "tick sessions={} orphan_ports={} mcp_servers={} token_delta={} rate_limits={}",
+            self.sessions.len(),
+            self.orphan_ports.len(),
+            self.mcp_servers.len(),
+            rate,
+            self.rate_limits.len()
+        );
+
         self.drain_and_retry_summaries();
     }
 
@@ -532,12 +541,14 @@ impl App {
             match maybe_summary {
                 Some(summary) => {
                     self.summary_retries.remove(&sid);
+                    crate::log_debug!("summary generated sid={}", sid);
                     self.summaries.insert(sid, summary);
                     save_summary_cache(&self.summaries);
                 }
                 None => {
                     let count = self.summary_retries.entry(sid.clone()).or_insert(0);
                     *count += 1;
+                    crate::log_warn!("summary generation failed sid={} attempt={}", sid, *count);
                     if *count >= MAX_SUMMARY_RETRIES {
                         // Exhausted — store sanitized fallback using prompt from worker
                         self.summaries.insert(sid, sanitize_fallback(&prompt, 80));

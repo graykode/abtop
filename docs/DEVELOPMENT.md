@@ -86,6 +86,43 @@ abtop
 Use Windows Terminal or another real interactive terminal. Recommended size is
 120x40 or larger.
 
+## Diagnostics Logging
+
+Runtime logging is file-based so it does not corrupt the TUI screen. Logging is
+disabled by default.
+
+Enable default log file:
+
+```powershell
+$env:ABTOP_LOG = "1"
+$env:ABTOP_LOG_LEVEL = "debug"
+abtop --once
+```
+
+Default log location:
+
+```text
+%LOCALAPPDATA%\abtop\abtop.log
+```
+
+Use a specific log file:
+
+```powershell
+$env:ABTOP_LOG_FILE = "$PWD\abtop-debug.log"
+$env:ABTOP_LOG_LEVEL = "trace"
+abtop --once
+```
+
+Levels: `error`, `warn`, `info`, `debug`, `trace`.
+
+Guidelines:
+
+- Keep logs operational: counts, modes, errors, timings, and state transitions.
+- Do not log prompt text, file contents, transcript lines, auth tokens, or full
+  tool inputs.
+- Prefer session IDs and aggregate counts over raw user content.
+- In TUI mode, never write diagnostic output to stdout or stderr.
+
 ## Baseline Architecture
 
 Core loop:
@@ -99,6 +136,7 @@ Main areas:
 - `src/main.rs`: CLI flags, terminal lifecycle, event loop.
 - `src/app.rs`: app state, tick logic, selection, summaries.
 - `src/collector/`: Claude, Codex, OpenCode, MCP, process and rate-limit data.
+- `src/diagnostics.rs`: optional file-based logging for development/debugging.
 - `src/ui/`: panel rendering and interaction surfaces.
 - `src/model/`: shared session and rate-limit structures.
 - `src/setup.rs`: Claude StatusLine hook installer.
@@ -111,4 +149,3 @@ a shell script that expects `bash` and `python3`.
 
 Until that is improved, treat `abtop --setup` as a manual opt-in and verify the
 generated Claude `settings.json` before relying on Claude rate-limit telemetry.
-

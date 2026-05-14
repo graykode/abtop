@@ -27,6 +27,7 @@ Verified:
   the existing product surface already does so intentionally.
 - Keep realtime work cheap: fast UI redraw, bounded collector work, defensive
   parsing, and cached expensive operations.
+- Keep diagnostics opt-in, file-based, and privacy-aware.
 
 ## Phase 0: Fork Hygiene
 
@@ -37,8 +38,10 @@ Goal: make the fork easy to maintain.
 - Keep `upstream` push URL disabled locally.
 - Add and maintain Windows development documentation.
 - Keep baseline DoD current when toolchain or behavior changes.
+- Maintain a lightweight logging path for debugging collector and TUI behavior.
 
-Status: in progress.
+Status: in progress. File-based diagnostics are available through `ABTOP_LOG`
+and `ABTOP_LOG_FILE`.
 
 ## Phase 1: Windows First-Class Support
 
@@ -117,4 +120,3 @@ Candidate work:
 - Collector logic depends on internal Claude/Codex/OpenCode file formats.
 - Interactive TUI verification needs a real terminal, not a non-interactive pipe.
 - Session data can contain sensitive local paths and operational metadata.
-

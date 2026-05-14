@@ -228,6 +228,7 @@ impl MultiCollector {
             self.tick_count = 0;
         }
         self.tick_count += 1;
+        crate::log_trace!("collect start slow_tick={}", slow_tick);
 
         // Ports: refresh on slow tick or when the PID set changes (PID reuse safety)
         let fresh_process = SharedProcessData::fetch(Some(&self.cached_ports), slow_tick);
@@ -236,6 +237,12 @@ impl MultiCollector {
         let pids_changed = current_pids != self.cached_port_pids;
 
         let mut shared = if slow_tick || pids_changed {
+            crate::log_debug!(
+                "refreshing ports slow_tick={} pids_changed={} processes={}",
+                slow_tick,
+                pids_changed,
+                current_pids.len()
+            );
             let s = SharedProcessData::fetch(None, slow_tick);
             self.cached_ports = s.ports.clone();
             self.cached_port_pids = current_pids;
@@ -248,6 +255,11 @@ impl MultiCollector {
         // so CodexCollector can avoid double-counting their rollouts.
         let detection = mcp::detect(&shared.process_info);
         self.mcp_servers = detection.servers;
+        crate::log_trace!(
+            "mcp detected servers={} suppress={}",
+            self.mcp_servers.len(),
+            self.mcp_suppress
+        );
         shared.mcp_suppress = self.mcp_suppress;
         if self.mcp_suppress {
             shared.mcp_server_pids = detection.server_pids;
@@ -258,6 +270,7 @@ impl MultiCollector {
         for collector in &mut self.collectors {
             all.extend(collector.collect(&shared));
         }
+        crate::log_trace!("collectors returned sessions={}", all.len());
 
         // Git stats: refresh only on slow tick
         if slow_tick {
@@ -286,6 +299,7 @@ impl MultiCollector {
         // Hide dead sessions: Codex uses pid==0 sentinel, Claude is filtered in collect().
         all.retain(|s| !matches!(s.status, SessionStatus::Done));
         all.sort_by_key(|s| std::cmp::Reverse(s.started_at));
+        crate::log_debug!("collect complete live_sessions={}", all.len());
 
         // --- Orphan port detection ---
         // 1. Update tracked port children from live sessions

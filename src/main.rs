@@ -2,6 +2,7 @@ mod app;
 mod collector;
 mod config;
 mod demo;
+mod diagnostics;
 mod host_info;
 mod locale;
 mod model;
@@ -23,19 +24,25 @@ use std::io::{self, stdout};
 use std::time::Duration;
 
 fn main() -> io::Result<()> {
+    diagnostics::init();
+    log_info!("abtop start version={}", env!("CARGO_PKG_VERSION"));
+
     // --version / -V flag: print version and exit
     if std::env::args().any(|a| a == "--version" || a == "-V") {
+        log_debug!("version command");
         println!("abtop {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
     // --update flag: self-update via GitHub releases installer
     if std::env::args().any(|a| a == "--update") {
+        log_info!("update command");
         return run_update();
     }
 
     // --setup flag: configure StatusLine hook and exit
     if std::env::args().any(|a| a == "--setup") {
+        log_info!("setup command");
         setup::run_setup();
         return Ok(());
     }
@@ -79,6 +86,7 @@ fn main() -> io::Result<()> {
 
     // --once flag: print snapshot and exit
     if std::env::args().any(|a| a == "--once") {
+        log_info!("snapshot mode demo={}", demo_mode);
         let mut app = App::new_with_config(
             initial_theme.unwrap_or_default(),
             &cfg.hidden_agents,
@@ -99,10 +107,12 @@ fn main() -> io::Result<()> {
             }
         }
         print_snapshot(&app);
+        log_info!("snapshot complete sessions={}", app.sessions.len());
         return Ok(());
     }
 
     // Setup terminal
+    log_info!("interactive mode start demo={}", demo_mode);
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     stdout().execute(EnableMouseCapture)?;
@@ -123,7 +133,13 @@ fn main() -> io::Result<()> {
     let r3 = stdout().execute(LeaveAlternateScreen).map(|_| ());
 
     // Return app error first, then cleanup errors
-    app_result.and(r1).and(r2).and(r3)
+    let result = app_result.and(r1).and(r2).and(r3);
+    if let Err(e) = &result {
+        log_error!("interactive mode exited with error: {}", e);
+    } else {
+        log_info!("interactive mode exit");
+    }
+    result
 }
 
 fn run_app(
