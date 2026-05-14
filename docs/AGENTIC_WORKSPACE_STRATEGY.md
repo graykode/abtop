@@ -118,10 +118,14 @@ Non-goals for MVP:
 
 ## Next Slices
 
-1. Workspace tab, project rollup, `.dw` hints.
-2. Search/filter by workspace state.
-3. Task/decision detail pane.
-4. Workspace timeline from tool calls and git changes.
-5. Graph or swimlane mode after the TUI data model is stable.
-6. Explicit control actions after read-only UX is proven.
+The active implementation board lives in
+`docs/AGENTIC_WORKSPACE_TRACKER.md`.
 
+1. Workspace tab, project rollup, `.dw` hints. Done.
+2. Project selection and session drill-down. Done.
+3. Workspace-to-session activation. Done.
+4. Task/decision detail pane.
+5. Attention queue and workspace state filters.
+6. Workspace timeline from tool calls and git changes.
+7. Graph or swimlane mode after the TUI data model is stable.
+8. Explicit control actions after read-only UX is proven.

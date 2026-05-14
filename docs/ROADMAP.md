@@ -3,6 +3,10 @@
 This roadmap keeps the fork useful locally while preserving a clean path for
 future upstream contributions.
 
+Active Agentic Workspace work is tracked in
+`docs/AGENTIC_WORKSPACE_TRACKER.md`. Update that tracker when a task starts,
+lands, or gets blocked.
+
 ## Baseline
 
 The current fork can build, test, install, and run on native Windows.
@@ -68,17 +72,24 @@ Success criteria:
 
 Goal: make the monitor more useful during daily multi-agent work.
 
+Status: in progress. Read-only Agentic Workspace MVP is implemented; the active
+focus is workflow intelligence and attention signals.
+
 First slice:
 
-- Agentic Workspace read-only tab for project rollups.
-- `.dw` workflow hints for active task and decision records.
+- Agentic Workspace read-only tab for project rollups. Done.
+- `.dw` workflow hints for active task and decision records. Done.
 - Project-level active/waiting/blocked counts, context pressure, tokens, git,
-  and port signals.
+  and port signals. Done.
+- Project selection and selected-project session drill-down. Done.
+- Workspace-to-session activation via `Enter`. Done.
 
 Candidate features:
 
+- Clearer `.dw` task phase and decision detail.
+- Attention queue for needs-input, high context, rate limit, orphan ports, and
+  dirty git.
 - Stronger filtering for project, agent type, status, and PID.
-- Project grouping or workspace-focused view.
 - Better Codex-specific timeline labeling.
 - Export snapshot to JSON or Markdown.
 - Config presets for hidden panels and hidden agents.
