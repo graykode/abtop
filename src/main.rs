@@ -211,6 +211,7 @@ fn run_app(
                             KeyCode::Right | KeyCode::Tab => app.select_next_narrow_tab(),
                             KeyCode::Left | KeyCode::BackTab => app.select_prev_narrow_tab(),
                             KeyCode::Char('w') => app.set_narrow_tab(app::NarrowTab::Work),
+                            KeyCode::Char('a') => app.set_narrow_tab(app::NarrowTab::Workspace),
                             KeyCode::Char('u') => app.set_narrow_tab(app::NarrowTab::Usage),
                             KeyCode::Char('s') => app.set_narrow_tab(app::NarrowTab::System),
                             KeyCode::Char('+') | KeyCode::Char('=') => {

@@ -575,4 +575,5 @@ pub fn populate_demo(app: &mut App) {
         load1: 1.8,
     });
     app.agent_aggregate = crate::host_info::AgentAggregate::from_sessions(&app.sessions);
+    app.workspace_projects = crate::app::WorkspaceProject::from_sessions(&app.sessions);
 }

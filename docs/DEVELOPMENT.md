@@ -86,6 +86,10 @@ abtop
 Use Windows Terminal or another real interactive terminal. Recommended size is
 120x40 or larger.
 
+In compact/narrow layouts, press `a` to open the Agentic Workspace tab. It
+shows a read-only project rollup with live agent counts, context pressure,
+tokens, git changes, ports, and `.dw` workflow hints.
+
 ## Diagnostics Logging
 
 Runtime logging is file-based so it does not corrupt the TUI screen. Logging is

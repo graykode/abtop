@@ -68,6 +68,13 @@ Success criteria:
 
 Goal: make the monitor more useful during daily multi-agent work.
 
+First slice:
+
+- Agentic Workspace read-only tab for project rollups.
+- `.dw` workflow hints for active task and decision records.
+- Project-level active/waiting/blocked counts, context pressure, tokens, git,
+  and port signals.
+
 Candidate features:
 
 - Stronger filtering for project, agent type, status, and PID.

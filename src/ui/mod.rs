@@ -10,6 +10,7 @@ mod quota;
 mod sessions;
 mod tokens;
 mod view_menu;
+mod workspace;
 
 use crate::app::{App, NarrowSection, NarrowTab};
 use crate::locale::t;
@@ -397,7 +398,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             NarrowSection::Projects => projects::draw_projects_panel(f, app, area, theme),
             NarrowSection::Ports => ports::draw_ports_panel(f, app, area, theme),
             NarrowSection::Mcp => mcp::draw_mcp_panel(f, app, area, theme),
-            NarrowSection::Sessions | NarrowSection::Context => {}
+            NarrowSection::Workspace | NarrowSection::Sessions | NarrowSection::Context => {}
         }
     }
 
@@ -660,6 +661,9 @@ fn draw_narrow_section(
     match section {
         NarrowSection::Sessions => {
             sessions::draw_sessions_panel_active(f, app, area, theme, active)
+        }
+        NarrowSection::Workspace => {
+            workspace::draw_workspace_panel_active(f, app, area, theme, active)
         }
         NarrowSection::Projects => {
             projects::draw_projects_panel_active(f, app, area, theme, active)
@@ -1073,6 +1077,35 @@ mod tests {
         assert!(
             !text.contains("SESSION"),
             "usage tab should not keep sessions detail in body\n{text}"
+        );
+    }
+
+    #[test]
+    fn compact_workspace_tab_renders_project_rollup() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.set_narrow_tab(NarrowTab::Workspace);
+
+        let backend = TestBackend::new(80, 27);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("workspace"),
+            "workspace tab should render the workspace panel\n{text}"
+        );
+        assert!(
+            text.contains("projects"),
+            "workspace panel should expose project count\n{text}"
+        );
+        assert!(
+            text.contains("webshop"),
+            "workspace panel should include demo project rollups\n{text}"
+        );
+        assert!(
+            text.contains("ctx"),
+            "workspace panel should show context pressure\n{text}"
         );
     }
 

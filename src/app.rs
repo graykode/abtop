@@ -3,6 +3,7 @@ use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
 use crate::theme::Theme;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -36,16 +37,18 @@ pub enum JumpOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NarrowTab {
+    Workspace,
     Work,
     Usage,
     System,
 }
 
 impl NarrowTab {
-    pub const ALL: [Self; 3] = [Self::Work, Self::Usage, Self::System];
+    pub const ALL: [Self; 4] = [Self::Workspace, Self::Work, Self::Usage, Self::System];
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Workspace => "Workspace",
             Self::Work => "Work",
             Self::Usage => "Usage",
             Self::System => "System",
@@ -54,6 +57,7 @@ impl NarrowTab {
 
     pub fn shortcut(self) -> char {
         match self {
+            Self::Workspace => 'a',
             Self::Work => 'w',
             Self::Usage => 'u',
             Self::System => 's',
@@ -63,6 +67,7 @@ impl NarrowTab {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NarrowSection {
+    Workspace,
     Sessions,
     Projects,
     Context,
@@ -75,10 +80,99 @@ pub enum NarrowSection {
 impl NarrowSection {
     pub fn tab(self) -> NarrowTab {
         match self {
+            Self::Workspace => NarrowTab::Workspace,
             Self::Sessions | Self::Projects => NarrowTab::Work,
             Self::Context | Self::Quota | Self::Tokens => NarrowTab::Usage,
             Self::Ports | Self::Mcp => NarrowTab::System,
         }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkspaceProject {
+    pub name: String,
+    pub cwd: String,
+    pub session_count: usize,
+    pub active_count: usize,
+    pub waiting_count: usize,
+    pub rate_limited_count: usize,
+    pub max_context_percent: f64,
+    pub total_tokens: u64,
+    pub child_count: usize,
+    pub port_count: usize,
+    pub git_added: u32,
+    pub git_modified: u32,
+    pub has_dw: bool,
+    pub has_active_task: bool,
+    pub decision_count: usize,
+}
+
+impl WorkspaceProject {
+    pub(crate) fn from_sessions(sessions: &[AgentSession]) -> Vec<Self> {
+        let mut by_cwd: HashMap<String, WorkspaceProject> = HashMap::new();
+        for session in sessions {
+            let entry = by_cwd
+                .entry(session.cwd.clone())
+                .or_insert_with(|| WorkspaceProject {
+                    name: session.project_name.clone(),
+                    cwd: session.cwd.clone(),
+                    ..WorkspaceProject::default()
+                });
+            entry.session_count += 1;
+            match session.status {
+                SessionStatus::Thinking | SessionStatus::Executing => entry.active_count += 1,
+                SessionStatus::Waiting => entry.waiting_count += 1,
+                SessionStatus::RateLimited => entry.rate_limited_count += 1,
+                SessionStatus::Done => {}
+            }
+            entry.max_context_percent = entry.max_context_percent.max(session.context_percent);
+            entry.total_tokens = entry.total_tokens.saturating_add(session.active_tokens());
+            entry.child_count += session.children.len();
+            entry.port_count += session.children.iter().filter(|c| c.port.is_some()).count();
+            entry.git_added = entry.git_added.saturating_add(session.git_added);
+            entry.git_modified = entry.git_modified.saturating_add(session.git_modified);
+        }
+
+        let mut projects: Vec<_> = by_cwd
+            .into_values()
+            .map(|mut project| {
+                project.populate_workflow_hints();
+                project
+            })
+            .collect();
+        projects.sort_by(|a, b| {
+            b.active_count
+                .cmp(&a.active_count)
+                .then_with(|| b.session_count.cmp(&a.session_count))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        projects
+    }
+
+    fn populate_workflow_hints(&mut self) {
+        let root = Path::new(&self.cwd).join(".dw");
+        self.has_dw = root.is_dir();
+        if !self.has_dw {
+            return;
+        }
+
+        self.has_active_task =
+            root.join("tasks").join("ACTIVE.md").is_file() || root.join("ACTIVE.md").is_file();
+        self.decision_count = std::fs::read_dir(root.join("decisions"))
+            .ok()
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
     }
 }
 
@@ -143,6 +237,8 @@ pub struct App {
     pub host_metrics: Option<HostMetrics>,
     /// Aggregate metrics across all sessions (recomputed each tick).
     pub agent_aggregate: AgentAggregate,
+    /// Agentic workspace project rollup, recomputed each tick.
+    pub workspace_projects: Vec<WorkspaceProject>,
     /// Help overlay (`?`) visibility.
     pub help_open: bool,
     /// View leader overlay (`v`) visibility.
@@ -200,6 +296,7 @@ impl App {
             host_sampler: HostSampler::new(),
             host_metrics: None,
             agent_aggregate: AgentAggregate::default(),
+            workspace_projects: Vec::new(),
             help_open: false,
             view_open: false,
         }
@@ -309,6 +406,7 @@ impl App {
 
     pub fn narrow_tab_visible(&self, tab: NarrowTab) -> bool {
         match tab {
+            NarrowTab::Workspace => self.show_sessions || self.show_projects,
             NarrowTab::Work => self.show_sessions || self.show_projects,
             NarrowTab::Usage => self.show_context || self.show_quota || self.show_tokens,
             NarrowTab::System => self.show_ports || self.show_mcp,
@@ -370,6 +468,7 @@ impl App {
 
     pub fn narrow_section_visible(&self, section: NarrowSection) -> bool {
         match section {
+            NarrowSection::Workspace => self.show_sessions || self.show_projects,
             NarrowSection::Sessions => self.show_sessions,
             NarrowSection::Projects => self.show_projects,
             NarrowSection::Context => self.show_context,
@@ -382,6 +481,7 @@ impl App {
 
     pub fn visible_narrow_sections(&self, tab: NarrowTab) -> Vec<NarrowSection> {
         let sections: &[NarrowSection] = match tab {
+            NarrowTab::Workspace => &[NarrowSection::Workspace],
             NarrowTab::Work => &[NarrowSection::Sessions, NarrowSection::Projects],
             NarrowTab::Usage => &[
                 NarrowSection::Context,
@@ -485,6 +585,7 @@ impl App {
         self.mcp_servers = self.collector.mcp_servers.clone();
         self.host_metrics = self.host_sampler.sample();
         self.agent_aggregate = AgentAggregate::from_sessions(&self.sessions);
+        self.workspace_projects = WorkspaceProject::from_sessions(&self.sessions);
         if self.selected >= self.sessions.len() && !self.sessions.is_empty() {
             self.selected = self.sessions.len() - 1;
         }
