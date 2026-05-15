@@ -22,8 +22,8 @@ Use it together with `docs/PRODUCT_STRATEGY.md`, `docs/ROADMAP_V2.md`, and
 
 ## Current Focus
 
-`P1-T01`: design and implement the dw-kit task index reader as the next product
-slice after Windows hardening.
+`P2-VIS-01`: add a read-only task tree view on top of the new dw-kit task
+model.
 
 ## Task Board
 
@@ -34,63 +34,59 @@ slice after Windows hardening.
 | P0-WIN-03 | Done | Codex | Windows baseline | Windows TCP port parsing | `netstat -ano -p TCP` parsing handles IPv4, IPv6, duplicate rows, and non-listening rows. | None | `src/collector/process.rs` | `parse_windows_netstat_ports_*`; commit `d10f5aa` |
 | P0-UP-01 | Done | Codex | Fork hygiene | Upstream sync guide | Fork has repeatable upstream merge/cherry-pick/conflict workflow. | None | `docs/UPSTREAM_SYNC.md` | `git fetch upstream`; commit `cbaa87e` |
 | P0-UP-02 | Done | Codex | Fork hygiene | Sync upstream OpenCode fix | macOS OpenCode cwd lookup uses `lsof -a` upstream fix. | P0-UP-01 | `src/collector/opencode.rs` | `cargo test opencode`; commit `c8a3803` |
-| P1-T01 | Next | Unassigned | Task-aware workspace | dw-kit task index reader | Parse dw-kit task/project metadata into a safe internal model. | Product strategy docs | `src/task/*` or `src/workspace/*`, tests, docs | Pending |
-| P1-T02 | Next | Unassigned | Task-aware workspace | Workspace task detail pane v2 | Show active task, phase, acceptance criteria count, decisions, verification status, and next action. | P1-T01 | `src/app.rs`, `src/ui/workspace.rs`, task model | Pending |
-| P1-T03 | Next | Unassigned | Task-aware workspace | Safe task snapshot export | Extend `--workspace-summary` with task state without prompt/file contents. | P1-T01 | `src/app.rs`, tests, docs | Pending |
-| P1-T04 | Backlog | Unassigned | Task-aware workspace | Task status normalization | Map dw-kit state to `ready`, `doing`, `blocked`, `review`, `done`, and `unknown`. | P1-T01 | task model, tests | Pending |
-| P2-VIS-01 | Backlog | Unassigned | Visual task viewer | TUI task tree view | Add read-only task tree before any graphical mind map. | P1-T01, P1-T02 | UI module, tests | Pending |
+| P1-T01 | Done | Codex + Peirce | Task-aware workspace | dw-kit task index reader | Parse dw-kit task/project metadata into a safe internal model. | Product strategy docs | `src/task/*`, `src/app.rs`, tests | `cargo fmt -- --check`; `cargo test task`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; demo summary |
+| P1-T02 | Done | Codex + Beauvoir | Task-aware workspace | Workspace task detail pane v2 | Show active task, phase, acceptance criteria count, decisions, verification status, and next action. | P1-T01 | `src/app.rs`, `src/ui/workspace.rs`, task model | `desktop_workspace_focus_renders_dw_task_lens`; `cargo test workspace` |
+| P1-T03 | Done | Codex | Task-aware workspace | Safe task snapshot export | Extend `--workspace-summary` with task state without prompt/file contents. | P1-T01 | `src/app.rs`, tests, docs | `workspace_summary_markdown_is_redacted_and_structured`; demo summary output includes workflow counts |
+| P1-T04 | Done | Peirce + Codex | Task-aware workspace | Task status normalization | Map dw-kit state to `ready`, `doing`, `blocked`, `review`, `done`, and `unknown`. | P1-T01 | task model, tests | `task::dw::tests::*`; app next-action mapping |
+| P2-VIS-01 | Next | Unassigned | Visual task viewer | TUI task tree view | Add read-only task tree before any graphical mind map. | P1-T01, P1-T02 | UI module, tests | Pending |
 | P2-VIS-02 | Backlog | Unassigned | Visual task viewer | Mind-map data model prototype | Create graph nodes/edges for tasks, decisions, sessions, files, and risks. | P2-VIS-01 | `src/task_graph/*`, docs | Pending |
 | P3-EVD-01 | Backlog | Unassigned | Evidence bundles | Per-task evidence bundle | Export safe per-task evidence: sessions, commands, files touched, checks, decisions. | P1-T03 | export module, tests | Pending |
 | P4-AUD-01 | Blocked | Unassigned | Controls | Local audit log | Add append-only audit log before any mutating control action. | Product decision | audit module, docs | Pending |
 | P4-CTL-01 | Blocked | Unassigned | Controls | Mutating control actions | Kill/restart/archive/dispatch actions with confirmation and audit. | P4-AUD-01 | app/ui/control modules | Pending |
 
-## Next Task Detail: P1-T01
+## Next Task Detail: P2-VIS-01
 
 Target user:
 
-- Solo power user and small team using dw-kit to manage project tasks.
+- Solo power user and small team using dw-kit to manage project tasks across
+  several agent sessions.
 
 Pain solved:
 
-- Agent sessions are visible, but the user cannot yet see which structured task
-  each session advances.
+- The workspace panel now knows task metadata, but the user still needs a
+  structured task list/tree to scan task relationships before any future
+  mind-map view.
 
 Hypothesis:
 
-- Reading dw-kit task artifacts as first-class data makes abtop more valuable
-  than provider-native session dashboards.
+- A read-only TUI task tree creates immediate value and derisks the later
+  graphical mind-map product direction.
 
 Data sources:
 
-- `.dw/tasks/ACTIVE.md`,
-- `.dw/tasks/*.md`,
-- `.dw/decisions/*.md`,
-- `.dw/records/*.md`,
-- optional future machine-readable dw-kit index.
+- `crate::task::read_project_state(cwd)`,
+- `WorkspaceProject` task rollups,
+- later optional graph model for task relationships.
 
 Privacy risk:
 
-- Task files may include sensitive text. UI and exports must prefer titles,
-  status, counts, and short sanitized snippets over full content.
+- Task files may include sensitive text. Continue rendering only titles,
+  status, counts, short sanitized metadata, and relationship labels.
 
 Expected design:
 
-- Add a small task model separate from `App`.
-- Prefer structured metadata when available.
-- Fall back to safe Markdown heading extraction.
-- Keep parser defensive and read-only.
+- Add a compact task-tree section or lens that lists task title/status/phase.
+- Keep the default workspace view dense and readable.
+- Avoid drawing raw task body, checklist text, prompt text, or file contents.
 
 Suggested write scope:
 
-- `src/task/mod.rs`,
-- `src/task/dw.rs`,
-- `src/app.rs` only for integration,
-- `src/ui/workspace.rs` only if needed for minimal surface,
-- `docs/DEVELOPMENT.md` or `docs/ROADMAP_V2.md` for EVD.
+- `src/ui/workspace.rs`,
+- `src/app.rs` only for data shape if needed,
+- tests in `src/ui/mod.rs` and `src/app.rs`.
 
 EVD target:
 
-- `cargo test task`,
 - `cargo test workspace`,
 - `cargo fmt -- --check`,
 - `cargo clippy --all-targets --all-features -- -D warnings`.

@@ -585,6 +585,13 @@ pub fn populate_demo(app: &mut App) {
         project.has_active_task = true;
         project.active_task_title = Some("Batch inference rollout".into());
         project.active_task_phase = Some("Execute".into());
+        project.active_task_status = crate::task::TaskStatus::Doing;
+        project.active_task_raw_status = Some("Doing".into());
+        project.active_task_acceptance_count = 6;
+        project.task_count = 5;
         project.decision_count = 3;
+        project.record_count = 8;
+        project.verification_count = 4;
+        project.completed_verification_count = 2;
     }
 }

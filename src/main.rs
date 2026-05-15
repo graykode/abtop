@@ -7,6 +7,7 @@ mod host_info;
 mod locale;
 mod model;
 mod setup;
+mod task;
 mod theme;
 mod ui;
 

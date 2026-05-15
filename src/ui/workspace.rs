@@ -199,19 +199,24 @@ pub(crate) fn draw_workspace_panel_active(
                 Style::default().fg(theme.graph_text),
             ));
             flow.push(Span::styled(
-                project
-                    .active_task_phase
-                    .as_deref()
-                    .unwrap_or(if project.has_active_task {
-                        "active"
-                    } else {
-                        "idle"
-                    }),
+                if project.has_active_task {
+                    project.active_task_status.label()
+                } else {
+                    "idle"
+                },
                 Style::default().fg(if project.has_active_task {
                     theme.proc_misc
                 } else {
                     theme.inactive_fg
                 }),
+            ));
+            flow.push(Span::styled(
+                " tasks ",
+                Style::default().fg(theme.graph_text),
+            ));
+            flow.push(Span::styled(
+                project.task_count.to_string(),
+                Style::default().fg(theme.main_fg),
             ));
             flow.push(Span::styled(" adr ", Style::default().fg(theme.graph_text)));
             flow.push(Span::styled(
@@ -248,32 +253,74 @@ pub(crate) fn draw_workspace_panel_active(
             Span::styled("lens", Style::default().fg(theme.main_fg)),
         ]));
         if project.has_dw {
+            let task_title =
+                project
+                    .active_task_title
+                    .as_deref()
+                    .unwrap_or(if project.has_active_task {
+                        "active task"
+                    } else {
+                        "none"
+                    });
             lines.push(Line::from(vec![
                 Span::styled(" task ", Style::default().fg(theme.graph_text)),
                 Span::styled(
-                    project
-                        .active_task_title
-                        .as_deref()
-                        .unwrap_or(if project.has_active_task {
-                            "active task"
-                        } else {
-                            "none"
-                        }),
+                    truncate_str(task_title, area.width.saturating_sub(52) as usize),
                     Style::default().fg(if project.has_active_task {
                         theme.main_fg
                     } else {
                         theme.inactive_fg
                     }),
                 ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(" status ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    project
+                        .active_task_raw_status
+                        .as_deref()
+                        .unwrap_or(project.active_task_status.label()),
+                    Style::default().fg(theme.proc_misc),
+                ),
                 Span::styled(" phase ", Style::default().fg(theme.graph_text)),
                 Span::styled(
                     project.active_task_phase.as_deref().unwrap_or("-"),
                     Style::default().fg(theme.proc_misc),
                 ),
+                Span::styled(" tasks ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    project.task_count.to_string(),
+                    Style::default().fg(theme.main_fg),
+                ),
                 Span::styled(" decisions ", Style::default().fg(theme.graph_text)),
                 Span::styled(
                     project.decision_count.to_string(),
                     Style::default().fg(theme.main_fg),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(" records ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    project.record_count.to_string(),
+                    Style::default().fg(theme.main_fg),
+                ),
+                Span::styled(" accept ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    project.active_task_acceptance_count.to_string(),
+                    Style::default().fg(theme.main_fg),
+                ),
+                Span::styled(" verification ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    format!(
+                        "{}/{}",
+                        project.completed_verification_count, project.verification_count
+                    ),
+                    Style::default().fg(theme.main_fg),
+                ),
+                Span::styled(" next ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    project.active_task_next_action(),
+                    Style::default().fg(theme.proc_misc),
                 ),
             ]));
         }

@@ -1,9 +1,9 @@
 use crate::collector::{read_rate_limits, McpServer, MultiCollector};
 use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
+use crate::task::{read_project_state, TaskStatus};
 use crate::theme::Theme;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -125,7 +125,14 @@ pub struct WorkspaceProject {
     pub has_active_task: bool,
     pub active_task_title: Option<String>,
     pub active_task_phase: Option<String>,
+    pub active_task_status: TaskStatus,
+    pub active_task_raw_status: Option<String>,
+    pub active_task_acceptance_count: usize,
+    pub task_count: usize,
     pub decision_count: usize,
+    pub record_count: usize,
+    pub verification_count: usize,
+    pub completed_verification_count: usize,
     pub attention_score: u32,
     pub attention: Vec<String>,
 }
@@ -177,33 +184,37 @@ impl WorkspaceProject {
     }
 
     fn populate_workflow_hints(&mut self) {
-        let root = Path::new(&self.cwd).join(".dw");
-        self.has_dw = root.is_dir();
-        if !self.has_dw {
-            return;
+        let state = read_project_state(std::path::Path::new(&self.cwd));
+        self.has_dw = state.has_dw;
+        self.task_count = state.tasks.len();
+        self.decision_count = state.decision_count;
+        self.record_count = state.record_count;
+        self.verification_count = state.verification_count;
+        self.completed_verification_count = state.completed_verification_count;
+
+        if let Some(active_task) = state.active_task {
+            self.has_active_task = true;
+            self.active_task_title = active_task.title;
+            self.active_task_phase = active_task.phase;
+            self.active_task_status = active_task.status;
+            self.active_task_raw_status = active_task.raw_status;
+            self.active_task_acceptance_count = active_task.acceptance_count;
+        }
+    }
+
+    pub fn active_task_next_action(&self) -> &'static str {
+        if !self.has_active_task {
+            return "choose task";
         }
 
-        if let Some(active_task) = active_task_path(&root) {
-            self.has_active_task = true;
-            let (title, phase) = read_active_task_metadata(&active_task);
-            self.active_task_title = title;
-            self.active_task_phase = phase;
+        match self.active_task_status {
+            TaskStatus::Ready => "start",
+            TaskStatus::Doing => "continue",
+            TaskStatus::Blocked => "unblock",
+            TaskStatus::Review => "verify",
+            TaskStatus::Done => "archive",
+            TaskStatus::Unknown => "inspect",
         }
-        self.decision_count = std::fs::read_dir(root.join("decisions"))
-            .ok()
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|entry| {
-                        entry
-                            .path()
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
     }
 
     fn compute_attention(&mut self) {
@@ -238,63 +249,6 @@ impl WorkspaceProject {
             self.attention.push("no-task".into());
         }
     }
-}
-
-fn active_task_path(root: &Path) -> Option<PathBuf> {
-    [root.join("tasks").join("ACTIVE.md"), root.join("ACTIVE.md")]
-        .into_iter()
-        .find(|path| path.is_file())
-}
-
-fn read_active_task_metadata(path: &Path) -> (Option<String>, Option<String>) {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return (None, None);
-    };
-    let mut title = None;
-    let mut phase = None;
-
-    for raw in content.lines().take(80) {
-        let line = raw.trim();
-        if line.is_empty() || line == "---" {
-            continue;
-        }
-        if title.is_none() {
-            if let Some(value) = metadata_value(line, "title") {
-                title = Some(value);
-            } else if let Some(heading) = line.strip_prefix("# ") {
-                title = Some(truncate_metadata(heading.trim(), 80));
-            }
-        }
-        if phase.is_none() {
-            phase = metadata_value(line, "phase").or_else(|| metadata_value(line, "status"));
-        }
-        if title.is_some() && phase.is_some() {
-            break;
-        }
-    }
-
-    (title, phase)
-}
-
-fn metadata_value(line: &str, key: &str) -> Option<String> {
-    let (left, right) = line.split_once(':')?;
-    if !left.trim().eq_ignore_ascii_case(key) {
-        return None;
-    }
-    let value = right.trim().trim_matches('"').trim_matches('\'');
-    if value.is_empty() {
-        None
-    } else {
-        Some(truncate_metadata(value, 40))
-    }
-}
-
-fn truncate_metadata(value: &str, max_len: usize) -> String {
-    value
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(max_len)
-        .collect()
 }
 
 pub struct App {
@@ -1145,7 +1099,7 @@ impl App {
             ));
             if project.has_dw {
                 out.push_str(&format!(
-                    "- workflow: task={} phase={} decisions={}\n",
+                    "- workflow: task={} status={} phase={} next={} acceptance={} tasks={} decisions={} records={} verification={}/{}\n",
                     project
                         .active_task_title
                         .as_deref()
@@ -1157,8 +1111,23 @@ impl App {
                                 "none".into()
                             }
                         }),
-                    project.active_task_phase.as_deref().unwrap_or("-"),
-                    project.decision_count
+                    project
+                        .active_task_raw_status
+                        .as_deref()
+                        .map(|status| safe_export_text(status, 32))
+                        .unwrap_or_else(|| project.active_task_status.label().into()),
+                    project
+                        .active_task_phase
+                        .as_deref()
+                        .map(|phase| safe_export_text(phase, 40))
+                        .unwrap_or_else(|| "-".into()),
+                    project.active_task_next_action(),
+                    project.active_task_acceptance_count,
+                    project.task_count,
+                    project.decision_count,
+                    project.record_count,
+                    project.completed_verification_count,
+                    project.verification_count
                 ));
             }
 
@@ -1652,15 +1621,19 @@ mod tests {
         let root = temp.path().join("project");
         let task_dir = root.join(".dw").join("tasks");
         let decision_dir = root.join(".dw").join("decisions");
+        let record_dir = root.join(".dw").join("records");
         std::fs::create_dir_all(&task_dir).unwrap();
         std::fs::create_dir_all(&decision_dir).unwrap();
+        std::fs::create_dir_all(&record_dir).unwrap();
         std::fs::write(
             task_dir.join("ACTIVE.md"),
-            "---\ntitle: Improve checkout flow\nphase: Verify\n---\n# Ignored fallback\n",
+            "---\ntitle: Improve checkout flow\nphase: Verify\nstatus: review\n---\n# Ignored fallback\n\n## Verification\n- [x] cargo test\n- [ ] cargo clippy\n\nSecret body text should stay out of workspace exports.\n",
         )
         .unwrap();
+        std::fs::write(task_dir.join("next.md"), "# Follow-up\nstatus: ready\n").unwrap();
         std::fs::write(decision_dir.join("001.md"), "# ADR\n").unwrap();
         std::fs::write(decision_dir.join("notes.txt"), "ignored\n").unwrap();
+        std::fs::write(record_dir.join("001.md"), "# Record\n").unwrap();
 
         let session = AgentSession {
             cwd: root.to_string_lossy().to_string(),
@@ -1677,7 +1650,18 @@ mod tests {
             Some("Improve checkout flow")
         );
         assert_eq!(projects[0].active_task_phase.as_deref(), Some("Verify"));
+        assert_eq!(projects[0].active_task_status, TaskStatus::Review);
+        assert_eq!(
+            projects[0].active_task_raw_status.as_deref(),
+            Some("review")
+        );
+        assert_eq!(projects[0].active_task_acceptance_count, 0);
+        assert_eq!(projects[0].active_task_next_action(), "verify");
+        assert_eq!(projects[0].task_count, 2);
         assert_eq!(projects[0].decision_count, 1);
+        assert_eq!(projects[0].record_count, 1);
+        assert_eq!(projects[0].verification_count, 2);
+        assert_eq!(projects[0].completed_verification_count, 1);
     }
 
     #[test]
@@ -1753,7 +1737,9 @@ mod tests {
         assert!(summary.contains("# abtop workspace summary"));
         assert!(summary.contains("## ml-pipeline"));
         assert!(summary.contains("attention:"));
-        assert!(summary.contains("workflow: task=Batch inference rollout"));
+        assert!(summary.contains("workflow: task=Batch inference rollout status=Doing"));
+        assert!(summary.contains("next=continue acceptance=6"));
+        assert!(summary.contains("verification=2/4"));
         assert!(summary.contains("Batch inference endpoint"));
         assert!(
             !summary.contains("Refactor Terraform modules for multi-region"),
