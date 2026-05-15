@@ -2,6 +2,7 @@ use crate::collector::{read_rate_limits, McpServer, MultiCollector};
 use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
 use crate::task::{read_project_state, DwTaskSummary, TaskStatus};
+use crate::task_graph::{GraphNodeKind, TaskGraph};
 use crate::theme::Theme;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
@@ -1129,12 +1130,17 @@ impl App {
 
     pub fn workspace_summary_markdown(&self) -> String {
         let mut out = String::new();
+        let task_graph = self.workspace_task_graph();
         out.push_str("# abtop workspace summary\n\n");
         out.push_str(&format!(
-            "- projects: {}\n- sessions: {}\n- lens: {}\n\n",
+            "- projects: {}\n- sessions: {}\n- lens: {}\n- graph: {} nodes, {} edges, {} tasks, {} agents\n\n",
             self.workspace_projects.len(),
             self.sessions.len(),
-            self.workspace_lens.label()
+            self.workspace_lens.label(),
+            task_graph.nodes.len(),
+            task_graph.edges.len(),
+            task_graph.node_count(GraphNodeKind::Task),
+            task_graph.node_count(GraphNodeKind::Agent)
         ));
 
         for project in &self.workspace_projects {
@@ -1229,6 +1235,10 @@ impl App {
         }
 
         out
+    }
+
+    pub fn workspace_task_graph(&self) -> TaskGraph {
+        TaskGraph::build(&self.workspace_projects, &self.sessions)
     }
 
     /// Jump to the terminal running the selected session's Claude process.
@@ -1805,6 +1815,7 @@ mod tests {
 
         let summary = app.workspace_summary_markdown();
         assert!(summary.contains("# abtop workspace summary"));
+        assert!(summary.contains("graph:"));
         assert!(summary.contains("## ml-pipeline"));
         assert!(summary.contains("attention:"));
         assert!(summary.contains("workflow: task=Batch inference rollout status=Doing"));

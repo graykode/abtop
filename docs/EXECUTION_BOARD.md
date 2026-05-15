@@ -22,8 +22,8 @@ Use it together with `docs/PRODUCT_STRATEGY.md`, `docs/ROADMAP_V2.md`, and
 
 ## Current Focus
 
-`P2-VIS-02`: prototype the mind-map data model after the read-only TUI task
-tree has landed.
+`P3-EVD-01`: add safe per-task evidence bundles on top of the task graph and
+workspace summary surfaces.
 
 ## Task Board
 
@@ -39,56 +39,58 @@ tree has landed.
 | P1-T03 | Done | Codex | Task-aware workspace | Safe task snapshot export | Extend `--workspace-summary` with task state without prompt/file contents. | P1-T01 | `src/app.rs`, tests, docs | `workspace_summary_markdown_is_redacted_and_structured`; demo summary output includes workflow counts |
 | P1-T04 | Done | Peirce + Codex | Task-aware workspace | Task status normalization | Map dw-kit state to `ready`, `doing`, `blocked`, `review`, `done`, and `unknown`. | P1-T01 | task model, tests | `task::dw::tests::*`; app next-action mapping |
 | P2-VIS-01 | Done | Codex | Visual task viewer | TUI task tree view | Add read-only task tree before any graphical mind map. | P1-T01, P1-T02 | UI module, tests | `cargo fmt -- --check`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; refreshed `assets/workspace-demo.gif` |
-| P2-VIS-02 | Next | Unassigned | Visual task viewer | Mind-map data model prototype | Create graph nodes/edges for tasks, decisions, sessions, files, and risks. | P2-VIS-01 | `src/task_graph/*`, docs | Pending |
-| P3-EVD-01 | Backlog | Unassigned | Evidence bundles | Per-task evidence bundle | Export safe per-task evidence: sessions, commands, files touched, checks, decisions. | P1-T03 | export module, tests | Pending |
+| P2-VIS-02 | Done | Codex | Visual task viewer | Mind-map data model prototype | Create graph nodes/edges for tasks, decisions, sessions, files, and risks. | P2-VIS-01 | `src/task_graph/*`, docs | `cargo test task_graph`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; demo summary graph stats |
+| P3-EVD-01 | Next | Unassigned | Evidence bundles | Per-task evidence bundle | Export safe per-task evidence: sessions, commands, files touched, checks, decisions. | P1-T03, P2-VIS-02 | export module, tests | Pending |
 | P4-AUD-01 | Blocked | Unassigned | Controls | Local audit log | Add append-only audit log before any mutating control action. | Product decision | audit module, docs | Pending |
 | P4-CTL-01 | Blocked | Unassigned | Controls | Mutating control actions | Kill/restart/archive/dispatch actions with confirmation and audit. | P4-AUD-01 | app/ui/control modules | Pending |
 
-## Next Task Detail: P2-VIS-02
+## Next Task Detail: P3-EVD-01
 
 Target user:
 
-- Solo power user and small team that wants to understand how tasks, agents,
-  decisions, files, and risks relate across projects.
+- Solo power user and small team that need shareable proof that agent work
+  advanced a task safely.
 
 Pain solved:
 
-- The TUI task tree is useful for scanning task state, but it does not yet model
-  cross-object relationships for a future mind-map or graph lens.
+- The workspace can show task state and graph stats, but there is no focused
+  per-task evidence bundle for review, handoff, or pitch demos.
 
 Hypothesis:
 
-- A separate graph data model lets us experiment with mind-map UX without
-  entangling it with terminal rendering.
+- A privacy-safe evidence bundle makes abtop useful beyond live monitoring:
+  users can verify outcomes without exposing prompts or file contents.
 
 Data sources:
 
-- `WorkspaceProject` task rollups,
 - `WorkspaceTask` summaries,
-- session summaries, tool calls, decisions, records, and touched files where
-  safe to expose.
+- `TaskGraph`,
+- selected session status, sanitized tool names, verification counts, decisions,
+  records, and redacted file identifiers where safe.
 
 Privacy risk:
 
-- Relationship graphs can leak sensitive context through labels. Use only
-  sanitized task titles, counts, relative identifiers, and redacted relationship
-  types.
+- Evidence exports can leak prompts, absolute paths, and file contents. Keep
+  bundles to labels, counts, statuses, commands/tool names, and sanitized
+  relative identifiers.
 
 Expected design:
 
-- Add a pure data model first: nodes, edges, node kinds, and redacted labels.
-- Keep rendering separate from graph construction.
-- Start with tests over demo data and `.dw` fixtures before adding UI.
+- Add a safe export model/function first.
+- Include task title, status, next action, verification progress, related graph
+  node counts, sessions, and decisions/records counts.
+- Avoid raw task markdown, prompts, tool inputs, file contents, and absolute
+  local paths.
 
 Suggested write scope:
 
-- `src/task_graph/*`,
-- `src/app.rs` only if a bridge is needed,
-- tests for graph construction and privacy boundaries.
+- `src/evidence/*` or a narrow export module,
+- `src/app.rs` only for bridge methods or CLI surface,
+- tests for privacy and deterministic output.
 
 EVD target:
 
-- `cargo test task_graph`,
+- `cargo test evidence`,
 - `cargo test workspace`,
 - `cargo fmt -- --check`,
 - `cargo clippy --all-targets --all-features -- -D warnings`.

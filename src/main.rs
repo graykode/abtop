@@ -8,6 +8,7 @@ mod locale;
 mod model;
 mod setup;
 mod task;
+mod task_graph;
 mod theme;
 mod ui;
 
