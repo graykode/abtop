@@ -7,6 +7,10 @@ Active Agentic Workspace work is tracked in
 `docs/AGENTIC_WORKSPACE_TRACKER.md`. Update that tracker when a task starts,
 lands, or gets blocked.
 
+Product strategy and the next product-led roadmap live in
+`docs/PRODUCT_STRATEGY.md`, `docs/COMPETITIVE_MAP.md`, and
+`docs/ROADMAP_V2.md`.
+
 ## Baseline
 
 The current fork can build, test, install, and run on native Windows.

@@ -3,6 +3,10 @@
 This document turns the fork from an agent monitor into a staged agentic
 workspace while keeping the first implementation read-only and safe.
 
+For product positioning, business strategy, moat, and the task/workflow viewer
+direction, see `docs/PRODUCT_STRATEGY.md`, `docs/COMPETITIVE_MAP.md`, and
+`docs/ROADMAP_V2.md`.
+
 ## Goal
 
 Build a friendly command center for multi-agent development:
@@ -76,6 +80,19 @@ Useful translation for this fork:
 - surface active task and decision counts,
 - treat guards, records, surfaces, bridges, and tunes as workspace dimensions,
 - use dw artifacts as a bridge between agent sessions and human planning.
+
+### Task Map / Visual Task Viewer
+
+The workspace should treat project tasks as a graph, not only as a list. A
+future task viewer can show dw-kit tasks as a tree, mind map, dependency graph,
+or decision map. The key product difference is that task nodes should connect
+to live runtime evidence: sessions, commands, files, ports, quota pressure,
+verification status, and handoff notes.
+
+Nogic-style maps are a useful reference for progressive code understanding.
+abtop should apply the same visual clarity to live agentic work: what task is
+active, why it matters, what depends on it, what is blocked, and what evidence
+exists.
 
 ## Product Model
 
