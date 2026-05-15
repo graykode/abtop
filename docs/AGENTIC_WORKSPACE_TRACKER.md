@@ -14,7 +14,7 @@ Status values:
 
 ## Current Focus
 
-`AW-010`: add attention signals for projects that need operator focus.
+`AW-011`: add local-only Workspace lens controls.
 
 ## Task Board
 
@@ -29,8 +29,8 @@ Status values:
 | AW-007 | Done | Workspace to session activation | `Enter` opens the selected project's first session in the sessions panel. | `activating_workspace_project_selects_its_first_session`; commit `7e00f95` |
 | AW-008 | Done | Roadmap and task tracking | Add this tracker and keep roadmap status explicit. | `cargo test workspace`; this commit |
 | AW-009 | Done | Workspace task state lens | Surface `.dw` active task title, phase, and decision counts more clearly. | `workspace_project_reads_dw_active_task_metadata`; `desktop_workspace_focus_renders_dw_task_lens`; this commit |
-| AW-010 | Doing | Workspace risk/attention queue | Sort or flag projects needing input, rate-limited sessions, high context, orphan ports, or dirty git. | Add sorting/ranking tests |
-| AW-011 | Backlog | Workspace filter/lens controls | Add local-only filters for project state, agent CLI, status, and `.dw` presence. | UI tests plus demo tape |
+| AW-010 | Done | Workspace risk/attention queue | Sort and flag projects needing input, high context, open ports, or dirty git. | `workspace_attention_scores_and_sorts_projects`; `desktop_workspace_focus_renders_attention_signals`; this commit |
+| AW-011 | Doing | Workspace filter/lens controls | Add local-only filters for project state, agent CLI, status, and `.dw` presence. | UI tests plus demo tape |
 | AW-012 | Backlog | Workspace timeline strip | Show recent selected-project tool calls and file access summaries without prompt/file contents. | UI tests with demo transcript data |
 | AW-013 | Backlog | Snapshot/export surface | Add safe Markdown or JSON snapshot for sharing current Workspace state. | Snapshot tests with redaction assertions |
 | AW-014 | Blocked | Mutating control actions | Dispatch/reply/restart/archive are intentionally blocked until read-only UX and audit story are stable. | Requires product decision and confirmation UX |

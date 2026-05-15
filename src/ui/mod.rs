@@ -1116,8 +1116,12 @@ mod tests {
             "workspace panel should expose project count\n{text}"
         );
         assert!(
-            text.contains("webshop"),
-            "workspace panel should include demo project rollups\n{text}"
+            text.contains("ml-pipeline"),
+            "workspace panel should prioritize projects needing attention\n{text}"
+        );
+        assert!(
+            text.contains("attention"),
+            "workspace panel should include attention signals\n{text}"
         );
         assert!(
             text.contains("ctx"),
@@ -1495,6 +1499,27 @@ mod tests {
         assert!(
             text.contains("decisions"),
             "workspace should render .dw decision count label\n{text}"
+        );
+    }
+
+    #[test]
+    fn desktop_workspace_focus_renders_attention_signals() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.set_narrow_tab(NarrowTab::Workspace);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("attention"),
+            "workspace should show attention project count and labels\n{text}"
+        );
+        assert!(
+            text.contains("ctx"),
+            "workspace attention should include context pressure labels\n{text}"
         );
     }
 

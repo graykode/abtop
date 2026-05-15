@@ -13,6 +13,8 @@ const GRAPH_HISTORY_LEN: usize = 200;
 const MAX_SUMMARY_JOBS: usize = 3;
 /// Max summary attempts per session before giving up.
 const MAX_SUMMARY_RETRIES: u32 = 2;
+const ATTENTION_CONTEXT_WARN_PCT: f64 = 80.0;
+const ATTENTION_CONTEXT_CRITICAL_PCT: f64 = 90.0;
 
 /// Produce a terminal-safe fallback summary from a raw prompt.
 fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
@@ -107,6 +109,8 @@ pub struct WorkspaceProject {
     pub active_task_title: Option<String>,
     pub active_task_phase: Option<String>,
     pub decision_count: usize,
+    pub attention_score: u32,
+    pub attention: Vec<String>,
 }
 
 impl WorkspaceProject {
@@ -139,12 +143,16 @@ impl WorkspaceProject {
             .into_values()
             .map(|mut project| {
                 project.populate_workflow_hints();
+                project.compute_attention();
                 project
             })
             .collect();
         projects.sort_by(|a, b| {
-            b.active_count
-                .cmp(&a.active_count)
+            b.attention_score
+                .cmp(&a.attention_score)
+                .then_with(|| b.active_count.cmp(&a.active_count))
+                .then_with(|| b.rate_limited_count.cmp(&a.rate_limited_count))
+                .then_with(|| b.waiting_count.cmp(&a.waiting_count))
                 .then_with(|| b.session_count.cmp(&a.session_count))
                 .then_with(|| a.name.cmp(&b.name))
         });
@@ -179,6 +187,39 @@ impl WorkspaceProject {
                     .count()
             })
             .unwrap_or(0);
+    }
+
+    fn compute_attention(&mut self) {
+        self.attention.clear();
+        self.attention_score = 0;
+
+        if self.rate_limited_count > 0 {
+            self.attention_score += 100;
+            self.attention.push("rate".into());
+        }
+        if self.max_context_percent >= ATTENTION_CONTEXT_CRITICAL_PCT {
+            self.attention_score += 90;
+            self.attention.push("ctx90".into());
+        } else if self.max_context_percent >= ATTENTION_CONTEXT_WARN_PCT {
+            self.attention_score += 60;
+            self.attention.push("ctx80".into());
+        }
+        if self.waiting_count > 0 {
+            self.attention_score += 50;
+            self.attention.push("input".into());
+        }
+        if self.port_count > 0 {
+            self.attention_score += 30;
+            self.attention.push("ports".into());
+        }
+        if self.git_added > 0 || self.git_modified > 0 {
+            self.attention_score += 20;
+            self.attention.push("git".into());
+        }
+        if self.has_dw && !self.has_active_task {
+            self.attention_score += 10;
+            self.attention.push("no-task".into());
+        }
     }
 }
 
@@ -1455,6 +1496,34 @@ mod tests {
         );
         assert_eq!(projects[0].active_task_phase.as_deref(), Some("Verify"));
         assert_eq!(projects[0].decision_count, 1);
+    }
+
+    #[test]
+    fn workspace_attention_scores_and_sorts_projects() {
+        let mut calm = waiting_session("claude");
+        calm.cwd = "/tmp/calm".into();
+        calm.project_name = "calm".into();
+        calm.status = SessionStatus::Executing;
+
+        let mut urgent = waiting_session("claude");
+        urgent.cwd = "/tmp/urgent".into();
+        urgent.project_name = "urgent".into();
+        urgent.context_percent = 92.0;
+        urgent.git_modified = 2;
+        urgent.children.push(crate::model::ChildProcess {
+            pid: 42,
+            command: "npm run dev".into(),
+            mem_kb: 1024,
+            port: Some(3000),
+        });
+
+        let projects = WorkspaceProject::from_sessions(&[calm, urgent]);
+        assert_eq!(projects[0].name, "urgent");
+        assert!(projects[0].attention_score > projects[1].attention_score);
+        assert!(projects[0].attention.iter().any(|label| label == "ctx90"));
+        assert!(projects[0].attention.iter().any(|label| label == "input"));
+        assert!(projects[0].attention.iter().any(|label| label == "ports"));
+        assert!(projects[0].attention.iter().any(|label| label == "git"));
     }
 
     #[test]

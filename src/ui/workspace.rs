@@ -28,6 +28,11 @@ pub(crate) fn draw_workspace_panel_active(
         .iter()
         .filter(|s| matches!(s.status, crate::model::SessionStatus::RateLimited))
         .count();
+    let attention_projects = app
+        .workspace_projects
+        .iter()
+        .filter(|project| project.attention_score > 0)
+        .count();
 
     lines.push(Line::from(vec![
         Span::styled(" projects ", Style::default().fg(theme.graph_text)),
@@ -43,6 +48,15 @@ pub(crate) fn draw_workspace_panel_active(
             Style::default()
                 .fg(theme.title)
                 .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  attention ", Style::default().fg(theme.graph_text)),
+        Span::styled(
+            attention_projects.to_string(),
+            Style::default().fg(if attention_projects > 0 {
+                theme.warning_fg
+            } else {
+                theme.inactive_fg
+            }),
         ),
     ]));
     lines.push(Line::from(vec![
@@ -76,7 +90,7 @@ pub(crate) fn draw_workspace_panel_active(
     let detail_rows = if app.workspace_projects.is_empty() {
         0
     } else {
-        6
+        7
     };
     let available_rows = area
         .height
@@ -98,6 +112,11 @@ pub(crate) fn draw_workspace_panel_active(
         let selected = idx == app.workspace_selected;
         let name_w = area.width.saturating_sub(22).clamp(8, 24) as usize;
         let dw = if project.has_dw { " dw" } else { "" };
+        let attention = if project.attention_score > 0 {
+            " !"
+        } else {
+            ""
+        };
         let name_style = if selected {
             Style::default()
                 .fg(theme.selected_fg)
@@ -118,6 +137,7 @@ pub(crate) fn draw_workspace_panel_active(
                 name_style,
             ),
             Span::styled(dw, Style::default().fg(theme.proc_misc)),
+            Span::styled(attention, Style::default().fg(theme.warning_fg)),
         ]));
 
         let mut status = vec![
@@ -241,6 +261,20 @@ pub(crate) fn draw_workspace_panel_active(
                 Span::styled(" decisions ", Style::default().fg(theme.graph_text)),
                 Span::styled(
                     project.decision_count.to_string(),
+                    Style::default().fg(theme.main_fg),
+                ),
+            ]));
+        }
+        if !project.attention.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(" attention ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    project.attention.join(","),
+                    Style::default().fg(theme.warning_fg),
+                ),
+                Span::styled(" score ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    project.attention_score.to_string(),
                     Style::default().fg(theme.main_fg),
                 ),
             ]));
