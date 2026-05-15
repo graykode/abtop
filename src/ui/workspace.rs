@@ -311,7 +311,7 @@ pub(crate) fn draw_workspace_panel_active(
                     Style::default().fg(theme.main_fg),
                 ),
             ]));
-            for session in project_sessions.into_iter().take(3) {
+            for session in project_sessions.iter().copied().take(3) {
                 let (status, color) = workspace_status(session, theme);
                 let task = session
                     .current_tasks
@@ -334,6 +334,41 @@ pub(crate) fn draw_workspace_panel_active(
                         Style::default().fg(theme.inactive_fg),
                     ),
                 ]));
+            }
+            let timeline: Vec<_> = project_sessions
+                .iter()
+                .flat_map(|session| session.tool_calls.iter())
+                .rev()
+                .take(3)
+                .collect();
+            if !timeline.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled(" timeline ", Style::default().fg(theme.graph_text)),
+                    Span::styled(
+                        timeline.len().to_string(),
+                        Style::default().fg(theme.main_fg),
+                    ),
+                ]));
+                for call in timeline {
+                    let arg_w = area.width.saturating_sub(22) as usize;
+                    lines.push(Line::from(vec![
+                        Span::styled("   ", Style::default().fg(theme.graph_text)),
+                        Span::styled(
+                            truncate_str(&call.name, 10),
+                            Style::default().fg(theme.hi_fg),
+                        ),
+                        Span::styled(" ", Style::default().fg(theme.graph_text)),
+                        Span::styled(
+                            truncate_str(&call.arg, arg_w),
+                            Style::default().fg(theme.main_fg),
+                        ),
+                        Span::styled(" ", Style::default().fg(theme.graph_text)),
+                        Span::styled(
+                            fmt_duration_ms(call.duration_ms),
+                            Style::default().fg(theme.inactive_fg),
+                        ),
+                    ]));
+                }
             }
         }
     }
@@ -374,5 +409,15 @@ fn workspace_idle_text(status: &SessionStatus) -> &'static str {
         SessionStatus::Waiting => "waiting for input",
         SessionStatus::RateLimited => "rate limited",
         SessionStatus::Done => "finished",
+    }
+}
+
+fn fmt_duration_ms(ms: u64) -> String {
+    if ms == 0 {
+        "live".into()
+    } else if ms < 1_000 {
+        format!("{}ms", ms)
+    } else {
+        format!("{:.1}s", ms as f64 / 1_000.0)
     }
 }

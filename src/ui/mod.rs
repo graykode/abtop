@@ -1546,6 +1546,32 @@ mod tests {
     }
 
     #[test]
+    fn desktop_workspace_focus_renders_project_timeline() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.set_narrow_tab(NarrowTab::Workspace);
+        app.workspace_selected = app
+            .workspace_projects
+            .iter()
+            .position(|project| project.name == "api-server")
+            .expect("demo project should exist");
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("timeline"),
+            "workspace should render selected project timeline strip\n{text}"
+        );
+        assert!(
+            text.contains("Bash"),
+            "workspace timeline should include redacted tool names\n{text}"
+        );
+    }
+
+    #[test]
     fn desktop_footer_shows_workspace_shortcut() {
         let text = render_demo(120, 40);
         assert!(
