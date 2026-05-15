@@ -72,8 +72,9 @@ Success criteria:
 
 Goal: make the monitor more useful during daily multi-agent work.
 
-Status: in progress. Read-only Agentic Workspace MVP is implemented; the active
-focus is workflow intelligence and attention signals.
+Status: done for the read-only slice. Agentic Workspace now includes project
+rollups, workflow hints, attention signals, lens filtering, session drill-down,
+timeline summaries, and safe Markdown snapshot export.
 
 First slice:
 
@@ -83,15 +84,12 @@ First slice:
   and port signals. Done.
 - Project selection and selected-project session drill-down. Done.
 - Workspace-to-session activation via `Enter`. Done.
+- Lens filtering, attention sorting, timeline strip, and Markdown snapshot
+  export. Done.
 
 Candidate features:
 
-- Clearer `.dw` task phase and decision detail.
-- Attention queue for needs-input, high context, rate limit, orphan ports, and
-  dirty git.
-- Stronger filtering for project, agent type, status, and PID.
-- Better Codex-specific timeline labeling.
-- Export snapshot to JSON or Markdown.
+- Stronger filtering for agent type, status, and PID.
 - Config presets for hidden panels and hidden agents.
 - Clearer empty and partial-data states.
 

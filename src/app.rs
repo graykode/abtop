@@ -1105,6 +1105,95 @@ impl App {
         self.should_quit = true;
     }
 
+    pub fn workspace_summary_markdown(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# abtop workspace summary\n\n");
+        out.push_str(&format!(
+            "- projects: {}\n- sessions: {}\n- lens: {}\n\n",
+            self.workspace_projects.len(),
+            self.sessions.len(),
+            self.workspace_lens.label()
+        ));
+
+        for project in &self.workspace_projects {
+            out.push_str(&format!("## {}\n\n", safe_export_text(&project.name, 80)));
+            out.push_str(&format!(
+                "- sessions: {} active, {} waiting, {} rate-limited\n",
+                project.active_count, project.waiting_count, project.rate_limited_count
+            ));
+            out.push_str(&format!(
+                "- attention: {} (score {})\n",
+                if project.attention.is_empty() {
+                    "none".to_string()
+                } else {
+                    project.attention.join(",")
+                },
+                project.attention_score
+            ));
+            out.push_str(&format!(
+                "- context: {:.0}%\n- tokens: {}\n- git: +{} ~{}\n- ports: {}\n",
+                project.max_context_percent,
+                fmt_export_tokens(project.total_tokens),
+                project.git_added,
+                project.git_modified,
+                project.port_count
+            ));
+            if project.has_dw {
+                out.push_str(&format!(
+                    "- workflow: task={} phase={} decisions={}\n",
+                    project
+                        .active_task_title
+                        .as_deref()
+                        .map(|title| safe_export_text(title, 80))
+                        .unwrap_or_else(|| {
+                            if project.has_active_task {
+                                "active task".into()
+                            } else {
+                                "none".into()
+                            }
+                        }),
+                    project.active_task_phase.as_deref().unwrap_or("-"),
+                    project.decision_count
+                ));
+            }
+
+            let project_sessions: Vec<_> = self
+                .sessions
+                .iter()
+                .filter(|session| session.cwd == project.cwd)
+                .collect();
+            if !project_sessions.is_empty() {
+                out.push_str("- agents:\n");
+                for session in project_sessions.into_iter().take(5) {
+                    let sid = if session.session_id.len() >= 7 {
+                        &session.session_id[..7]
+                    } else {
+                        &session.session_id
+                    };
+                    let summary = self
+                        .summaries
+                        .get(&session.session_id)
+                        .map(|summary| safe_export_text(summary, 80))
+                        .unwrap_or_else(|| format!("session {}", sid));
+                    let task = session
+                        .current_tasks
+                        .first()
+                        .map(|task| safe_export_text(task, 80))
+                        .unwrap_or_else(|| workspace_export_idle_text(&session.status).into());
+                    out.push_str(&format!(
+                        "  - {} {}: {}\n",
+                        workspace_export_status(&session.status),
+                        summary,
+                        task
+                    ));
+                }
+            }
+            out.push('\n');
+        }
+
+        out
+    }
+
     /// Jump to the terminal running the selected session's Claude process.
     /// In tmux: switch to the pane. Otherwise: no-op.
     pub fn jump_to_session(&mut self) -> JumpOutcome {
@@ -1411,6 +1500,44 @@ fn is_supported_agent_command(cmd: &str) -> bool {
         || crate::collector::process::cmd_has_binary(cmd, "opencode")
 }
 
+fn safe_export_text(value: &str, max_len: usize) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max_len)
+        .collect()
+}
+
+fn fmt_export_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn workspace_export_status(status: &SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Thinking => "think",
+        SessionStatus::Executing => "work",
+        SessionStatus::Waiting => "wait",
+        SessionStatus::RateLimited => "rate",
+        SessionStatus::Done => "done",
+    }
+}
+
+fn workspace_export_idle_text(status: &SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Thinking => "generating reply",
+        SessionStatus::Executing => "working",
+        SessionStatus::Waiting => "waiting for input",
+        SessionStatus::RateLimited => "rate limited",
+        SessionStatus::Done => "finished",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1606,6 +1733,27 @@ mod tests {
             .visible_workspace_project_indices()
             .contains(&app.workspace_selected));
         assert_eq!(app.workspace_selected, before);
+    }
+
+    #[test]
+    fn workspace_summary_markdown_is_redacted_and_structured() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        crate::demo::populate_demo(&mut app);
+
+        let summary = app.workspace_summary_markdown();
+        assert!(summary.contains("# abtop workspace summary"));
+        assert!(summary.contains("## ml-pipeline"));
+        assert!(summary.contains("attention:"));
+        assert!(summary.contains("workflow: task=Batch inference rollout"));
+        assert!(summary.contains("Batch inference endpoint"));
+        assert!(
+            !summary.contains("Refactor Terraform modules for multi-region"),
+            "workspace summary should not fall back to raw prompt text\n{summary}"
+        );
     }
 
     #[test]

@@ -49,6 +49,7 @@ Pre-built binaries for all platforms are available on the [GitHub Releases](http
 ```bash
 abtop                    # Launch TUI
 abtop --once             # Print snapshot and exit
+abtop --workspace-summary # Print redacted Workspace Markdown and exit
 abtop --setup            # Install rate limit collection hook
 abtop --theme dracula    # Launch with a specific theme
 ```

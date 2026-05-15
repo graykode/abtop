@@ -14,7 +14,8 @@ Status values:
 
 ## Current Focus
 
-`AW-013`: add a safe Workspace snapshot/export surface.
+`M3 readiness`: keep mutating control actions blocked until product and audit
+decisions are made.
 
 ## Task Board
 
@@ -32,7 +33,7 @@ Status values:
 | AW-010 | Done | Workspace risk/attention queue | Sort and flag projects needing input, high context, open ports, or dirty git. | `workspace_attention_scores_and_sorts_projects`; `desktop_workspace_focus_renders_attention_signals`; this commit |
 | AW-011 | Done | Workspace filter/lens controls | Add local-only lens cycling for all, attention, and `.dw` projects. | `workspace_lens_filters_navigation_to_matching_projects`; `desktop_workspace_focus_renders_lens_state`; this commit |
 | AW-012 | Done | Workspace timeline strip | Show recent selected-project tool calls and file access summaries without prompt/file contents. | `desktop_workspace_focus_renders_project_timeline`; this commit |
-| AW-013 | Doing | Snapshot/export surface | Add safe Markdown or JSON snapshot for sharing current Workspace state. | Snapshot tests with redaction assertions |
+| AW-013 | Done | Snapshot/export surface | Add safe Markdown snapshot for sharing current Workspace state. | `workspace_summary_markdown_is_redacted_and_structured`; `cargo run -- --demo --workspace-summary`; this commit |
 | AW-014 | Blocked | Mutating control actions | Dispatch/reply/restart/archive are intentionally blocked until read-only UX and audit story are stable. | Requires product decision and confirmation UX |
 
 ## Milestones
@@ -58,11 +59,13 @@ Status: `Done`
 
 ### M2: Workflow Intelligence
 
-Status: `Doing`
+Status: `Done`
 
-- Improve `.dw` task/decision display.
-- Add attention queue signals.
-- Preserve read-only behavior and privacy boundaries.
+- `.dw` task/decision display is clearer.
+- Attention queue signals are visible and sortable.
+- Lens controls filter all, attention, and `.dw` projects.
+- Selected-project timeline strip is redacted.
+- Workspace Markdown snapshot export is safe-to-share by default.
 
 ### M3: Operator Controls
 

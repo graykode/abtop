@@ -83,9 +83,10 @@ fn main() -> io::Result<()> {
 
     let demo_mode = std::env::args().any(|a| a == "--demo");
     let exit_on_jump = std::env::args().any(|a| a == "--exit-on-jump");
+    let workspace_summary = std::env::args().any(|a| a == "--workspace-summary");
 
     // --once flag: print snapshot and exit
-    if std::env::args().any(|a| a == "--once") {
+    if std::env::args().any(|a| a == "--once") || workspace_summary {
         log_info!("snapshot mode demo={}", demo_mode);
         let mut app = App::new_with_config(
             initial_theme.unwrap_or_default(),
@@ -106,7 +107,11 @@ fn main() -> io::Result<()> {
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
-        print_snapshot(&app);
+        if workspace_summary {
+            print!("{}", app.workspace_summary_markdown());
+        } else {
+            print_snapshot(&app);
+        }
         log_info!("snapshot complete sessions={}", app.sessions.len());
         return Ok(());
     }

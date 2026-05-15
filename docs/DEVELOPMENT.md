@@ -75,6 +75,7 @@ Snapshot mode verifies collector output without opening the TUI:
 ```powershell
 abtop --once
 abtop --demo --once
+abtop --demo --workspace-summary
 ```
 
 Interactive mode verifies the full realtime UI:
