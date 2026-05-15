@@ -22,6 +22,10 @@ Sleep 2s
 Type "a"
 Sleep 1s
 
+# Switch to the attention lens.
+Type "o"
+Sleep 1s
+
 # Move project selection inside the Workspace focus view.
 Type "j"
 Sleep 2s

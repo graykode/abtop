@@ -90,6 +90,23 @@ impl NarrowSection {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceLens {
+    All,
+    Attention,
+    Workflow,
+}
+
+impl WorkspaceLens {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Attention => "attention",
+            Self::Workflow => ".dw",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct WorkspaceProject {
     pub name: String,
@@ -320,6 +337,7 @@ pub struct App {
     pub narrow_tab: NarrowTab,
     pub workspace_focus: bool,
     pub workspace_selected: usize,
+    pub workspace_lens: WorkspaceLens,
     pub active_narrow_section: Option<NarrowSection>,
     pub maximized_narrow_section: Option<NarrowSection>,
     /// MCP servers detected on the most recent tick (sourced from
@@ -389,6 +407,7 @@ impl App {
             narrow_tab: NarrowTab::Work,
             workspace_focus: false,
             workspace_selected: 0,
+            workspace_lens: WorkspaceLens::All,
             active_narrow_section: Some(NarrowSection::Sessions),
             maximized_narrow_section: None,
             mcp_servers: Vec::new(),
@@ -563,23 +582,53 @@ impl App {
     }
 
     pub fn select_next_workspace_project(&mut self) {
-        if self.workspace_projects.is_empty() {
+        let visible = self.visible_workspace_project_indices();
+        if visible.is_empty() {
             self.workspace_selected = 0;
             return;
         }
-        self.workspace_selected = (self.workspace_selected + 1) % self.workspace_projects.len();
+        let pos = visible
+            .iter()
+            .position(|&idx| idx == self.workspace_selected)
+            .unwrap_or(0);
+        self.workspace_selected = visible[(pos + 1) % visible.len()];
     }
 
     pub fn select_prev_workspace_project(&mut self) {
-        if self.workspace_projects.is_empty() {
+        let visible = self.visible_workspace_project_indices();
+        if visible.is_empty() {
             self.workspace_selected = 0;
             return;
         }
-        self.workspace_selected = if self.workspace_selected == 0 {
-            self.workspace_projects.len() - 1
-        } else {
-            self.workspace_selected - 1
+        let pos = visible
+            .iter()
+            .position(|&idx| idx == self.workspace_selected)
+            .unwrap_or(0);
+        self.workspace_selected = visible[(pos + visible.len() - 1) % visible.len()];
+    }
+
+    pub fn cycle_workspace_lens(&mut self) {
+        self.workspace_lens = match self.workspace_lens {
+            WorkspaceLens::All => WorkspaceLens::Attention,
+            WorkspaceLens::Attention => WorkspaceLens::Workflow,
+            WorkspaceLens::Workflow => WorkspaceLens::All,
         };
+        self.clamp_workspace_selection();
+    }
+
+    pub fn visible_workspace_project_indices(&self) -> Vec<usize> {
+        self.workspace_projects
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, project)| {
+                let visible = match self.workspace_lens {
+                    WorkspaceLens::All => true,
+                    WorkspaceLens::Attention => project.attention_score > 0,
+                    WorkspaceLens::Workflow => project.has_dw,
+                };
+                visible.then_some(idx)
+            })
+            .collect()
     }
 
     pub fn activate_selected_workspace_project(&mut self) -> bool {
@@ -602,10 +651,11 @@ impl App {
     }
 
     fn clamp_workspace_selection(&mut self) {
-        if self.workspace_projects.is_empty() {
+        let visible = self.visible_workspace_project_indices();
+        if visible.is_empty() {
             self.workspace_selected = 0;
-        } else if self.workspace_selected >= self.workspace_projects.len() {
-            self.workspace_selected = self.workspace_projects.len() - 1;
+        } else if !visible.contains(&self.workspace_selected) {
+            self.workspace_selected = visible[0];
         }
     }
 
@@ -1524,6 +1574,38 @@ mod tests {
         assert!(projects[0].attention.iter().any(|label| label == "input"));
         assert!(projects[0].attention.iter().any(|label| label == "ports"));
         assert!(projects[0].attention.iter().any(|label| label == "git"));
+    }
+
+    #[test]
+    fn workspace_lens_filters_navigation_to_matching_projects() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        crate::demo::populate_demo(&mut app);
+
+        assert_eq!(app.workspace_lens, WorkspaceLens::All);
+        app.cycle_workspace_lens();
+        assert_eq!(app.workspace_lens, WorkspaceLens::Attention);
+        assert!(app
+            .visible_workspace_project_indices()
+            .iter()
+            .all(|&idx| app.workspace_projects[idx].attention_score > 0));
+
+        app.cycle_workspace_lens();
+        assert_eq!(app.workspace_lens, WorkspaceLens::Workflow);
+        assert!(app
+            .visible_workspace_project_indices()
+            .iter()
+            .all(|&idx| app.workspace_projects[idx].has_dw));
+
+        let before = app.workspace_selected;
+        app.select_next_workspace_project();
+        assert!(app
+            .visible_workspace_project_indices()
+            .contains(&app.workspace_selected));
+        assert_eq!(app.workspace_selected, before);
     }
 
     #[test]

@@ -218,6 +218,7 @@ fn run_app(
                             KeyCode::Left | KeyCode::BackTab => app.select_prev_narrow_tab(),
                             KeyCode::Char('w') => app.set_narrow_tab(app::NarrowTab::Work),
                             KeyCode::Char('a') => app.toggle_workspace_focus(),
+                            KeyCode::Char('o') if app.workspace_focus => app.cycle_workspace_lens(),
                             KeyCode::Char('u') => app.set_narrow_tab(app::NarrowTab::Usage),
                             KeyCode::Char('s') => app.set_narrow_tab(app::NarrowTab::System),
                             KeyCode::Char('+') | KeyCode::Char('=') => {

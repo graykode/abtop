@@ -14,7 +14,7 @@ Status values:
 
 ## Current Focus
 
-`AW-011`: add local-only Workspace lens controls.
+`AW-012`: add a selected-project timeline strip.
 
 ## Task Board
 
@@ -30,8 +30,8 @@ Status values:
 | AW-008 | Done | Roadmap and task tracking | Add this tracker and keep roadmap status explicit. | `cargo test workspace`; this commit |
 | AW-009 | Done | Workspace task state lens | Surface `.dw` active task title, phase, and decision counts more clearly. | `workspace_project_reads_dw_active_task_metadata`; `desktop_workspace_focus_renders_dw_task_lens`; this commit |
 | AW-010 | Done | Workspace risk/attention queue | Sort and flag projects needing input, high context, open ports, or dirty git. | `workspace_attention_scores_and_sorts_projects`; `desktop_workspace_focus_renders_attention_signals`; this commit |
-| AW-011 | Doing | Workspace filter/lens controls | Add local-only filters for project state, agent CLI, status, and `.dw` presence. | UI tests plus demo tape |
-| AW-012 | Backlog | Workspace timeline strip | Show recent selected-project tool calls and file access summaries without prompt/file contents. | UI tests with demo transcript data |
+| AW-011 | Done | Workspace filter/lens controls | Add local-only lens cycling for all, attention, and `.dw` projects. | `workspace_lens_filters_navigation_to_matching_projects`; `desktop_workspace_focus_renders_lens_state`; this commit |
+| AW-012 | Doing | Workspace timeline strip | Show recent selected-project tool calls and file access summaries without prompt/file contents. | UI tests with demo transcript data |
 | AW-013 | Backlog | Snapshot/export surface | Add safe Markdown or JSON snapshot for sharing current Workspace state. | Snapshot tests with redaction assertions |
 | AW-014 | Blocked | Mutating control actions | Dispatch/reply/restart/archive are intentionally blocked until read-only UX and audit story are stable. | Requires product decision and confirmation UX |
 

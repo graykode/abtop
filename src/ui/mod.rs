@@ -1524,6 +1524,28 @@ mod tests {
     }
 
     #[test]
+    fn desktop_workspace_focus_renders_lens_state() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.set_narrow_tab(NarrowTab::Workspace);
+        app.cycle_workspace_lens();
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("lens"),
+            "workspace should render active lens state\n{text}"
+        );
+        assert!(
+            text.contains("attention"),
+            "workspace should render attention lens label\n{text}"
+        );
+    }
+
+    #[test]
     fn desktop_footer_shows_workspace_shortcut() {
         let text = render_demo(120, 40);
         assert!(

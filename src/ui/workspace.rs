@@ -58,6 +58,11 @@ pub(crate) fn draw_workspace_panel_active(
                 theme.inactive_fg
             }),
         ),
+        Span::styled("  lens ", Style::default().fg(theme.graph_text)),
+        Span::styled(
+            app.workspace_lens.label(),
+            Style::default().fg(theme.main_fg),
+        ),
     ]));
     lines.push(Line::from(vec![
         Span::styled(" active ", Style::default().fg(theme.graph_text)),
@@ -97,18 +102,23 @@ pub(crate) fn draw_workspace_panel_active(
         .saturating_sub(5 + detail_rows as u16)
         .max(project_rows as u16) as usize;
     let max_projects = (available_rows / project_rows).max(1);
-    let start = if app.workspace_selected >= max_projects {
-        app.workspace_selected + 1 - max_projects
+    let visible_projects = app.visible_workspace_project_indices();
+    let selected_pos = visible_projects
+        .iter()
+        .position(|&idx| idx == app.workspace_selected)
+        .unwrap_or(0);
+    let start = if selected_pos >= max_projects {
+        selected_pos + 1 - max_projects
     } else {
         0
     };
-    for (idx, project) in app
-        .workspace_projects
+    for idx in visible_projects
         .iter()
-        .enumerate()
+        .copied()
         .skip(start)
         .take(max_projects)
     {
+        let project = &app.workspace_projects[idx];
         let selected = idx == app.workspace_selected;
         let name_w = area.width.saturating_sub(22).clamp(8, 24) as usize;
         let dw = if project.has_dw { " dw" } else { "" };
@@ -234,6 +244,8 @@ pub(crate) fn draw_workspace_panel_active(
             ),
             Span::styled("  enter ", Style::default().fg(theme.graph_text)),
             Span::styled("open", Style::default().fg(theme.main_fg)),
+            Span::styled("  o ", Style::default().fg(theme.graph_text)),
+            Span::styled("lens", Style::default().fg(theme.main_fg)),
         ]));
         if project.has_dw {
             lines.push(Line::from(vec![
@@ -329,6 +341,11 @@ pub(crate) fn draw_workspace_panel_active(
     if app.workspace_projects.is_empty() {
         lines.push(Line::from(Span::styled(
             " no live workspace data",
+            Style::default().fg(theme.inactive_fg),
+        )));
+    } else if visible_projects.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " no projects match lens",
             Style::default().fg(theme.inactive_fg),
         )));
     }
