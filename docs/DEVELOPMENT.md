@@ -28,6 +28,9 @@ git push -u origin codex/<short-feature-name>
 Detailed upstream merge, cherry-pick, and conflict-resolution rules live in
 `docs/UPSTREAM_SYNC.md`.
 
+Multi-agent task ownership, status, and handoff rules live in
+`docs/EXECUTION_BOARD.md` and `docs/AGENT_HANDOFF.md`.
+
 ## Local Windows Toolchain
 
 Required:

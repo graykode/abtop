@@ -3,6 +3,9 @@
 This roadmap organizes future work around product value. It complements
 `docs/ROADMAP.md`, which still tracks platform and implementation hygiene.
 
+Execution status for agent work lives in `docs/EXECUTION_BOARD.md`. Agent
+handoff rules live in `docs/AGENT_HANDOFF.md`.
+
 ## North Star
 
 Make agentic software work observable, task-aware, and safe to hand off.

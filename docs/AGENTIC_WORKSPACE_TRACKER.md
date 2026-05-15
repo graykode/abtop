@@ -4,6 +4,10 @@ This tracker is the working task board for the Agentic Workspace effort. Keep
 it updated whenever a slice lands so the fork has a clear record of what is
 done, what is active, and what is next.
 
+For the current product-led multi-agent execution board, use
+`docs/EXECUTION_BOARD.md`. This file preserves the completed read-only Agentic
+Workspace history and the blocked operator-controls decision.
+
 Status values:
 
 - `Done`: implemented, tested, and pushed.

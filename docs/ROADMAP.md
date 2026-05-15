@@ -13,6 +13,8 @@ Product strategy and the next product-led roadmap live in
 
 Fork/upstream sync policy lives in `docs/UPSTREAM_SYNC.md`.
 
+Current multi-agent execution status lives in `docs/EXECUTION_BOARD.md`.
+
 ## Baseline
 
 The current fork can build, test, install, and run on native Windows.
