@@ -25,6 +25,9 @@ Push feature branches to the fork:
 git push -u origin codex/<short-feature-name>
 ```
 
+Detailed upstream merge, cherry-pick, and conflict-resolution rules live in
+`docs/UPSTREAM_SYNC.md`.
+
 ## Local Windows Toolchain
 
 Required:

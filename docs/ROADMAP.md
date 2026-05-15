@@ -11,6 +11,8 @@ Product strategy and the next product-led roadmap live in
 `docs/PRODUCT_STRATEGY.md`, `docs/COMPETITIVE_MAP.md`, and
 `docs/ROADMAP_V2.md`.
 
+Fork/upstream sync policy lives in `docs/UPSTREAM_SYNC.md`.
+
 ## Baseline
 
 The current fork can build, test, install, and run on native Windows.
