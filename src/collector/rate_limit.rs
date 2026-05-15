@@ -106,7 +106,8 @@ fn codex_cache_path() -> Option<PathBuf> {
 
 fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
     let content = std::fs::read_to_string(path).ok()?;
-    let file: RateLimitFile = serde_json::from_str(&content).ok()?;
+    let content = content.trim_start_matches('\u{feff}');
+    let file: RateLimitFile = serde_json::from_str(content).ok()?;
 
     // Reject if both windows are absent
     if file.five_hour.is_none() && file.seven_day.is_none() {
@@ -127,4 +128,26 @@ fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
         seven_day_resets_at: file.seven_day.as_ref().map(|w| w.resets_at),
         updated_at: file.updated_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_rate_limit_file_with_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abtop-rate-limits.json");
+        std::fs::write(
+            &path,
+            "\u{feff}{\"source\":\"claude\",\"five_hour\":{\"used_percentage\":31,\"resets_at\":1778827200},\"seven_day\":{\"used_percentage\":45,\"resets_at\":1779091200},\"updated_at\":1778816120}",
+        )
+        .unwrap();
+
+        let info = read_rate_file(&path, "claude").unwrap();
+
+        assert_eq!(info.source, "claude");
+        assert_eq!(info.five_hour_pct, Some(31.0));
+        assert_eq!(info.seven_day_pct, Some(45.0));
+    }
 }

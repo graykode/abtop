@@ -82,7 +82,9 @@ if ($env:CLAUDE_CONFIG_DIR) {
 
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 $OutputPath = Join-Path $ConfigDir "abtop-rate-limits.json"
-$Out | ConvertTo-Json -Depth 4 -Compress | Set-Content -Path $OutputPath -Encoding UTF8
+$Json = $Out | ConvertTo-Json -Depth 4 -Compress
+$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+[System.IO.File]::WriteAllText($OutputPath, $Json, $Utf8NoBom)
 "#;
 
 #[derive(Debug)]
