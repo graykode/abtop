@@ -1,7 +1,7 @@
 use crate::collector::{read_rate_limits, McpServer, MultiCollector};
 use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
-use crate::task::{read_project_state, TaskStatus};
+use crate::task::{read_project_state, DwTaskSummary, TaskStatus};
 use crate::theme::Theme;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
@@ -95,6 +95,7 @@ pub enum WorkspaceLens {
     All,
     Attention,
     Workflow,
+    Tasks,
 }
 
 impl WorkspaceLens {
@@ -103,7 +104,44 @@ impl WorkspaceLens {
             Self::All => "all",
             Self::Attention => "attention",
             Self::Workflow => ".dw",
+            Self::Tasks => "tasks",
         }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkspaceTask {
+    pub title: String,
+    pub phase: Option<String>,
+    pub status: TaskStatus,
+    pub raw_status: Option<String>,
+    pub acceptance_count: usize,
+    pub verification_count: usize,
+    pub completed_verification_count: usize,
+    pub is_active: bool,
+}
+
+impl WorkspaceTask {
+    fn from_summary(summary: DwTaskSummary) -> Self {
+        let title = summary
+            .title
+            .unwrap_or_else(|| summary.path.to_string_lossy().into_owned());
+        Self {
+            title,
+            phase: summary.phase,
+            status: summary.status,
+            raw_status: summary.raw_status,
+            acceptance_count: summary.acceptance_count,
+            verification_count: summary.verification_count,
+            completed_verification_count: summary.completed_verification_count,
+            is_active: summary.is_active,
+        }
+    }
+
+    pub fn status_label(&self) -> &str {
+        self.raw_status
+            .as_deref()
+            .unwrap_or_else(|| self.status.label())
     }
 }
 
@@ -133,6 +171,7 @@ pub struct WorkspaceProject {
     pub record_count: usize,
     pub verification_count: usize,
     pub completed_verification_count: usize,
+    pub tasks: Vec<WorkspaceTask>,
     pub attention_score: u32,
     pub attention: Vec<String>,
 }
@@ -191,6 +230,17 @@ impl WorkspaceProject {
         self.record_count = state.record_count;
         self.verification_count = state.verification_count;
         self.completed_verification_count = state.completed_verification_count;
+        self.tasks = state
+            .tasks
+            .into_iter()
+            .map(WorkspaceTask::from_summary)
+            .collect();
+        self.tasks.sort_by(|a, b| {
+            b.is_active
+                .cmp(&a.is_active)
+                .then_with(|| task_status_rank(a.status).cmp(&task_status_rank(b.status)))
+                .then_with(|| a.title.cmp(&b.title))
+        });
 
         if let Some(active_task) = state.active_task {
             self.has_active_task = true;
@@ -248,6 +298,17 @@ impl WorkspaceProject {
             self.attention_score += 10;
             self.attention.push("no-task".into());
         }
+    }
+}
+
+fn task_status_rank(status: TaskStatus) -> u8 {
+    match status {
+        TaskStatus::Blocked => 0,
+        TaskStatus::Review => 1,
+        TaskStatus::Doing => 2,
+        TaskStatus::Ready => 3,
+        TaskStatus::Unknown => 4,
+        TaskStatus::Done => 5,
     }
 }
 
@@ -565,7 +626,8 @@ impl App {
         self.workspace_lens = match self.workspace_lens {
             WorkspaceLens::All => WorkspaceLens::Attention,
             WorkspaceLens::Attention => WorkspaceLens::Workflow,
-            WorkspaceLens::Workflow => WorkspaceLens::All,
+            WorkspaceLens::Workflow => WorkspaceLens::Tasks,
+            WorkspaceLens::Tasks => WorkspaceLens::All,
         };
         self.clamp_workspace_selection();
     }
@@ -579,6 +641,7 @@ impl App {
                     WorkspaceLens::All => true,
                     WorkspaceLens::Attention => project.attention_score > 0,
                     WorkspaceLens::Workflow => project.has_dw,
+                    WorkspaceLens::Tasks => project.task_count > 0,
                 };
                 visible.then_some(idx)
             })
@@ -1715,6 +1778,13 @@ mod tests {
             .visible_workspace_project_indices()
             .iter()
             .all(|&idx| app.workspace_projects[idx].has_dw));
+
+        app.cycle_workspace_lens();
+        assert_eq!(app.workspace_lens, WorkspaceLens::Tasks);
+        assert!(app
+            .visible_workspace_project_indices()
+            .iter()
+            .all(|&idx| app.workspace_projects[idx].task_count > 0));
 
         let before = app.workspace_selected;
         app.select_next_workspace_project();

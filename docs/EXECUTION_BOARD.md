@@ -22,8 +22,8 @@ Use it together with `docs/PRODUCT_STRATEGY.md`, `docs/ROADMAP_V2.md`, and
 
 ## Current Focus
 
-`P2-VIS-01`: add a read-only task tree view on top of the new dw-kit task
-model.
+`P2-VIS-02`: prototype the mind-map data model after the read-only TUI task
+tree has landed.
 
 ## Task Board
 
@@ -38,55 +38,57 @@ model.
 | P1-T02 | Done | Codex + Beauvoir | Task-aware workspace | Workspace task detail pane v2 | Show active task, phase, acceptance criteria count, decisions, verification status, and next action. | P1-T01 | `src/app.rs`, `src/ui/workspace.rs`, task model | `desktop_workspace_focus_renders_dw_task_lens`; `cargo test workspace` |
 | P1-T03 | Done | Codex | Task-aware workspace | Safe task snapshot export | Extend `--workspace-summary` with task state without prompt/file contents. | P1-T01 | `src/app.rs`, tests, docs | `workspace_summary_markdown_is_redacted_and_structured`; demo summary output includes workflow counts |
 | P1-T04 | Done | Peirce + Codex | Task-aware workspace | Task status normalization | Map dw-kit state to `ready`, `doing`, `blocked`, `review`, `done`, and `unknown`. | P1-T01 | task model, tests | `task::dw::tests::*`; app next-action mapping |
-| P2-VIS-01 | Next | Unassigned | Visual task viewer | TUI task tree view | Add read-only task tree before any graphical mind map. | P1-T01, P1-T02 | UI module, tests | Pending |
-| P2-VIS-02 | Backlog | Unassigned | Visual task viewer | Mind-map data model prototype | Create graph nodes/edges for tasks, decisions, sessions, files, and risks. | P2-VIS-01 | `src/task_graph/*`, docs | Pending |
+| P2-VIS-01 | Done | Codex | Visual task viewer | TUI task tree view | Add read-only task tree before any graphical mind map. | P1-T01, P1-T02 | UI module, tests | `cargo fmt -- --check`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; refreshed `assets/workspace-demo.gif` |
+| P2-VIS-02 | Next | Unassigned | Visual task viewer | Mind-map data model prototype | Create graph nodes/edges for tasks, decisions, sessions, files, and risks. | P2-VIS-01 | `src/task_graph/*`, docs | Pending |
 | P3-EVD-01 | Backlog | Unassigned | Evidence bundles | Per-task evidence bundle | Export safe per-task evidence: sessions, commands, files touched, checks, decisions. | P1-T03 | export module, tests | Pending |
 | P4-AUD-01 | Blocked | Unassigned | Controls | Local audit log | Add append-only audit log before any mutating control action. | Product decision | audit module, docs | Pending |
 | P4-CTL-01 | Blocked | Unassigned | Controls | Mutating control actions | Kill/restart/archive/dispatch actions with confirmation and audit. | P4-AUD-01 | app/ui/control modules | Pending |
 
-## Next Task Detail: P2-VIS-01
+## Next Task Detail: P2-VIS-02
 
 Target user:
 
-- Solo power user and small team using dw-kit to manage project tasks across
-  several agent sessions.
+- Solo power user and small team that wants to understand how tasks, agents,
+  decisions, files, and risks relate across projects.
 
 Pain solved:
 
-- The workspace panel now knows task metadata, but the user still needs a
-  structured task list/tree to scan task relationships before any future
-  mind-map view.
+- The TUI task tree is useful for scanning task state, but it does not yet model
+  cross-object relationships for a future mind-map or graph lens.
 
 Hypothesis:
 
-- A read-only TUI task tree creates immediate value and derisks the later
-  graphical mind-map product direction.
+- A separate graph data model lets us experiment with mind-map UX without
+  entangling it with terminal rendering.
 
 Data sources:
 
-- `crate::task::read_project_state(cwd)`,
 - `WorkspaceProject` task rollups,
-- later optional graph model for task relationships.
+- `WorkspaceTask` summaries,
+- session summaries, tool calls, decisions, records, and touched files where
+  safe to expose.
 
 Privacy risk:
 
-- Task files may include sensitive text. Continue rendering only titles,
-  status, counts, short sanitized metadata, and relationship labels.
+- Relationship graphs can leak sensitive context through labels. Use only
+  sanitized task titles, counts, relative identifiers, and redacted relationship
+  types.
 
 Expected design:
 
-- Add a compact task-tree section or lens that lists task title/status/phase.
-- Keep the default workspace view dense and readable.
-- Avoid drawing raw task body, checklist text, prompt text, or file contents.
+- Add a pure data model first: nodes, edges, node kinds, and redacted labels.
+- Keep rendering separate from graph construction.
+- Start with tests over demo data and `.dw` fixtures before adding UI.
 
 Suggested write scope:
 
-- `src/ui/workspace.rs`,
-- `src/app.rs` only for data shape if needed,
-- tests in `src/ui/mod.rs` and `src/app.rs`.
+- `src/task_graph/*`,
+- `src/app.rs` only if a bridge is needed,
+- tests for graph construction and privacy boundaries.
 
 EVD target:
 
+- `cargo test task_graph`,
 - `cargo test workspace`,
 - `cargo fmt -- --check`,
 - `cargo clippy --all-targets --all-features -- -D warnings`.

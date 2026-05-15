@@ -593,5 +593,37 @@ pub fn populate_demo(app: &mut App) {
         project.record_count = 8;
         project.verification_count = 4;
         project.completed_verification_count = 2;
+        project.tasks = vec![
+            crate::app::WorkspaceTask {
+                title: "Batch inference rollout".into(),
+                phase: Some("Execute".into()),
+                status: crate::task::TaskStatus::Doing,
+                raw_status: Some("Doing".into()),
+                acceptance_count: 6,
+                verification_count: 4,
+                completed_verification_count: 2,
+                is_active: true,
+            },
+            crate::app::WorkspaceTask {
+                title: "Dataset drift guardrails".into(),
+                phase: Some("Plan".into()),
+                status: crate::task::TaskStatus::Blocked,
+                raw_status: Some("Blocked".into()),
+                acceptance_count: 3,
+                verification_count: 1,
+                completed_verification_count: 0,
+                is_active: false,
+            },
+            crate::app::WorkspaceTask {
+                title: "Model card refresh".into(),
+                phase: Some("Review".into()),
+                status: crate::task::TaskStatus::Review,
+                raw_status: Some("Review".into()),
+                acceptance_count: 2,
+                verification_count: 2,
+                completed_verification_count: 1,
+                is_active: false,
+            },
+        ];
     }
 }

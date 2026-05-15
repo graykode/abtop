@@ -1509,6 +1509,18 @@ mod tests {
             text.contains("decisions"),
             "workspace should render .dw decision count label\n{text}"
         );
+        assert!(
+            text.contains("task tree"),
+            "workspace should render a read-only task tree\n{text}"
+        );
+        assert!(
+            text.contains("Dataset drift guardrails"),
+            "workspace task tree should show sibling tasks without body text\n{text}"
+        );
+        assert!(
+            text.contains("2/4"),
+            "workspace task tree should show verification progress\n{text}"
+        );
     }
 
     #[test]
@@ -1551,6 +1563,16 @@ mod tests {
         assert!(
             text.contains("attention"),
             "workspace should render attention lens label\n{text}"
+        );
+
+        app.cycle_workspace_lens();
+        app.cycle_workspace_lens();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(
+            text.contains("tasks"),
+            "workspace should render task lens label\n{text}"
         );
     }
 

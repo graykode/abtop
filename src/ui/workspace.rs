@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, WorkspaceTask};
 use crate::model::{AgentSession, SessionStatus};
 use crate::theme::Theme;
 use ratatui::layout::Rect;
@@ -323,6 +323,18 @@ pub(crate) fn draw_workspace_panel_active(
                     Style::default().fg(theme.proc_misc),
                 ),
             ]));
+            if !project.tasks.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled(" task tree ", Style::default().fg(theme.graph_text)),
+                    Span::styled(
+                        format!("{} items", project.tasks.len()),
+                        Style::default().fg(theme.main_fg),
+                    ),
+                ]));
+                for task in project.tasks.iter().take(task_tree_limit(area.height)) {
+                    lines.push(render_task_tree_line(task, area.width, theme));
+                }
+            }
         }
         if !project.attention.is_empty() {
             lines.push(Line::from(vec![
@@ -434,6 +446,70 @@ pub(crate) fn draw_workspace_panel_active(
 
     let block = btop_block_active("workspace", "A", theme.mem_box, theme, active);
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn task_tree_limit(height: u16) -> usize {
+    if height >= 36 {
+        6
+    } else if height >= 28 {
+        4
+    } else {
+        2
+    }
+}
+
+fn render_task_tree_line(task: &WorkspaceTask, width: u16, theme: &Theme) -> Line<'static> {
+    let marker = if task.is_active { "*" } else { "-" };
+    let title_width = width.saturating_sub(54).clamp(12, 42) as usize;
+    let phase = task.phase.as_deref().unwrap_or("-");
+    Line::from(vec![
+        Span::styled("   ", Style::default().fg(theme.graph_text)),
+        Span::styled(marker, Style::default().fg(theme.hi_fg)),
+        Span::styled(" ", Style::default().fg(theme.graph_text)),
+        Span::styled(
+            truncate_str(&task.title, title_width),
+            Style::default().fg(if task.is_active {
+                theme.main_fg
+            } else {
+                theme.inactive_fg
+            }),
+        ),
+        Span::styled("  ", Style::default().fg(theme.graph_text)),
+        Span::styled(
+            task.status_label().to_string(),
+            task_status_style(task, theme),
+        ),
+        Span::styled(" phase ", Style::default().fg(theme.graph_text)),
+        Span::styled(
+            truncate_str(phase, 12),
+            Style::default().fg(theme.proc_misc),
+        ),
+        Span::styled(" v ", Style::default().fg(theme.graph_text)),
+        Span::styled(
+            format!(
+                "{}/{}",
+                task.completed_verification_count, task.verification_count
+            ),
+            Style::default().fg(theme.main_fg),
+        ),
+        Span::styled(" a ", Style::default().fg(theme.graph_text)),
+        Span::styled(
+            task.acceptance_count.to_string(),
+            Style::default().fg(theme.main_fg),
+        ),
+    ])
+}
+
+fn task_status_style(task: &WorkspaceTask, theme: &Theme) -> Style {
+    match task.status {
+        crate::task::TaskStatus::Blocked => Style::default().fg(theme.warning_fg),
+        crate::task::TaskStatus::Doing => Style::default().fg(theme.proc_misc),
+        crate::task::TaskStatus::Review => Style::default().fg(theme.hi_fg),
+        crate::task::TaskStatus::Done => Style::default().fg(theme.inactive_fg),
+        crate::task::TaskStatus::Ready | crate::task::TaskStatus::Unknown => {
+            Style::default().fg(theme.main_fg)
+        }
+    }
 }
 
 fn workspace_status(
