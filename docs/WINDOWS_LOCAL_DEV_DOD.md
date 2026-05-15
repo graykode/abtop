@@ -85,3 +85,7 @@ this local install. A future dependency refresh should evaluate upgrading
 The Claude collector test helper now serializes session JSON with `serde_json`
 instead of string interpolation. This preserves Windows paths correctly by
 escaping backslashes in `cwd` and keeps the Windows test suite green.
+
+Windows TCP port detection now parses `netstat -ano -p TCP` by explicit columns
+instead of treating the first token as the local address. Tests cover IPv4,
+IPv6, duplicate dual-stack rows, and non-listening rows.

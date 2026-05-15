@@ -328,31 +328,50 @@ pub fn get_listening_ports() -> HashMap<u32, Vec<u16>> {
 
 #[cfg(target_os = "windows")]
 pub fn get_listening_ports() -> HashMap<u32, Vec<u16>> {
-    let mut map: HashMap<u32, Vec<u16>> = HashMap::new();
     let output = Command::new("netstat")
         .args(["-ano", "-p", "TCP"])
         .output()
         .ok();
 
-    if let Some(output) = output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if !line.contains("LISTENING") {
-                continue;
-            }
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            let local_addr = parts.first();
-            let pid_str = parts.last();
-            if let (Some(addr), Some(pid_s)) = (local_addr, pid_str) {
-                if let (Some(port_str), Ok(pid)) = (addr.rsplit(':').next(), pid_s.parse::<u32>()) {
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        map.entry(pid).or_default().push(port);
-                    }
-                }
-            }
+    output
+        .map(|output| parse_windows_netstat_ports(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_windows_netstat_ports(output: &str) -> HashMap<u32, Vec<u16>> {
+    let mut map: HashMap<u32, Vec<u16>> = HashMap::new();
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 || !parts[0].eq_ignore_ascii_case("TCP") {
+            continue;
+        }
+        if !parts[3].eq_ignore_ascii_case("LISTENING") {
+            continue;
+        }
+
+        let local_addr = parts[1];
+        let pid_str = parts[4];
+        if let (Some(port), Ok(pid)) = (parse_socket_port(local_addr), pid_str.parse::<u32>()) {
+            map.entry(pid).or_default().push(port);
         }
     }
+
+    for ports in map.values_mut() {
+        ports.sort_unstable();
+        ports.dedup();
+    }
     map
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_socket_port(addr: &str) -> Option<u16> {
+    if addr.starts_with('[') {
+        let (_, port) = addr.rsplit_once("]:")?;
+        return port.parse().ok();
+    }
+    let (_, port) = addr.rsplit_once(':')?;
+    port.parse().ok()
 }
 
 #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
@@ -659,5 +678,44 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(20, proc(20, 99));
         assert!(!is_descendant_of(20, 7, &m));
+    }
+
+    #[test]
+    fn parse_windows_netstat_ports_reads_listening_tcp_rows() {
+        let output = r#"
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:3000           0.0.0.0:0              LISTENING       1234
+  TCP    127.0.0.1:5173         0.0.0.0:0              LISTENING       1234
+  TCP    [::]:8080              [::]:0                 LISTENING       4321
+  TCP    [::1]:9229             [::]:0                 LISTENING       4321
+  TCP    127.0.0.1:6000         127.0.0.1:50000        ESTABLISHED     9999
+"#;
+
+        let ports = parse_windows_netstat_ports(output);
+
+        assert_eq!(ports.get(&1234), Some(&vec![3000, 5173]));
+        assert_eq!(ports.get(&4321), Some(&vec![8080, 9229]));
+        assert!(!ports.contains_key(&9999));
+    }
+
+    #[test]
+    fn parse_windows_netstat_ports_deduplicates_repeated_rows() {
+        let output = r#"
+  TCP    0.0.0.0:3000           0.0.0.0:0              LISTENING       1234
+  TCP    [::]:3000              [::]:0                 LISTENING       1234
+"#;
+
+        let ports = parse_windows_netstat_ports(output);
+
+        assert_eq!(ports.get(&1234), Some(&vec![3000]));
+    }
+
+    #[test]
+    fn parse_socket_port_handles_windows_address_shapes() {
+        assert_eq!(parse_socket_port("127.0.0.1:3000"), Some(3000));
+        assert_eq!(parse_socket_port("0.0.0.0:5173"), Some(5173));
+        assert_eq!(parse_socket_port("[::]:8080"), Some(8080));
+        assert_eq!(parse_socket_port("[::1]:9229"), Some(9229));
+        assert_eq!(parse_socket_port("bad"), None);
     }
 }

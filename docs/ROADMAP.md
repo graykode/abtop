@@ -58,7 +58,9 @@ Priority work:
   command path. Done.
 - Verify Claude rate-limit file generation on Windows.
 - Improve path and command display for Windows process trees.
-- Validate port detection with common Windows dev servers.
+- Validate port detection with common Windows dev servers. In progress:
+  `netstat -ano -p TCP` parsing is covered for IPv4, IPv6, duplicate rows, and
+  non-listening rows.
 - Add targeted tests for Windows setup behavior. Done.
 
 Success criteria:
