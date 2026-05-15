@@ -192,9 +192,21 @@ Main areas:
 
 ## Windows Notes
 
-The main monitor path works on native Windows. The `--setup` path needs special
-attention before it is considered first-class Windows UX: it currently installs
-a shell script that expects `bash` and `python3`.
+The main monitor path works on native Windows. The `--setup` path now installs
+a PowerShell StatusLine hook at `%USERPROFILE%\.claude\abtop-statusline.ps1`
+or the equivalent `CLAUDE_CONFIG_DIR` path. The generated Claude command uses:
 
-Until that is improved, treat `abtop --setup` as a manual opt-in and verify the
-generated Claude `settings.json` before relying on Claude rate-limit telemetry.
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<path>\abtop-statusline.ps1"
+```
+
+Run setup with:
+
+```powershell
+abtop --setup
+```
+
+Then restart Claude Code and send one message before expecting Claude
+rate-limit telemetry in abtop. If a custom `statusLine` command already exists,
+setup refuses to overwrite it; remove or merge that key manually before running
+setup again.

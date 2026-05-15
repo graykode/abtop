@@ -56,6 +56,10 @@ abtop --once
 abtop --setup
 ```
 
+On native Windows, `abtop --setup` writes a PowerShell StatusLine hook
+(`abtop-statusline.ps1`) and configures Claude Code to invoke it with
+`powershell.exe -NoProfile -ExecutionPolicy Bypass`. Git Bash is not required.
+
 ### Option C: CI release flow (recommended for fork maintainers)
 
 1. Bump `Cargo.toml` + `Cargo.lock` version.

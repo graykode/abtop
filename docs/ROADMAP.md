@@ -53,17 +53,18 @@ Goal: remove Windows-specific rough edges before product work expands.
 
 Priority work:
 
-- Audit `abtop --setup` for native Windows.
+- Audit `abtop --setup` for native Windows. Done.
 - Replace or complement the shell-based StatusLine hook with a Windows-friendly
-  command path.
+  command path. Done.
 - Verify Claude rate-limit file generation on Windows.
 - Improve path and command display for Windows process trees.
 - Validate port detection with common Windows dev servers.
-- Add targeted tests for Windows path serialization and setup behavior.
+- Add targeted tests for Windows setup behavior. Done.
 
 Success criteria:
 
-- `abtop --setup` works on native Windows without requiring Git Bash.
+- `abtop --setup` installs a PowerShell StatusLine hook on native Windows
+  without requiring Git Bash.
 - Claude quota appears after a real Claude response when account data is
   available.
 - Test coverage protects the Windows setup path.
@@ -131,7 +132,8 @@ Candidate work:
 
 ## Risk Register
 
-- `abtop --setup` is not yet native Windows friendly.
+- Claude rate-limit telemetry still needs an end-to-end check against a real
+  Claude Code response on Windows.
 - `cargo audit` reports transitive warnings through `ratatui 0.29.0`.
 - Collector logic depends on internal Claude/Codex/OpenCode file formats.
 - Interactive TUI verification needs a real terminal, not a non-interactive pipe.
