@@ -3,7 +3,7 @@ use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
 use crate::theme::Theme;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -104,6 +104,8 @@ pub struct WorkspaceProject {
     pub git_modified: u32,
     pub has_dw: bool,
     pub has_active_task: bool,
+    pub active_task_title: Option<String>,
+    pub active_task_phase: Option<String>,
     pub decision_count: usize,
 }
 
@@ -156,8 +158,12 @@ impl WorkspaceProject {
             return;
         }
 
-        self.has_active_task =
-            root.join("tasks").join("ACTIVE.md").is_file() || root.join("ACTIVE.md").is_file();
+        if let Some(active_task) = active_task_path(&root) {
+            self.has_active_task = true;
+            let (title, phase) = read_active_task_metadata(&active_task);
+            self.active_task_title = title;
+            self.active_task_phase = phase;
+        }
         self.decision_count = std::fs::read_dir(root.join("decisions"))
             .ok()
             .map(|entries| {
@@ -174,6 +180,63 @@ impl WorkspaceProject {
             })
             .unwrap_or(0);
     }
+}
+
+fn active_task_path(root: &Path) -> Option<PathBuf> {
+    [root.join("tasks").join("ACTIVE.md"), root.join("ACTIVE.md")]
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn read_active_task_metadata(path: &Path) -> (Option<String>, Option<String>) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return (None, None);
+    };
+    let mut title = None;
+    let mut phase = None;
+
+    for raw in content.lines().take(80) {
+        let line = raw.trim();
+        if line.is_empty() || line == "---" {
+            continue;
+        }
+        if title.is_none() {
+            if let Some(value) = metadata_value(line, "title") {
+                title = Some(value);
+            } else if let Some(heading) = line.strip_prefix("# ") {
+                title = Some(truncate_metadata(heading.trim(), 80));
+            }
+        }
+        if phase.is_none() {
+            phase = metadata_value(line, "phase").or_else(|| metadata_value(line, "status"));
+        }
+        if title.is_some() && phase.is_some() {
+            break;
+        }
+    }
+
+    (title, phase)
+}
+
+fn metadata_value(line: &str, key: &str) -> Option<String> {
+    let (left, right) = line.split_once(':')?;
+    if !left.trim().eq_ignore_ascii_case(key) {
+        return None;
+    }
+    let value = right.trim().trim_matches('"').trim_matches('\'');
+    if value.is_empty() {
+        None
+    } else {
+        Some(truncate_metadata(value, 40))
+    }
+}
+
+fn truncate_metadata(value: &str, max_len: usize) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max_len)
+        .collect()
 }
 
 pub struct App {
@@ -1358,6 +1421,40 @@ mod tests {
         app.workspace_projects.pop();
         app.clamp_workspace_selection();
         assert_eq!(app.workspace_selected, 0);
+    }
+
+    #[test]
+    fn workspace_project_reads_dw_active_task_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let task_dir = root.join(".dw").join("tasks");
+        let decision_dir = root.join(".dw").join("decisions");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        std::fs::create_dir_all(&decision_dir).unwrap();
+        std::fs::write(
+            task_dir.join("ACTIVE.md"),
+            "---\ntitle: Improve checkout flow\nphase: Verify\n---\n# Ignored fallback\n",
+        )
+        .unwrap();
+        std::fs::write(decision_dir.join("001.md"), "# ADR\n").unwrap();
+        std::fs::write(decision_dir.join("notes.txt"), "ignored\n").unwrap();
+
+        let session = AgentSession {
+            cwd: root.to_string_lossy().to_string(),
+            project_name: "project".into(),
+            ..waiting_session("claude")
+        };
+
+        let projects = WorkspaceProject::from_sessions(&[session]);
+        assert_eq!(projects.len(), 1);
+        assert!(projects[0].has_dw);
+        assert!(projects[0].has_active_task);
+        assert_eq!(
+            projects[0].active_task_title.as_deref(),
+            Some("Improve checkout flow")
+        );
+        assert_eq!(projects[0].active_task_phase.as_deref(), Some("Verify"));
+        assert_eq!(projects[0].decision_count, 1);
     }
 
     #[test]

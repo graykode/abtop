@@ -169,11 +169,14 @@ pub(crate) fn draw_workspace_panel_active(
                 Style::default().fg(theme.graph_text),
             ));
             flow.push(Span::styled(
-                if project.has_active_task {
-                    "active"
-                } else {
-                    "idle"
-                },
+                project
+                    .active_task_phase
+                    .as_deref()
+                    .unwrap_or(if project.has_active_task {
+                        "active"
+                    } else {
+                        "idle"
+                    }),
                 Style::default().fg(if project.has_active_task {
                     theme.proc_misc
                 } else {
@@ -212,6 +215,36 @@ pub(crate) fn draw_workspace_panel_active(
             Span::styled("  enter ", Style::default().fg(theme.graph_text)),
             Span::styled("open", Style::default().fg(theme.main_fg)),
         ]));
+        if project.has_dw {
+            lines.push(Line::from(vec![
+                Span::styled(" task ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    project
+                        .active_task_title
+                        .as_deref()
+                        .unwrap_or(if project.has_active_task {
+                            "active task"
+                        } else {
+                            "none"
+                        }),
+                    Style::default().fg(if project.has_active_task {
+                        theme.main_fg
+                    } else {
+                        theme.inactive_fg
+                    }),
+                ),
+                Span::styled(" phase ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    project.active_task_phase.as_deref().unwrap_or("-"),
+                    Style::default().fg(theme.proc_misc),
+                ),
+                Span::styled(" decisions ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    project.decision_count.to_string(),
+                    Style::default().fg(theme.main_fg),
+                ),
+            ]));
+        }
         lines.push(Line::from(vec![
             Span::styled(" cwd ", Style::default().fg(theme.graph_text)),
             Span::styled(

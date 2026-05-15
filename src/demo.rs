@@ -576,4 +576,15 @@ pub fn populate_demo(app: &mut App) {
     });
     app.agent_aggregate = crate::host_info::AgentAggregate::from_sessions(&app.sessions);
     app.workspace_projects = crate::app::WorkspaceProject::from_sessions(&app.sessions);
+    if let Some(project) = app
+        .workspace_projects
+        .iter_mut()
+        .find(|project| project.name == "ml-pipeline")
+    {
+        project.has_dw = true;
+        project.has_active_task = true;
+        project.active_task_title = Some("Batch inference rollout".into());
+        project.active_task_phase = Some("Execute".into());
+        project.decision_count = 3;
+    }
 }
