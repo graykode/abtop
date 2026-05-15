@@ -182,7 +182,7 @@ fn draw_source_column(
         )];
         s.extend(remaining_bar(remaining, bar_w, cpu_grad, theme.meter_bg));
         s.push(Span::styled(
-            format!(" {:>3.0}%", remaining),
+            quota_pct_label(remaining, col_w_usize),
             Style::default().fg(c),
         ));
         lines.push(Line::from(s));
@@ -215,7 +215,7 @@ fn draw_source_column(
         )];
         s.extend(remaining_bar(remaining, bar_w, cpu_grad, theme.meter_bg));
         s.push(Span::styled(
-            format!(" {:>3.0}%", remaining),
+            quota_pct_label(remaining, col_w_usize),
             Style::default().fg(c),
         ));
         lines.push(Line::from(s));
@@ -233,6 +233,14 @@ fn draw_source_column(
     }
 
     f.render_widget(Paragraph::new(lines), area);
+}
+
+fn quota_pct_label(remaining: f64, col_width: usize) -> String {
+    if col_width >= 18 {
+        format!(" {:>3.0}% {}", remaining, t("quota.left"))
+    } else {
+        format!(" {:>3.0}%", remaining)
+    }
 }
 
 /// Format a reset timestamp as a human countdown labeled "in X" so the

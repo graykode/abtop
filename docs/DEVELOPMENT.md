@@ -78,6 +78,19 @@ abtop --demo --once
 abtop --demo --workspace-summary
 ```
 
+Quota panel semantics:
+
+- Claude and Codex quota bars show account rate-limit percentage remaining for
+  the 5-hour and 7-day windows.
+- The displayed percentage is `100 - used_percent` from the provider telemetry;
+  it is not an absolute token count.
+- The `total` row is session token telemetry collected by abtop and should not
+  be compared directly with Settings pages that show rate-limit remaining.
+- Codex values come from the latest Codex CLI `token_count` rate-limit event or
+  the cached fallback at `%LOCALAPPDATA%\abtop\codex-rate-limits.json`.
+- Claude values come from `%USERPROFILE%\.claude\abtop-rate-limits.json`,
+  written by the Claude Code StatusLine hook installed by `abtop --setup`.
+
 Interactive mode verifies the full realtime UI:
 
 ```powershell

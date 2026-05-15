@@ -1396,6 +1396,15 @@ mod tests {
     }
 
     #[test]
+    fn desktop_quota_labels_remaining_percent() {
+        let text = render_demo(220, 40);
+        assert!(
+            text.contains("left"),
+            "quota percentage should be labeled as remaining, not token count\n{text}"
+        );
+    }
+
+    #[test]
     fn desktop_workspace_focus_renders_workspace_panel() {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         crate::demo::populate_demo(&mut app);

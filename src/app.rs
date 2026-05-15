@@ -851,12 +851,17 @@ impl App {
         promote_waiting_to_rate_limited(&mut self.sessions, &self.rate_limits);
 
         crate::log_debug!(
-            "tick sessions={} orphan_ports={} mcp_servers={} token_delta={} rate_limits={}",
+            "tick sessions={} orphan_ports={} mcp_servers={} token_delta={} rate_limits={} sources={}",
             self.sessions.len(),
             self.orphan_ports.len(),
             self.mcp_servers.len(),
             rate,
-            self.rate_limits.len()
+            self.rate_limits.len(),
+            self.rate_limits
+                .iter()
+                .map(|rl| rl.source.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
         );
 
         self.drain_and_retry_summaries();

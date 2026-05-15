@@ -202,6 +202,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("quota.run_codex", "run codex once");
     m.insert("quota.total", "total");
     m.insert("quota.in", "in");
+    m.insert("quota.left", "left");
 
     // Projects panel
     m.insert("projects.no_git", "no git");
@@ -444,6 +445,7 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("quota.run_codex", "运行一次 codex");
     m.insert("quota.total", "总计");
     m.insert("quota.in", "还有");
+    m.insert("quota.left", "剩余");
 
     // Projects panel
     m.insert("projects.no_git", "非 Git");

@@ -56,6 +56,9 @@ abtop --theme dracula    # Launch with a specific theme
 
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 
+Quota bars show account rate-limit percentage remaining for each provider
+window. They are separate from the session token totals shown in the same panel.
+
 ### tmux
 
 abtop works standalone, but running inside tmux unlocks session jumping — press `Enter` to switch directly to the pane running that agent.
