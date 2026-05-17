@@ -2713,6 +2713,7 @@ mod tests {
             ControlPolicy {
                 allow_kill_sessions: false,
                 allow_kill_orphan_ports: true,
+                ..ControlPolicy::default()
             },
         );
         app.sessions = vec![waiting_session("codex")];
@@ -2733,6 +2734,7 @@ mod tests {
             ControlPolicy {
                 allow_kill_sessions: true,
                 allow_kill_orphan_ports: false,
+                ..ControlPolicy::default()
             },
         );
         app.orphan_ports = vec![orphan_port()];

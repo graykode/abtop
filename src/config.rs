@@ -29,6 +29,17 @@ impl Default for PanelVisibility {
 pub struct ControlPolicy {
     pub allow_kill_sessions: bool,
     pub allow_kill_orphan_ports: bool,
+    /// Allow dispatching a one-shot non-interactive prompt to a Claude Code
+    /// agent. Opt-in (default `false`) because dispatch is a mutating action
+    /// that crosses the read-only boundary; the UI surface for it
+    /// (`P6-UX-01`) is still pending.
+    pub allow_dispatch_claude: bool,
+    /// Allow dispatching a one-shot non-interactive prompt to a Codex CLI
+    /// agent. Opt-in (default `false`); see `allow_dispatch_claude`.
+    pub allow_dispatch_codex: bool,
+    /// Allow dispatching a one-shot non-interactive prompt to an OpenCode
+    /// agent. Opt-in (default `false`); see `allow_dispatch_claude`.
+    pub allow_dispatch_opencode: bool,
 }
 
 impl Default for ControlPolicy {
@@ -36,6 +47,26 @@ impl Default for ControlPolicy {
         Self {
             allow_kill_sessions: true,
             allow_kill_orphan_ports: true,
+            allow_dispatch_claude: false,
+            allow_dispatch_codex: false,
+            allow_dispatch_opencode: false,
+        }
+    }
+}
+
+impl ControlPolicy {
+    /// Whether dispatch is allowed for a given collector `agent_cli` identifier.
+    /// Match is case-insensitive and tolerant of common synonyms
+    /// (`claude`/`claude-code`, `codex`/`codex-cli`, `opencode`).
+    ///
+    /// Pre-staged for `P6-UX-01`; no production caller yet.
+    #[allow(dead_code)]
+    pub fn is_dispatch_allowed(&self, agent_cli: &str) -> bool {
+        match agent_cli.trim().to_ascii_lowercase().as_str() {
+            "claude" | "claude-code" | "claude_code" | "cc" => self.allow_dispatch_claude,
+            "codex" | "codex-cli" | "codex_cli" => self.allow_dispatch_codex,
+            "opencode" | "open-code" | "open_code" => self.allow_dispatch_opencode,
+            _ => false,
         }
     }
 }
@@ -118,6 +149,15 @@ fn parse_config_content(content: &str) -> AppConfig {
                 }
                 "allow_kill_orphan_ports" => {
                     config.control_policy.allow_kill_orphan_ports = parse_bool(val).unwrap_or(true)
+                }
+                "allow_dispatch_claude" => {
+                    config.control_policy.allow_dispatch_claude = parse_bool(val).unwrap_or(false)
+                }
+                "allow_dispatch_codex" => {
+                    config.control_policy.allow_dispatch_codex = parse_bool(val).unwrap_or(false)
+                }
+                "allow_dispatch_opencode" => {
+                    config.control_policy.allow_dispatch_opencode = parse_bool(val).unwrap_or(false)
                 }
                 _ => {}
             }
@@ -299,6 +339,49 @@ mod tests {
 
         assert!(!config.control_policy.allow_kill_sessions);
         assert!(!config.control_policy.allow_kill_orphan_ports);
+    }
+
+    #[test]
+    fn dispatch_flags_default_false() {
+        let config = AppConfig::default();
+        assert!(!config.control_policy.allow_dispatch_claude);
+        assert!(!config.control_policy.allow_dispatch_codex);
+        assert!(!config.control_policy.allow_dispatch_opencode);
+    }
+
+    #[test]
+    fn parse_dispatch_policy_keys() {
+        let config = parse_config_content(
+            "allow_dispatch_claude = true\nallow_dispatch_codex = true\nallow_dispatch_opencode = true\n",
+        );
+
+        assert!(config.control_policy.allow_dispatch_claude);
+        assert!(config.control_policy.allow_dispatch_codex);
+        assert!(config.control_policy.allow_dispatch_opencode);
+    }
+
+    #[test]
+    fn is_dispatch_allowed_matches_agent_cli_synonyms() {
+        let mut policy = ControlPolicy::default();
+        assert!(!policy.is_dispatch_allowed("claude"));
+        assert!(!policy.is_dispatch_allowed("codex-cli"));
+
+        policy.allow_dispatch_claude = true;
+        assert!(policy.is_dispatch_allowed("claude"));
+        assert!(policy.is_dispatch_allowed("Claude-Code"));
+        assert!(policy.is_dispatch_allowed("claude_code"));
+        assert!(!policy.is_dispatch_allowed("codex"));
+
+        policy.allow_dispatch_codex = true;
+        assert!(policy.is_dispatch_allowed("codex"));
+        assert!(policy.is_dispatch_allowed("Codex-CLI"));
+
+        policy.allow_dispatch_opencode = true;
+        assert!(policy.is_dispatch_allowed("opencode"));
+        assert!(policy.is_dispatch_allowed("Open-Code"));
+
+        assert!(!policy.is_dispatch_allowed("gemini"));
+        assert!(!policy.is_dispatch_allowed(""));
     }
 
     #[test]
