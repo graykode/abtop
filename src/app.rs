@@ -1,3 +1,4 @@
+use crate::audit::{record as record_audit, AuditEvent};
 use crate::collector::{read_rate_limits, McpServer, MultiCollector};
 use crate::evidence::{build_task_evidence, render_task_evidence_markdown};
 use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
@@ -1070,12 +1071,28 @@ impl App {
                     })
                     .unwrap_or(false);
                 if !verified {
+                    record_audit(&AuditEvent::new(
+                        "kill-session",
+                        "session",
+                        &session.session_id,
+                        Some(&session.project_name),
+                        "blocked",
+                        Some("pid verification failed"),
+                    ));
                     self.set_status(format!("PID {} is no longer a known agent process", pid));
                     return;
                 }
                 let _ = std::process::Command::new("kill")
                     .args(["-9", &pid.to_string()])
                     .output();
+                record_audit(&AuditEvent::new(
+                    "kill-session",
+                    "session",
+                    &session.session_id,
+                    Some(&session.project_name),
+                    "sent",
+                    Some("double-confirmed by user"),
+                ));
                 self.tick();
                 return;
             }
@@ -1118,6 +1135,23 @@ impl App {
                     let _ = std::process::Command::new("kill")
                         .args([&orphan.pid.to_string()])
                         .output();
+                    record_audit(&AuditEvent::new(
+                        "kill-orphan-port",
+                        "process",
+                        &orphan.pid.to_string(),
+                        Some(&orphan.project_name),
+                        "sent",
+                        Some("orphan port verified"),
+                    ));
+                } else {
+                    record_audit(&AuditEvent::new(
+                        "kill-orphan-port",
+                        "process",
+                        &orphan.pid.to_string(),
+                        Some(&orphan.project_name),
+                        "blocked",
+                        Some("command verification failed"),
+                    ));
                 }
             }
         }

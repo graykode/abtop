@@ -22,8 +22,8 @@ Use it together with `docs/PRODUCT_STRATEGY.md`, `docs/ROADMAP_V2.md`, and
 
 ## Current Focus
 
-`P4-AUD-01`: decide and implement the local audit log before adding any
-mutating control actions.
+`P4-CTL-01`: decide which mutating control action should become the first
+audited, user-facing workflow beyond the existing kill controls.
 
 ## Task Board
 
@@ -41,59 +41,60 @@ mutating control actions.
 | P2-VIS-01 | Done | Codex | Visual task viewer | TUI task tree view | Add read-only task tree before any graphical mind map. | P1-T01, P1-T02 | UI module, tests | `cargo fmt -- --check`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; refreshed `assets/workspace-demo.gif` |
 | P2-VIS-02 | Done | Codex | Visual task viewer | Mind-map data model prototype | Create graph nodes/edges for tasks, decisions, sessions, files, and risks. | P2-VIS-01 | `src/task_graph/*`, docs | `cargo test task_graph`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; demo summary graph stats |
 | P3-EVD-01 | Done | Codex | Evidence bundles | Per-task evidence bundle | Export safe per-task evidence: sessions, commands, files touched, checks, decisions. | P1-T03, P2-VIS-02 | export module, tests | `cargo test evidence`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo run -- --demo --task-evidence` |
-| P4-AUD-01 | Blocked | Unassigned | Controls | Local audit log | Add append-only audit log before any mutating control action. | Product decision | audit module, docs | Pending |
-| P4-CTL-01 | Blocked | Unassigned | Controls | Mutating control actions | Kill/restart/archive/dispatch actions with confirmation and audit. | P4-AUD-01 | app/ui/control modules | Pending |
+| P4-AUD-01 | Done | Codex | Controls | Local audit log | Add append-only audit log before any mutating control action. | Product decision | audit module, docs | `cargo test audit`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; kill controls record audit events |
+| P4-CTL-01 | Next | Unassigned | Controls | Mutating control actions | Kill/restart/archive/dispatch actions with confirmation and audit. | P4-AUD-01 | app/ui/control modules | Pending |
 
 ## Next Task Detail: P4-AUD-01
 
 Target user:
 
-- Solo power user and small team that want abtop to eventually trigger or
-  modify agent/task state without losing trust.
+- Solo power user and small team that want safe, explicit controls over agent
+  and task workflows.
 
 Pain solved:
 
-- Mutating controls are powerful but risky. Before kill/restart/archive/dispatch
-  actions, the product needs an append-only local audit trail.
+- Kill controls exist, but richer controls need clear confirmation, audit
+  logging, and a focused first workflow before broad mutation is allowed.
 
 Hypothesis:
 
-- A visible, local-first audit log makes future controls safer and easier to
-  explain during manual review or demos.
+- Starting with one high-value audited control will validate the control model
+  without turning abtop into a risky automation surface.
 
 Data sources:
 
-- User-triggered control events,
-- target project/session/task identifiers,
-- timestamp, action, outcome, and sanitized reason.
+- Selected workspace project/task/session,
+- existing `WorkspaceTask` and `TaskGraph` state,
+- local audit log from P4-AUD-01.
 
 Privacy risk:
 
-- Audit logs can become sensitive operational history. Store no prompts, file
-  contents, task body text, credentials, or absolute private paths.
+- Controls must not write prompts, task body text, secrets, or absolute private
+  paths into task files, UI, or audit events.
 
 Expected design:
 
-- Add append-only JSONL or structured text log under a local abtop cache/config
-  path.
-- Add a narrow writer API and tests before wiring any mutating control.
-- Keep P4-CTL-01 blocked until this is done.
+- Pick one first control, likely `archive/mark evidence reviewed` or another
+  low-risk local action before any dispatch/restart automation.
+- Require explicit confirmation and audit every outcome.
+- Keep behavior local-first and reversible where possible.
 
 Suggested write scope:
 
-- `src/audit/*`,
-- config/path helper if needed,
-- docs and tests.
+- `src/app.rs`,
+- `src/ui/workspace.rs` or a narrow control module,
+- audit tests and UI tests.
 
 EVD target:
 
+- `cargo test control`,
 - `cargo test audit`,
 - `cargo fmt -- --check`,
 - `cargo clippy --all-targets --all-features -- -D warnings`.
 
 ## Handoff Notes
 
-- Keep `AW-014` blocked until audit and confirmation UX exist.
+- P4-AUD-01 is now complete; keep new controls explicit and audited.
 - Avoid large refactors in `src/app.rs`; prefer extracting new task/workspace
   modules.
 - Do not commit local EVD files that include private paths, quota, prompts, or

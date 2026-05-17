@@ -55,6 +55,9 @@ abtop --setup            # Install rate limit collection hook
 abtop --theme dracula    # Launch with a specific theme
 ```
 
+Mutating actions write append-only audit events to the local abtop data
+directory. Set `ABTOP_AUDIT_FILE` to override the JSONL audit path.
+
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 
 Quota bars show account rate-limit percentage remaining for each provider

@@ -1,4 +1,5 @@
 mod app;
+mod audit;
 mod collector;
 mod config;
 mod demo;
