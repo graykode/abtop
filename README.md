@@ -54,6 +54,7 @@ abtop --workspace-summary # Print redacted Workspace Markdown and exit
 abtop --task-evidence    # Print redacted per-task evidence Markdown and exit
 abtop --roadmap          # Print dependency-aware task roadmap Markdown and exit
 abtop --handoff          # Print cross-agent assignment handoff Markdown and exit
+abtop --handoff --json   # Print machine-readable handoff JSON and exit
 abtop --setup            # Install rate limit collection hook
 abtop --doctor           # Check local setup and collector health
 abtop --doctor --json    # Print machine-readable diagnostics JSON
@@ -72,6 +73,8 @@ Handoff exports turn that roadmap into a safe shared workspace protocol for
 Claude Code, Codex, OpenCode, or future local agents. Agents coordinate through
 task state, dependency order, evidence, and blockers rather than an unaudited
 private chat.
+Use Markdown output for human planning and JSON output when another tool or
+agent needs stable structured handoff context.
 
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 

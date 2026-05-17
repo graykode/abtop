@@ -112,6 +112,7 @@ fn main() -> io::Result<()> {
     let task_evidence = std::env::args().any(|a| a == "--task-evidence");
     let roadmap = std::env::args().any(|a| a == "--roadmap");
     let handoff = std::env::args().any(|a| a == "--handoff");
+    let json_output = std::env::args().any(|a| a == "--json");
 
     // --once flag: print snapshot and exit
     if std::env::args().any(|a| a == "--once")
@@ -141,7 +142,9 @@ fn main() -> io::Result<()> {
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
-        if handoff {
+        if handoff && json_output {
+            print!("{}", app.handoff_json());
+        } else if handoff {
             print!("{}", app.handoff_markdown());
         } else if roadmap {
             print!("{}", app.roadmap_markdown());
@@ -405,6 +408,7 @@ Options:
   --task-evidence      Print redacted per-task evidence Markdown and exit
   --roadmap            Print dependency-aware task roadmap Markdown and exit
   --handoff            Print cross-agent assignment handoff Markdown and exit
+  --handoff --json     Print machine-readable handoff JSON and exit
   --doctor             Check local setup and collector health
   --doctor --json      Print machine-readable diagnostics JSON
   --setup              Install Claude rate-limit collection hook
@@ -587,5 +591,6 @@ mod tests {
         assert!(usage.contains("--doctor"));
         assert!(usage.contains("--once"));
         assert!(usage.contains("--handoff"));
+        assert!(usage.contains("--handoff --json"));
     }
 }

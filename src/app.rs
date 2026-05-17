@@ -1664,6 +1664,94 @@ impl App {
         out
     }
 
+    pub fn handoff_json(&self) -> String {
+        let projects = self
+            .workspace_projects
+            .iter()
+            .filter(|project| project.has_dw && !project.tasks.is_empty())
+            .map(|project| {
+                let plan = self.workspace_project_roadmap(project);
+                let project_sessions: Vec<_> = self
+                    .sessions
+                    .iter()
+                    .filter(|session| session.cwd == project.cwd)
+                    .collect();
+                let active_agents = project_sessions
+                    .iter()
+                    .map(|session| safe_export_text(session.agent_cli, 24))
+                    .collect::<HashSet<_>>();
+                let stages = plan
+                    .stages
+                    .iter()
+                    .map(|stage| {
+                        let tasks = stage
+                            .tasks
+                            .iter()
+                            .map(|task| {
+                                serde_json::json!({
+                                    "title": safe_export_text(&task.title, 80),
+                                    "status": safe_export_text(&task.status, 32),
+                                    "dependency_count": task.dependency_count,
+                                    "suggested_agent": suggested_handoff_agent(
+                                        &task.status,
+                                        task.dependency_count
+                                    ),
+                                    "verification": task_evidence_summary(project, &task.title),
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        serde_json::json!({
+                            "index": stage.index,
+                            "label": stage.label.as_str(),
+                            "tasks": tasks,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let risks = plan
+                    .risks
+                    .iter()
+                    .take(8)
+                    .map(roadmap_risk_detail)
+                    .collect::<Vec<_>>();
+                let live_agents = project_sessions
+                    .iter()
+                    .take(5)
+                    .map(|session| {
+                        let task = session
+                            .current_tasks
+                            .first()
+                            .map(|task| safe_export_text(task, 80))
+                            .unwrap_or_else(|| workspace_export_idle_text(&session.status).into());
+                        serde_json::json!({
+                            "agent": safe_export_text(session.agent_cli, 24),
+                            "status": workspace_export_status(&session.status),
+                            "current_task": task,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                serde_json::json!({
+                    "name": safe_export_text(&project.name, 80),
+                    "active_agents": sorted_values(active_agents),
+                    "ready_now": plan.ready_count,
+                    "blocked": plan.blocked_count,
+                    "stages": stages,
+                    "do_not_assign_yet": risks,
+                    "live_coordination_notes": live_agents,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let payload = serde_json::json!({
+            "schema": "abtop.agent_handoff.v1",
+            "coordination": "shared_workspace_protocol",
+            "handoff_lanes": ["claude-code", "codex-cli", "opencode"],
+            "privacy": "redacted task metadata only; no prompt text or file contents",
+            "projects": projects,
+        });
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
+    }
+
     /// Jump to the terminal running the selected session's Claude process.
     /// In tmux: switch to the pane. Otherwise: no-op.
     pub fn jump_to_session(&mut self) -> JumpOutcome {
@@ -2146,9 +2234,13 @@ fn task_evidence_summary(project: &WorkspaceProject, task_title: &str) -> String
 }
 
 fn sorted_join(values: HashSet<String>, separator: &str) -> String {
+    sorted_values(values).join(separator)
+}
+
+fn sorted_values(values: HashSet<String>) -> Vec<String> {
     let mut values: Vec<_> = values.into_iter().collect();
     values.sort();
-    values.join(separator)
+    values
 }
 
 #[cfg(test)]
@@ -2462,6 +2554,26 @@ mod tests {
         assert!(handoff.contains("suggested agent"));
         assert!(handoff.contains("do not assign yet"));
         assert!(handoff.contains("Batch inference rollout"));
+        assert!(!handoff.contains("/Users/demo"));
+        assert!(!handoff.contains("Implement Stripe payment integration"));
+    }
+
+    #[test]
+    fn handoff_json_is_redacted_and_structured() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        crate::demo::populate_demo(&mut app);
+
+        let handoff = app.handoff_json();
+        let json: serde_json::Value = serde_json::from_str(&handoff).unwrap();
+        assert_eq!(json["schema"], "abtop.agent_handoff.v1");
+        assert_eq!(json["coordination"], "shared_workspace_protocol");
+        assert_eq!(json["handoff_lanes"][1], "codex-cli");
+        assert_eq!(json["projects"][0]["name"], "ml-pipeline");
+        assert!(json["projects"][0]["stages"][0]["tasks"][0]["suggested_agent"].is_string());
         assert!(!handoff.contains("/Users/demo"));
         assert!(!handoff.contains("Implement Stripe payment integration"));
     }
