@@ -66,18 +66,12 @@ write append-only audit events to the local abtop data directory. Set
 `ABTOP_AUDIT_FILE` to override the JSONL audit path, or set
 `ABTOP_CONTROL_DRY_RUN=1` to audit verified controls without terminating
 processes.
-Workspace summaries include redacted `.dw` task counts and dependency-aware
-roadmap sequencing so ready, blocked, and staged tasks can be reviewed before
-assigning agents.
-Handoff exports turn that roadmap into a safe shared workspace protocol for
-Claude Code, Codex, OpenCode, or future local agents. Agents coordinate through
-task state, dependency order, evidence, and blockers rather than an unaudited
-private chat.
-Use Markdown output for human planning and JSON output when another tool or
-agent needs stable structured handoff context.
-The Workspace TUI also shows compact handoff lanes and assignment suggestions
-when a `.dw` project has dependency-aware tasks.
-Production readiness checks live in `docs/PRODUCTION_READINESS.md`.
+
+The Agentic Workspace surfaces (`--workspace-summary`, `--roadmap`, `--handoff`,
+`--task-evidence`, plus the in-TUI Workspace tab) are documented under
+[Agentic Workspace](#agentic-workspace) below. Production readiness checks live
+in [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md). Known
+limitations are listed in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md).
 
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 
@@ -95,6 +89,102 @@ tmux new -s work
 # pane 2: claude (project B)
 # → Enter on a session in abtop jumps to its pane
 ```
+
+## Agentic Workspace
+
+When a project uses [dw-kit](https://github.com/dv-workflow/dw-kit) — or any
+layout that mirrors `.dw/tasks/`, `.dw/decisions/`, `.dw/records/` — abtop
+reads task state alongside live agent sessions. The same screen shows what is
+running, which task it belongs to, what is ready next, and what is blocked.
+
+Two or more agents (for example Claude Code and Codex) running against the
+**same project directory** are merged into one Workspace project. They
+coordinate through the shared task graph + evidence — not through a private
+agent-to-agent chat. See `docs/PRODUCT_STRATEGY.md` for the rationale.
+
+### Prerequisites
+
+- a `.dw/tasks/` directory in the project (v2 `spec.md`/`tracking.md` or legacy
+  3-file layout — both parsed),
+- at least one running Claude Code, Codex CLI, or OpenCode session inside that
+  directory.
+
+### Walkthrough
+
+Open the TUI and press `a` to focus the Workspace tab:
+
+```bash
+abtop
+# press `a` to focus Workspace
+```
+
+The Workspace tab shows: active task title, phase, acceptance/verification
+counts, roadmap stages (ready/blocked/next), handoff lanes per agent, and
+assignment suggestions.
+
+For headless / scripted use, four redacted exports cover the same data:
+
+```bash
+abtop --workspace-summary    # Markdown — what is running, per project
+abtop --roadmap              # Markdown — ready/blocked/staged tasks + risks
+abtop --handoff              # Markdown — task assignment queue per agent
+abtop --handoff --json       # JSON  — schema: abtop.agent_handoff.v1
+abtop --task-evidence        # Markdown — per-task counts, tools, files, risks
+```
+
+Example (`--demo --handoff`, abbreviated):
+
+```text
+# abtop agent handoff
+
+- coordination: shared workspace protocol
+- handoff lanes: claude-code, codex-cli, opencode
+- privacy: redacted task metadata only; no prompt text or file contents
+
+## ml-pipeline
+- active agents: claude
+- ready now: 2
+- blocked: 1
+- assignment queue:
+  - first stage 1: Dataset drift guardrails [Ready]
+    suggested agent: implementation agent
+    evidence: deps=0 verification=0/1
+  - next stage 2: Model card refresh [Review]
+    suggested agent: second agent reviewer
+- do not assign yet:
+  - blocked task: Production access approval
+- live coordination notes:
+  - claude wait: waiting for user input
+```
+
+Run any export with `--demo` to see synthetic data without a real session.
+
+### Output Guarantees
+
+All five Agentic Workspace surfaces:
+
+- contain task titles, statuses, counts, and redacted tool labels only,
+- never include prompt text, file contents, transcript bodies, or absolute
+  local paths,
+- can be piped into another tool or shared with a reviewer without further
+  scrubbing.
+
+`--handoff --json` carries a stable schema (`abtop.agent_handoff.v1`) suitable
+as startup context for another agent.
+
+### Roadmap of this surface
+
+What is **in scope today**: read-only task/runtime view, redacted exports,
+audited destructive controls (`kill session`, `kill orphan port`).
+
+What is **deliberately deferred** (per `docs/AGENT_HANDOFF.md`):
+
+- automatic task dispatch and reply,
+- direct agent-to-agent private chat in abtop,
+- cloud/team sync.
+
+These can only be added after the policy + audit + redaction model is
+extended — see `P4-DSP-01` and `P6-UX-01` in `docs/EXECUTION_BOARD.md`.
 
 ## Supported Agents
 
