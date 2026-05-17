@@ -449,7 +449,7 @@ pub(crate) fn draw_workspace_panel_active(
         let project_sessions: Vec<_> = app
             .sessions
             .iter()
-            .filter(|session| session.cwd == project.cwd)
+            .filter(|session| project.matches_session(session))
             .collect();
         if !project_sessions.is_empty() {
             lines.push(Line::from(vec![

@@ -127,7 +127,10 @@ impl TaskGraph {
                 graph.push_edge(&project_id, &risk_id, GraphEdgeKind::HasRisk);
             }
 
-            for session in sessions.iter().filter(|session| session.cwd == project.cwd) {
+            for session in sessions
+                .iter()
+                .filter(|session| project.matches_session(session))
+            {
                 let agent_id = format!("{}:agent:{}", project_id, slug(&session.session_id));
                 graph.push_node(GraphNode {
                     id: agent_id.clone(),

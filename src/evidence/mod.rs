@@ -40,7 +40,7 @@ pub fn build_task_evidence(
     for project in projects.iter().filter(|project| project.has_dw) {
         let project_sessions = sessions
             .iter()
-            .filter(|session| session.cwd == project.cwd)
+            .filter(|session| project.matches_session(session))
             .collect::<Vec<_>>();
         for task in &project.tasks {
             bundles.push(bundle_for_task(project, task, &project_sessions, graph));

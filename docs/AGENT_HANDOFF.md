@@ -96,30 +96,28 @@ Current technical state:
 - Dependency-aware roadmap export exists.
 - Cross-agent handoff export exists in Markdown and JSON.
 - Workspace TUI renders compact handoff lanes and assignment suggestions.
+- Real same-project Claude Code + Codex validation is captured in
+  `docs/PRODUCTION_EVIDENCE.md`.
 - Upstream sync guide exists.
 - Latest synced upstream fix: OpenCode macOS `lsof -a` cwd lookup.
 
 Current next task:
 
-`P5-GTM-04`: validate real Claude Code + Codex same-project workflows and
-capture non-demo handoff/roadmap evidence without leaking prompts, file
-contents, or private paths.
+`P5-GTM-05`: prepare release packaging and user-facing GTM onboarding from the
+validated local Agentic Workspace baseline.
 
 Why it matters:
 
-- It proves the cross-agent handoff loop outside demo data.
-- It validates the main user pain: Claude Code and Codex working on one project
-  through shared task/evidence state.
-- It hardens the GTM story with real manual EVD.
+- It turns the validated local baseline into something a real user can install,
+  understand, and try without reading internal planning docs.
+- It should make production scope and known limitations explicit.
 
 Suggested first implementation:
 
-- Use `docs/PRODUCTION_READINESS.md`.
-- Start a `.dw` project with at least one Claude Code and one Codex session.
-- Capture redacted CLI outputs from `--roadmap`, `--handoff`, and
-  `--handoff --json`.
-- Add only sanitized notes to docs; do not commit private screenshots, quota,
-  prompt text, or file contents.
+- Use `docs/PRODUCTION_READINESS.md` and `docs/PRODUCTION_EVIDENCE.md`.
+- Add a concise user-facing onboarding path for the fork.
+- Include install, setup, first run, Workspace, roadmap, handoff, and limitations.
+- Keep all docs in English and avoid private local paths.
 
 Do not start:
 

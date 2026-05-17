@@ -22,8 +22,8 @@ Use it together with `docs/PRODUCT_STRATEGY.md`, `docs/ROADMAP_V2.md`, and
 
 ## Current Focus
 
-`P5-GTM-04`: validate real Claude Code + Codex same-project workflows and
-capture production evidence from a non-demo workspace.
+`P5-GTM-05`: prepare release packaging and user-facing GTM onboarding from the
+validated local Agentic Workspace baseline.
 
 ## Task Board
 
@@ -49,7 +49,8 @@ capture production evidence from a non-demo workspace.
 | P5-GTM-01 | Done | Codex | GTM workflow | Roadmap export CLI | Users can export a redacted dependency-aware roadmap before assigning agents to tasks. | P2-VIS-04 | `src/app.rs`, `src/main.rs`, demo, README | `roadmap_markdown_is_redacted_and_structured`; `cargo test roadmap`; `cargo run -- --demo --roadmap`; full validation suite |
 | P5-GTM-02 | Done | Codex | GTM workflow | Agent assignment handoff | Turn roadmap stages and task evidence into safe human-readable and machine-readable handoff formats for humans or agents to claim next work. | P5-GTM-01, P3-EVD-01, user cross-agent feedback | `src/app.rs`, `src/main.rs`, README, strategy docs | `handoff_markdown_is_redacted_and_actionable`; `handoff_json_is_redacted_and_structured`; `cargo test handoff`; `cargo run -- --demo --handoff`; `cargo run -- --demo --handoff --json`; full validation suite |
 | P5-GTM-03 | Done | Codex | GTM workflow | Visual assignment surface | Show Claude/Codex same-project coordination lanes in the TUI Workspace view, backed by the handoff model. | P5-GTM-02 | `src/ui/workspace.rs`, `src/ui/mod.rs`, README | `desktop_workspace_focus_renders_dw_task_lens`; `cargo test workspace`; `cargo fmt -- --check`; full validation suite |
-| P5-GTM-04 | Next | Unassigned | GTM workflow | Real same-project validation | Run Claude Code and Codex against the same `.dw` project and capture non-demo handoff/roadmap evidence without prompt or file-content leaks. | P5-GTM-03 | docs, EVD notes, optional GIF/screenshot | Pending |
+| P5-GTM-04 | Done | Codex | GTM workflow | Real same-project validation | Run Claude Code and Codex against the same `.dw` project and capture non-demo handoff/roadmap evidence without prompt or file-content leaks. | P5-GTM-03 | `src/app.rs`, `src/ui/workspace.rs`, `src/task_graph/mod.rs`, `src/evidence/mod.rs`, docs | `workspace_projects_merge_canonical_same_directory_sessions`; live `--handoff --json` reported one project with both `claude` and `codex`; `cargo run -- --doctor`; `cargo run -- --workspace-summary`; `cargo run -- --roadmap`; `cargo run -- --handoff`; `cargo run -- --handoff --json` |
+| P5-GTM-05 | Next | Unassigned | GTM workflow | Release packaging and onboarding | Prepare the branch for user-facing trial: install path, usage guide, known limitations, and release checklist. | P5-GTM-04 | README, release notes, docs | Pending |
 
 ## Completed Task Detail: P4-CTL-01
 

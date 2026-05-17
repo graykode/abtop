@@ -157,6 +157,7 @@ impl WorkspaceTask {
 pub struct WorkspaceProject {
     pub name: String,
     pub cwd: String,
+    pub identity_key: String,
     pub session_count: usize,
     pub active_count: usize,
     pub waiting_count: usize,
@@ -189,11 +190,13 @@ impl WorkspaceProject {
     pub(crate) fn from_sessions(sessions: &[AgentSession]) -> Vec<Self> {
         let mut by_cwd: HashMap<String, WorkspaceProject> = HashMap::new();
         for session in sessions {
+            let identity_key = workspace_identity_key(&session.cwd);
             let entry = by_cwd
-                .entry(session.cwd.clone())
+                .entry(identity_key.clone())
                 .or_insert_with(|| WorkspaceProject {
                     name: session.project_name.clone(),
                     cwd: session.cwd.clone(),
+                    identity_key,
                     ..WorkspaceProject::default()
                 });
             entry.session_count += 1;
@@ -229,6 +232,15 @@ impl WorkspaceProject {
                 .then_with(|| a.name.cmp(&b.name))
         });
         projects
+    }
+
+    pub(crate) fn matches_session(&self, session: &AgentSession) -> bool {
+        let project_key = if self.identity_key.is_empty() {
+            workspace_identity_key(&self.cwd)
+        } else {
+            self.identity_key.clone()
+        };
+        workspace_identity_key(&session.cwd) == project_key
     }
 
     fn populate_workflow_hints(&mut self) {
@@ -319,6 +331,23 @@ fn task_status_rank(status: TaskStatus) -> u8 {
         TaskStatus::Ready => 3,
         TaskStatus::Unknown => 4,
         TaskStatus::Done => 5,
+    }
+}
+
+fn workspace_identity_key(cwd: &str) -> String {
+    let path = std::path::Path::new(cwd);
+    let normalized = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
     }
 }
 
@@ -681,7 +710,7 @@ impl App {
             .sessions
             .iter()
             .enumerate()
-            .find(|(_, session)| session.cwd == project.cwd)
+            .find(|(_, session)| project.matches_session(session))
         else {
             return false;
         };
@@ -1468,7 +1497,7 @@ impl App {
             let project_sessions: Vec<_> = self
                 .sessions
                 .iter()
-                .filter(|session| session.cwd == project.cwd)
+                .filter(|session| project.matches_session(session))
                 .collect();
             if !project_sessions.is_empty() {
                 out.push_str("- agents:\n");
@@ -1589,7 +1618,7 @@ impl App {
             let project_sessions: Vec<_> = self
                 .sessions
                 .iter()
-                .filter(|session| session.cwd == project.cwd)
+                .filter(|session| project.matches_session(session))
                 .collect();
             let active_agents = project_sessions
                 .iter()
@@ -1674,7 +1703,7 @@ impl App {
                 let project_sessions: Vec<_> = self
                     .sessions
                     .iter()
-                    .filter(|session| session.cwd == project.cwd)
+                    .filter(|session| project.matches_session(session))
                     .collect();
                 let active_agents = project_sessions
                     .iter()
@@ -2353,6 +2382,24 @@ mod tests {
         app.workspace_projects.pop();
         app.clamp_workspace_selection();
         assert_eq!(app.workspace_selected, 0);
+    }
+
+    #[test]
+    fn workspace_projects_merge_canonical_same_directory_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().to_string_lossy().to_string();
+        let dotted = temp.path().join(".").to_string_lossy().to_string();
+        let mut claude = waiting_session("claude");
+        claude.cwd = cwd;
+        claude.project_name = "same-project".into();
+        let mut codex = waiting_session("codex");
+        codex.cwd = dotted;
+        codex.project_name = "same-project".into();
+
+        let projects = WorkspaceProject::from_sessions(&[claude, codex]);
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].session_count, 2);
     }
 
     #[test]
