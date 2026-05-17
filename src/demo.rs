@@ -602,6 +602,10 @@ pub fn populate_demo(app: &mut App) {
                 acceptance_count: 6,
                 verification_count: 4,
                 completed_verification_count: 2,
+                dependencies: vec![
+                    "Dataset drift guardrails".into(),
+                    "Model card refresh".into(),
+                ],
                 is_active: true,
             },
             crate::app::WorkspaceTask {
@@ -612,6 +616,7 @@ pub fn populate_demo(app: &mut App) {
                 acceptance_count: 3,
                 verification_count: 1,
                 completed_verification_count: 0,
+                dependencies: Vec::new(),
                 is_active: false,
             },
             crate::app::WorkspaceTask {
@@ -622,8 +627,14 @@ pub fn populate_demo(app: &mut App) {
                 acceptance_count: 2,
                 verification_count: 2,
                 completed_verification_count: 1,
+                dependencies: vec!["Dataset drift guardrails".into()],
                 is_active: false,
             },
         ];
+        project.dependency_count = project
+            .tasks
+            .iter()
+            .map(|task| task.dependencies.len())
+            .sum();
     }
 }

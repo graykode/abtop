@@ -51,6 +51,7 @@ pub struct DwTaskSummary {
     pub acceptance_count: usize,
     pub verification_count: usize,
     pub completed_verification_count: usize,
+    pub dependencies: Vec<String>,
     pub is_active: bool,
 }
 
@@ -131,6 +132,7 @@ fn read_task_summary(cwd: &Path, path: &Path, is_active: bool) -> Option<DwTaskS
         acceptance_count: metadata.acceptance_count,
         verification_count: metadata.verification_count,
         completed_verification_count: metadata.completed_verification_count,
+        dependencies: metadata.dependencies,
         is_active,
     })
 }
@@ -144,6 +146,7 @@ struct ParsedTaskMetadata {
     acceptance_count: usize,
     verification_count: usize,
     completed_verification_count: usize,
+    dependencies: Vec<String>,
 }
 
 fn parse_task_metadata(text: &str) -> ParsedTaskMetadata {
@@ -214,8 +217,33 @@ fn apply_key_value(line: &str, parsed: &mut ParsedTaskMetadata) {
             parsed.status = TaskStatus::from_label(&value);
             parsed.raw_status = Some(value);
         }
+        "depends_on" | "depends-on" | "depends on" | "dependencies" | "blocked_by"
+        | "blocked-by" | "blocked by" => {
+            parsed.dependencies.extend(parse_dependency_list(&value));
+            parsed.dependencies.sort();
+            parsed.dependencies.dedup();
+        }
         _ => {}
     }
+}
+
+fn parse_dependency_list(value: &str) -> Vec<String> {
+    value
+        .split([',', ';'])
+        .map(clean_dependency)
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn clean_dependency(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`' | '[' | ']'))
+        .trim_start_matches("- ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(80)
+        .collect()
 }
 
 fn parse_counts(text: &str, parsed: &mut ParsedTaskMetadata) {
@@ -380,6 +408,7 @@ mod tests {
 title: Build workspace reader
 phase: Implementation
 status: Doing
+depends_on: Dataset import, Feature store
 ---
 
 Task body is intentionally not exposed.
@@ -411,6 +440,10 @@ Task body is intentionally not exposed.
         assert_eq!(active.acceptance_count, 2);
         assert_eq!(active.verification_count, 2);
         assert_eq!(active.completed_verification_count, 1);
+        assert_eq!(
+            active.dependencies,
+            vec!["Dataset import".to_string(), "Feature store".to_string()]
+        );
         assert_eq!(state.verification_count, 2);
         assert_eq!(state.completed_verification_count, 1);
     }

@@ -292,6 +292,11 @@ pub(crate) fn draw_workspace_panel_active(
                     project.task_count.to_string(),
                     Style::default().fg(theme.main_fg),
                 ),
+                Span::styled(" deps ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    project.dependency_count.to_string(),
+                    Style::default().fg(theme.main_fg),
+                ),
                 Span::styled(" decisions ", Style::default().fg(theme.graph_text)),
                 Span::styled(
                     project.decision_count.to_string(),
@@ -496,6 +501,15 @@ fn render_task_tree_line(task: &WorkspaceTask, width: u16, theme: &Theme) -> Lin
         Span::styled(
             task.acceptance_count.to_string(),
             Style::default().fg(theme.main_fg),
+        ),
+        Span::styled(" d ", Style::default().fg(theme.graph_text)),
+        Span::styled(
+            task.dependencies.len().to_string(),
+            Style::default().fg(if task.dependencies.is_empty() {
+                theme.inactive_fg
+            } else {
+                theme.warning_fg
+            }),
         ),
     ])
 }

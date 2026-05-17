@@ -121,6 +121,7 @@ pub struct WorkspaceTask {
     pub acceptance_count: usize,
     pub verification_count: usize,
     pub completed_verification_count: usize,
+    pub dependencies: Vec<String>,
     pub is_active: bool,
 }
 
@@ -137,6 +138,7 @@ impl WorkspaceTask {
             acceptance_count: summary.acceptance_count,
             verification_count: summary.verification_count,
             completed_verification_count: summary.completed_verification_count,
+            dependencies: summary.dependencies,
             is_active: summary.is_active,
         }
     }
@@ -174,6 +176,7 @@ pub struct WorkspaceProject {
     pub record_count: usize,
     pub verification_count: usize,
     pub completed_verification_count: usize,
+    pub dependency_count: usize,
     pub tasks: Vec<WorkspaceTask>,
     pub attention_score: u32,
     pub attention: Vec<String>,
@@ -244,6 +247,7 @@ impl WorkspaceProject {
                 .then_with(|| task_status_rank(a.status).cmp(&task_status_rank(b.status)))
                 .then_with(|| a.title.cmp(&b.title))
         });
+        self.dependency_count = self.tasks.iter().map(|task| task.dependencies.len()).sum();
 
         if let Some(active_task) = state.active_task {
             self.has_active_task = true;
@@ -1203,7 +1207,7 @@ impl App {
             ));
             if project.has_dw {
                 out.push_str(&format!(
-                    "- workflow: task={} status={} phase={} next={} acceptance={} tasks={} decisions={} records={} verification={}/{}\n",
+                    "- workflow: task={} status={} phase={} next={} acceptance={} tasks={} deps={} decisions={} records={} verification={}/{}\n",
                     project
                         .active_task_title
                         .as_deref()
@@ -1228,6 +1232,7 @@ impl App {
                     project.active_task_next_action(),
                     project.active_task_acceptance_count,
                     project.task_count,
+                    project.dependency_count,
                     project.decision_count,
                     project.record_count,
                     project.completed_verification_count,
@@ -1741,7 +1746,7 @@ mod tests {
         std::fs::create_dir_all(&record_dir).unwrap();
         std::fs::write(
             task_dir.join("ACTIVE.md"),
-            "---\ntitle: Improve checkout flow\nphase: Verify\nstatus: review\n---\n# Ignored fallback\n\n## Verification\n- [x] cargo test\n- [ ] cargo clippy\n\nSecret body text should stay out of workspace exports.\n",
+            "---\ntitle: Improve checkout flow\nphase: Verify\nstatus: review\ndepends_on: Follow-up, Risk check\n---\n# Ignored fallback\n\n## Verification\n- [x] cargo test\n- [ ] cargo clippy\n\nSecret body text should stay out of workspace exports.\n",
         )
         .unwrap();
         std::fs::write(task_dir.join("next.md"), "# Follow-up\nstatus: ready\n").unwrap();
@@ -1776,6 +1781,7 @@ mod tests {
         assert_eq!(projects[0].record_count, 1);
         assert_eq!(projects[0].verification_count, 2);
         assert_eq!(projects[0].completed_verification_count, 1);
+        assert_eq!(projects[0].dependency_count, 2);
     }
 
     #[test]
@@ -1861,6 +1867,7 @@ mod tests {
         assert!(summary.contains("attention:"));
         assert!(summary.contains("workflow: task=Batch inference rollout status=Doing"));
         assert!(summary.contains("next=continue acceptance=6"));
+        assert!(summary.contains("deps=3"));
         assert!(summary.contains("verification=2/4"));
         assert!(summary.contains("Batch inference endpoint"));
         assert!(

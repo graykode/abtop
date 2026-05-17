@@ -27,6 +27,7 @@ pub enum GraphEdgeKind {
     HasDecisionSet,
     HasRecordSet,
     HasVerification,
+    DependsOn,
     WorkedBy,
     HasRisk,
 }
@@ -83,6 +84,13 @@ impl TaskGraph {
                         weight: task.verification_count as u32,
                     });
                     graph.push_edge(&task_id, &verification_id, GraphEdgeKind::HasVerification);
+                }
+
+                for dependency in &task.dependencies {
+                    if let Some(dep_task) = find_dependency_task(project, dependency) {
+                        let dep_id = task_node_id(project, dep_task);
+                        graph.push_edge(&task_id, &dep_id, GraphEdgeKind::DependsOn);
+                    }
                 }
             }
 
@@ -158,6 +166,17 @@ impl TaskGraph {
     pub fn node_count(&self, kind: GraphNodeKind) -> usize {
         self.nodes.iter().filter(|node| node.kind == kind).count()
     }
+}
+
+fn find_dependency_task<'a>(
+    project: &'a WorkspaceProject,
+    dependency: &str,
+) -> Option<&'a WorkspaceTask> {
+    let normalized = slug(dependency);
+    project
+        .tasks
+        .iter()
+        .find(|task| slug(&task.title) == normalized)
 }
 
 fn task_node_id(project: &WorkspaceProject, task: &WorkspaceTask) -> String {
@@ -246,6 +265,7 @@ mod tests {
                     acceptance_count: 3,
                     verification_count: 2,
                     completed_verification_count: 1,
+                    dependencies: vec!["Dataset drift guardrails".into()],
                     is_active: true,
                 },
                 WorkspaceTask {
@@ -256,6 +276,7 @@ mod tests {
                     acceptance_count: 2,
                     verification_count: 1,
                     completed_verification_count: 0,
+                    dependencies: Vec::new(),
                     is_active: false,
                 },
             ],
@@ -321,6 +342,10 @@ mod tests {
             .edges
             .iter()
             .any(|edge| edge.kind == GraphEdgeKind::ActiveTask));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.kind == GraphEdgeKind::DependsOn));
         assert!(graph
             .nodes
             .iter()

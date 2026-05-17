@@ -17,6 +17,7 @@ pub struct TaskEvidenceBundle {
     pub record_count: usize,
     pub graph_nodes: usize,
     pub graph_edges: usize,
+    pub dependency_count: usize,
     pub agents: Vec<EvidenceAgent>,
     pub tools: Vec<String>,
     pub files: Vec<String>,
@@ -56,13 +57,14 @@ pub fn render_task_evidence_markdown(bundles: &[TaskEvidenceBundle]) -> String {
     for bundle in bundles {
         out.push_str(&format!("## {} / {}\n\n", bundle.project, bundle.task));
         out.push_str(&format!(
-            "- status: {}\n- phase: {}\n- next: {}\n- acceptance: {}\n- verification: {}/{}\n- decisions: {}\n- records: {}\n- graph: {} nodes, {} edges\n",
+            "- status: {}\n- phase: {}\n- next: {}\n- acceptance: {}\n- verification: {}/{}\n- dependencies: {}\n- decisions: {}\n- records: {}\n- graph: {} nodes, {} edges\n",
             bundle.status,
             bundle.phase,
             bundle.next_action,
             bundle.acceptance_count,
             bundle.completed_verification_count,
             bundle.verification_count,
+            bundle.dependency_count,
             bundle.decision_count,
             bundle.record_count,
             bundle.graph_nodes,
@@ -128,6 +130,7 @@ fn bundle_for_task(
         record_count: project.record_count,
         graph_nodes,
         graph_edges,
+        dependency_count: task.dependencies.len(),
         agents: sessions
             .iter()
             .map(|session| evidence_agent(session))
@@ -322,6 +325,7 @@ mod tests {
                 acceptance_count: 3,
                 verification_count: 2,
                 completed_verification_count: 1,
+                dependencies: vec!["Dataset import".into()],
                 is_active: true,
             }],
             ..WorkspaceProject::default()

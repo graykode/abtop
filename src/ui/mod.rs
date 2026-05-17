@@ -1521,6 +1521,10 @@ mod tests {
             text.contains("2/4"),
             "workspace task tree should show verification progress\n{text}"
         );
+        assert!(
+            text.contains("deps"),
+            "workspace should render dependency rollup\n{text}"
+        );
     }
 
     #[test]
