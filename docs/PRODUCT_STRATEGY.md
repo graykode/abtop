@@ -16,6 +16,8 @@ abtop can become the local-first control tower for agentic software work:
 - a flight recorder for every local agent session,
 - an operations cockpit for current project health,
 - a task/workflow viewer backed by structured project artifacts,
+- a shared workspace protocol where Claude Code, Codex, OpenCode, and future
+  agents coordinate through task state, evidence, blockers, and handoffs,
 - a safety layer before agent actions become mutating or automated.
 
 The initial wedge is still simple: run `abtop` and immediately understand what
@@ -77,7 +79,8 @@ Willingness to pay:
 3. Weak connection between tasks, decisions, files, commands, ports, and quota.
 4. Local chaos from child processes, dev servers, and orphan ports.
 5. Unsafe handoff between humans and agents.
-6. Enterprise trust gap for agentic software engineering.
+6. Weak coordination when multiple agent CLIs work inside the same project.
+7. Enterprise trust gap for agentic software engineering.
 
 ## Positioning
 
@@ -129,6 +132,25 @@ dw-kit task graph + abtop runtime graph = agentic work graph
 This is a meaningful product moat because most agent dashboards show only run
 telemetry, while most task managers know nothing about live agent behavior.
 
+## Cross-Agent Coordination
+
+Users increasingly run Claude Code and Codex on the same project. The product
+should not depend on agents chatting freely with each other. That creates
+unclear authority, token waste, and hard-to-audit context drift.
+
+The safer product shape is a shared workspace protocol:
+
+- dw-kit owns task intent, dependency order, status, and acceptance criteria,
+- abtop observes each agent's runtime evidence, current task, touched files,
+  commands, ports, context pressure, and blockers,
+- handoff exports tell a human or a next agent what can be claimed, what must
+  wait, what evidence exists, and which agent type is a reasonable fit,
+- direct agent-to-agent messaging can be explored later as an optional layer on
+  top of the shared protocol, not as the source of truth.
+
+This gives users the outcome they ask for: Claude Code and Codex can cooperate
+on one project without needing a fragile private conversation channel.
+
 ## Task Manager Direction
 
 The task manager should not be a generic Kanban clone. It should be an
@@ -160,6 +182,8 @@ The moat should be built around data integration and trust, not just UI.
   agents.
 - **Task/runtime fusion**: dw-kit task artifacts connected to live agent
   sessions.
+- **Agent handoff protocol**: dependency-aware, evidence-backed work packages
+  that let different agent CLIs continue each other's work safely.
 - **Privacy-first export**: safe summaries without prompt/file-content leaks.
 - **Evidence format**: shareable snapshots that explain work state and risk.
 - **Local policy controls**: explicit confirmation and audit before mutation.

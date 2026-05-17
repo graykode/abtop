@@ -53,6 +53,7 @@ abtop --once             # Print snapshot and exit
 abtop --workspace-summary # Print redacted Workspace Markdown and exit
 abtop --task-evidence    # Print redacted per-task evidence Markdown and exit
 abtop --roadmap          # Print dependency-aware task roadmap Markdown and exit
+abtop --handoff          # Print cross-agent assignment handoff Markdown and exit
 abtop --setup            # Install rate limit collection hook
 abtop --doctor           # Check local setup and collector health
 abtop --doctor --json    # Print machine-readable diagnostics JSON
@@ -67,6 +68,10 @@ processes.
 Workspace summaries include redacted `.dw` task counts and dependency-aware
 roadmap sequencing so ready, blocked, and staged tasks can be reviewed before
 assigning agents.
+Handoff exports turn that roadmap into a safe shared workspace protocol for
+Claude Code, Codex, OpenCode, or future local agents. Agents coordinate through
+task state, dependency order, evidence, and blockers rather than an unaudited
+private chat.
 
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 

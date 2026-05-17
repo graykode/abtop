@@ -18,6 +18,7 @@ The product should help a user answer:
 - What is risky or blocked?
 - What should happen next?
 - What evidence can I safely share?
+- Which agent can safely continue this work next?
 
 ## Milestone P0: Trustworthy Local Baseline
 
@@ -126,7 +127,32 @@ Definition of done:
 
 - a reviewer can understand what happened without opening raw transcripts,
 - a teammate can resume the task with less context loss,
+- Claude Code and Codex can coordinate through shared task evidence rather than
+  ad hoc chat transcripts,
 - sensitive content stays out by default.
+
+## Milestone P3.5: Cross-Agent Handoff
+
+Goal:
+
+Make it safe for a user to run Claude Code and Codex on the same project without
+losing task ownership or creating file conflicts.
+
+Outputs:
+
+- dependency-aware handoff plan,
+- next-ready task queue,
+- blocked task reasons,
+- suggested agent fit per task,
+- review/coordination notes,
+- safe per-task evidence references.
+
+Definition of done:
+
+- a user can run one command and see which task should be given to which agent,
+- blocked tasks explain why they should not be assigned yet,
+- the handoff avoids raw prompts, file contents, and absolute local paths,
+- the output is useful as a human checklist or as agent startup context.
 
 ## Milestone P4: Local Policy And Controls
 
@@ -185,9 +211,10 @@ Pricing hypotheses:
 3. dw-kit task index reader.
 4. Workspace task detail pane v2.
 5. Safe task evidence export.
-6. Task tree view in TUI.
-7. Mind-map/data model prototype.
-8. Local audit log for future controls.
+6. Cross-agent handoff export.
+7. Task tree view in TUI.
+8. Mind-map/data model prototype.
+9. Local audit log for future controls.
 
 ## Product Gate
 

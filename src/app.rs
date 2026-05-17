@@ -1572,6 +1572,98 @@ impl App {
         out
     }
 
+    pub fn handoff_markdown(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# abtop agent handoff\n\n");
+        out.push_str("- coordination: shared workspace protocol\n");
+        out.push_str("- handoff lanes: claude-code, codex-cli, opencode\n");
+        out.push_str("- scope: Claude Code, Codex, OpenCode, and future local agents\n");
+        out.push_str("- privacy: redacted task metadata only; no prompt text or file contents\n\n");
+
+        for project in self
+            .workspace_projects
+            .iter()
+            .filter(|project| project.has_dw && !project.tasks.is_empty())
+        {
+            let plan = self.workspace_project_roadmap(project);
+            let project_sessions: Vec<_> = self
+                .sessions
+                .iter()
+                .filter(|session| session.cwd == project.cwd)
+                .collect();
+            let active_agents = project_sessions
+                .iter()
+                .map(|session| safe_export_text(session.agent_cli, 24))
+                .collect::<HashSet<_>>();
+
+            out.push_str(&format!("## {}\n\n", safe_export_text(&project.name, 80)));
+            out.push_str(&format!(
+                "- active agents: {}\n- ready now: {}\n- blocked: {}\n- stages: {}\n",
+                if active_agents.is_empty() {
+                    "none".into()
+                } else {
+                    sorted_join(active_agents, ", ")
+                },
+                plan.ready_count,
+                plan.blocked_count,
+                plan.stages.len()
+            ));
+
+            if plan.stages.is_empty() {
+                out.push_str("- assignment queue: none\n");
+            } else {
+                out.push_str("- assignment queue:\n");
+                for stage in &plan.stages {
+                    for task in &stage.tasks {
+                        out.push_str(&format!(
+                            "  - {} stage {}: {} [{}]\n",
+                            stage.label.as_str(),
+                            stage.index,
+                            safe_export_text(&task.title, 80),
+                            safe_export_text(&task.status, 32)
+                        ));
+                        out.push_str(&format!(
+                            "    suggested agent: {}\n",
+                            suggested_handoff_agent(&task.status, task.dependency_count)
+                        ));
+                        out.push_str(&format!(
+                            "    evidence: deps={} verification={}\n",
+                            task.dependency_count,
+                            task_evidence_summary(project, &task.title)
+                        ));
+                    }
+                }
+            }
+
+            if !plan.risks.is_empty() {
+                out.push_str("- do not assign yet:\n");
+                for risk in plan.risks.iter().take(8) {
+                    out.push_str(&format!("  - {}\n", roadmap_risk_detail(risk)));
+                }
+            }
+
+            if !project_sessions.is_empty() {
+                out.push_str("- live coordination notes:\n");
+                for session in project_sessions.into_iter().take(5) {
+                    let task = session
+                        .current_tasks
+                        .first()
+                        .map(|task| safe_export_text(task, 80))
+                        .unwrap_or_else(|| workspace_export_idle_text(&session.status).into());
+                    out.push_str(&format!(
+                        "  - {} {}: {}\n",
+                        safe_export_text(session.agent_cli, 24),
+                        workspace_export_status(&session.status),
+                        task
+                    ));
+                }
+            }
+            out.push('\n');
+        }
+
+        out
+    }
+
     /// Jump to the terminal running the selected session's Claude process.
     /// In tmux: switch to the pane. Otherwise: no-op.
     pub fn jump_to_session(&mut self) -> JumpOutcome {
@@ -2028,6 +2120,37 @@ fn roadmap_risk_detail(risk: &RoadmapRisk) -> String {
     }
 }
 
+fn suggested_handoff_agent(status: &str, dependency_count: usize) -> &'static str {
+    match status.to_ascii_lowercase().as_str() {
+        "review" => "second agent reviewer",
+        "doing" => "current owner or reviewer",
+        "blocked" => "human unblock first",
+        "ready" if dependency_count > 0 => "planning-heavy agent",
+        "ready" => "implementation agent",
+        _ => "human triage",
+    }
+}
+
+fn task_evidence_summary(project: &WorkspaceProject, task_title: &str) -> String {
+    project
+        .tasks
+        .iter()
+        .find(|task| task.title == task_title)
+        .map(|task| {
+            format!(
+                "{}/{}",
+                task.completed_verification_count, task.verification_count
+            )
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn sorted_join(values: HashSet<String>, separator: &str) -> String {
+    let mut values: Vec<_> = values.into_iter().collect();
+    values.sort();
+    values.join(separator)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2320,6 +2443,27 @@ mod tests {
         assert!(roadmap.contains("Batch inference rollout"));
         assert!(!roadmap.contains("/Users/demo"));
         assert!(!roadmap.contains("Refactor Terraform modules for multi-region"));
+    }
+
+    #[test]
+    fn handoff_markdown_is_redacted_and_actionable() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        crate::demo::populate_demo(&mut app);
+
+        let handoff = app.handoff_markdown();
+        assert!(handoff.contains("# abtop agent handoff"));
+        assert!(handoff.contains("coordination: shared workspace protocol"));
+        assert!(handoff.contains("handoff lanes: claude-code, codex-cli"));
+        assert!(handoff.contains("assignment queue"));
+        assert!(handoff.contains("suggested agent"));
+        assert!(handoff.contains("do not assign yet"));
+        assert!(handoff.contains("Batch inference rollout"));
+        assert!(!handoff.contains("/Users/demo"));
+        assert!(!handoff.contains("Implement Stripe payment integration"));
     }
 
     #[test]

@@ -111,9 +111,15 @@ fn main() -> io::Result<()> {
     let workspace_summary = std::env::args().any(|a| a == "--workspace-summary");
     let task_evidence = std::env::args().any(|a| a == "--task-evidence");
     let roadmap = std::env::args().any(|a| a == "--roadmap");
+    let handoff = std::env::args().any(|a| a == "--handoff");
 
     // --once flag: print snapshot and exit
-    if std::env::args().any(|a| a == "--once") || workspace_summary || task_evidence || roadmap {
+    if std::env::args().any(|a| a == "--once")
+        || workspace_summary
+        || task_evidence
+        || roadmap
+        || handoff
+    {
         log_info!("snapshot mode demo={}", demo_mode);
         let mut app = App::new_with_config_and_policy(
             initial_theme.unwrap_or_default(),
@@ -135,7 +141,9 @@ fn main() -> io::Result<()> {
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
-        if roadmap {
+        if handoff {
+            print!("{}", app.handoff_markdown());
+        } else if roadmap {
             print!("{}", app.roadmap_markdown());
         } else if task_evidence {
             print!("{}", app.task_evidence_markdown());
@@ -396,6 +404,7 @@ Options:
   --workspace-summary  Print redacted Workspace Markdown and exit
   --task-evidence      Print redacted per-task evidence Markdown and exit
   --roadmap            Print dependency-aware task roadmap Markdown and exit
+  --handoff            Print cross-agent assignment handoff Markdown and exit
   --doctor             Check local setup and collector health
   --doctor --json      Print machine-readable diagnostics JSON
   --setup              Install Claude rate-limit collection hook
@@ -577,5 +586,6 @@ mod tests {
         assert!(usage.contains("--help"));
         assert!(usage.contains("--doctor"));
         assert!(usage.contains("--once"));
+        assert!(usage.contains("--handoff"));
     }
 }
