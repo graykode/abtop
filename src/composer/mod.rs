@@ -134,6 +134,41 @@ pub struct DispatchResult {
     pub error: Option<String>,
 }
 
+/// Aggregated dispatch history for a single (project, task) pair. Only the
+/// most recent result is retained — the full audit trail lives in the
+/// append-only audit log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispatchHistory {
+    pub count: usize,
+    pub last_outcome: DispatchOutcome,
+    pub last_agent_cli: String,
+    pub last_response_bytes: usize,
+    pub last_finished_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+}
+
+impl DispatchHistory {
+    pub fn from_result(result: &DispatchResult) -> Self {
+        Self {
+            count: 1,
+            last_outcome: result.outcome,
+            last_agent_cli: result.agent_cli.clone(),
+            last_response_bytes: result.response_bytes,
+            last_finished_at: result.finished_at,
+            last_error: result.error.clone(),
+        }
+    }
+
+    pub fn record(&mut self, result: &DispatchResult) {
+        self.count = self.count.saturating_add(1);
+        self.last_outcome = result.outcome;
+        self.last_agent_cli = result.agent_cli.clone();
+        self.last_response_bytes = result.response_bytes;
+        self.last_finished_at = result.finished_at;
+        self.last_error = result.error.clone();
+    }
+}
+
 /// State machine for the composer overlay. See `docs/COMPOSER_DESIGN.md` for
 /// the transition diagram.
 #[derive(Clone, Debug, Default)]
@@ -720,6 +755,41 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|err| err.contains("no dispatch command wired")));
+    }
+
+    #[test]
+    fn dispatch_history_records_results() {
+        let result_sent = DispatchResult {
+            outcome: DispatchOutcome::Sent,
+            agent_cli: "claude-code".into(),
+            task_id: "t1".into(),
+            project: "p".into(),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            response_bytes: 1234,
+            response_path: None,
+            error: None,
+        };
+        let mut history = DispatchHistory::from_result(&result_sent);
+        assert_eq!(history.count, 1);
+        assert_eq!(history.last_outcome, DispatchOutcome::Sent);
+        assert_eq!(history.last_response_bytes, 1234);
+
+        let result_failed = DispatchResult {
+            outcome: DispatchOutcome::Failed,
+            agent_cli: "claude-code".into(),
+            task_id: "t1".into(),
+            project: "p".into(),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            response_bytes: 0,
+            response_path: None,
+            error: Some("timeout".into()),
+        };
+        history.record(&result_failed);
+        assert_eq!(history.count, 2);
+        assert_eq!(history.last_outcome, DispatchOutcome::Failed);
+        assert_eq!(history.last_error.as_deref(), Some("timeout"));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use crate::app::{WorkspaceProject, WorkspaceTask};
+use crate::composer::{DispatchHistory, DispatchOutcome, DispatchTarget};
 use crate::model::{AgentSession, FileAccess, SessionStatus, ToolCall};
 use crate::task_graph::TaskGraph;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,6 +24,14 @@ pub struct TaskEvidenceBundle {
     pub tools: Vec<String>,
     pub files: Vec<String>,
     pub risks: Vec<String>,
+    /// Number of times the user has dispatched this task via the composer
+    /// (`P6-UX-01`). `0` means dispatch was never invoked. The full audit
+    /// trail lives in the audit log; this is a count + last-outcome rollup.
+    pub dispatch_count: usize,
+    pub dispatch_last_outcome: Option<String>,
+    pub dispatch_last_agent: Option<String>,
+    pub dispatch_last_response_bytes: usize,
+    pub dispatch_last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +45,7 @@ pub fn build_task_evidence(
     projects: &[WorkspaceProject],
     sessions: &[AgentSession],
     graph: &TaskGraph,
+    dispatch_history: &HashMap<(String, String), DispatchHistory>,
 ) -> Vec<TaskEvidenceBundle> {
     let mut bundles = Vec::new();
     for project in projects.iter().filter(|project| project.has_dw) {
@@ -43,7 +54,13 @@ pub fn build_task_evidence(
             .filter(|session| project.matches_session(session))
             .collect::<Vec<_>>();
         for task in &project.tasks {
-            bundles.push(bundle_for_task(project, task, &project_sessions, graph));
+            bundles.push(bundle_for_task(
+                project,
+                task,
+                &project_sessions,
+                graph,
+                dispatch_history,
+            ));
         }
     }
     bundles
@@ -100,6 +117,18 @@ pub fn render_task_evidence_markdown(bundles: &[TaskEvidenceBundle]) -> String {
             }
         }
 
+        if bundle.dispatch_count > 0 {
+            let outcome = bundle.dispatch_last_outcome.as_deref().unwrap_or("?");
+            let agent = bundle.dispatch_last_agent.as_deref().unwrap_or("?");
+            out.push_str(&format!(
+                "- dispatch: {} times, last={} via {} ({} bytes)\n",
+                bundle.dispatch_count, outcome, agent, bundle.dispatch_last_response_bytes
+            ));
+            if let Some(err) = &bundle.dispatch_last_error {
+                out.push_str(&format!("  - last error: {}\n", err));
+            }
+        }
+
         out.push('\n');
     }
 
@@ -111,8 +140,10 @@ fn bundle_for_task(
     task: &WorkspaceTask,
     sessions: &[&AgentSession],
     graph: &TaskGraph,
+    dispatch_history: &HashMap<(String, String), DispatchHistory>,
 ) -> TaskEvidenceBundle {
     let (graph_nodes, graph_edges) = project_graph_counts(project, graph);
+    let dispatch = dispatch_lookup(project, task, dispatch_history);
     TaskEvidenceBundle {
         project: sanitize_text(&project.name, 64),
         task: sanitize_text(&task.title, 96),
@@ -153,6 +184,32 @@ fn bundle_for_task(
             .take(6)
             .map(|risk| sanitize_text(risk, 24))
             .collect(),
+        dispatch_count: dispatch.map(|h| h.count).unwrap_or(0),
+        dispatch_last_outcome: dispatch.map(|h| dispatch_outcome_label(h.last_outcome).into()),
+        dispatch_last_agent: dispatch.map(|h| sanitize_text(&h.last_agent_cli, 24)),
+        dispatch_last_response_bytes: dispatch.map(|h| h.last_response_bytes).unwrap_or(0),
+        dispatch_last_error: dispatch
+            .and_then(|h| h.last_error.as_deref().map(|err| sanitize_text(err, 96))),
+    }
+}
+
+fn dispatch_lookup<'a>(
+    project: &WorkspaceProject,
+    task: &WorkspaceTask,
+    dispatch_history: &'a HashMap<(String, String), DispatchHistory>,
+) -> Option<&'a DispatchHistory> {
+    let key = (
+        project.name.clone(),
+        DispatchTarget::slug_from_title(&task.title),
+    );
+    dispatch_history.get(&key)
+}
+
+fn dispatch_outcome_label(outcome: DispatchOutcome) -> &'static str {
+    match outcome {
+        DispatchOutcome::DryRun => "dry-run",
+        DispatchOutcome::Sent => "sent",
+        DispatchOutcome::Failed => "failed",
     }
 }
 
@@ -397,7 +454,7 @@ mod tests {
             std::slice::from_ref(&session),
         );
 
-        let bundles = build_task_evidence(&[project], &[session], &graph);
+        let bundles = build_task_evidence(&[project], &[session], &graph, &HashMap::new());
 
         assert_eq!(bundles.len(), 1);
         assert_eq!(bundles[0].task, "Batch rollout");
@@ -411,6 +468,8 @@ mod tests {
             .files
             .iter()
             .any(|file| file.contains("/outside/secret.txt")));
+        assert_eq!(bundles[0].dispatch_count, 0);
+        assert!(bundles[0].dispatch_last_outcome.is_none());
     }
 
     #[test]
@@ -421,7 +480,7 @@ mod tests {
             std::slice::from_ref(&project),
             std::slice::from_ref(&session),
         );
-        let bundles = build_task_evidence(&[project], &[session], &graph);
+        let bundles = build_task_evidence(&[project], &[session], &graph, &HashMap::new());
         let markdown = render_task_evidence_markdown(&bundles);
 
         assert!(markdown.contains("# abtop task evidence"));
@@ -432,5 +491,82 @@ mod tests {
         assert!(!markdown.contains("/work/ml-pipeline"));
         assert!(!markdown.contains("/outside/secret.txt"));
         assert!(!markdown.contains("cargo test -- --nocapture"));
+        // No dispatch history → no dispatch line in markdown.
+        assert!(!markdown.contains("- dispatch:"));
+    }
+
+    #[test]
+    fn dispatch_history_surfaces_in_bundle_and_markdown() {
+        let project = project();
+        let session = session(project.cwd.clone());
+        let graph = TaskGraph::build(
+            std::slice::from_ref(&project),
+            std::slice::from_ref(&session),
+        );
+
+        let key = (
+            project.name.clone(),
+            DispatchTarget::slug_from_title("Batch rollout"),
+        );
+        let history = HashMap::from([(
+            key,
+            DispatchHistory {
+                count: 2,
+                last_outcome: DispatchOutcome::Sent,
+                last_agent_cli: "claude-code".into(),
+                last_response_bytes: 4321,
+                last_finished_at: chrono::Utc::now(),
+                last_error: None,
+            },
+        )]);
+
+        let bundles = build_task_evidence(&[project], &[session], &graph, &history);
+        assert_eq!(bundles[0].dispatch_count, 2);
+        assert_eq!(bundles[0].dispatch_last_outcome.as_deref(), Some("sent"));
+        assert_eq!(
+            bundles[0].dispatch_last_agent.as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(bundles[0].dispatch_last_response_bytes, 4321);
+
+        let markdown = render_task_evidence_markdown(&bundles);
+        assert!(
+            markdown.contains("- dispatch: 2 times, last=sent via claude-code (4321 bytes)"),
+            "dispatch line missing from markdown:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn dispatch_history_shows_failed_error_line() {
+        let project = project();
+        let session = session(project.cwd.clone());
+        let graph = TaskGraph::build(
+            std::slice::from_ref(&project),
+            std::slice::from_ref(&session),
+        );
+
+        let key = (
+            project.name.clone(),
+            DispatchTarget::slug_from_title("Batch rollout"),
+        );
+        let history = HashMap::from([(
+            key,
+            DispatchHistory {
+                count: 1,
+                last_outcome: DispatchOutcome::Failed,
+                last_agent_cli: "claude-code".into(),
+                last_response_bytes: 0,
+                last_finished_at: chrono::Utc::now(),
+                last_error: Some("spawn failed: command not found".into()),
+            },
+        )]);
+
+        let bundles = build_task_evidence(&[project], &[session], &graph, &history);
+        let markdown = render_task_evidence_markdown(&bundles);
+        assert!(markdown.contains("last=failed"), "markdown:\n{markdown}");
+        assert!(
+            markdown.contains("last error: spawn failed: command not found"),
+            "markdown:\n{markdown}"
+        );
     }
 }

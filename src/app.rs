@@ -2,8 +2,8 @@ use crate::audit::{outcomes, record as record_audit, AuditEvent, DISPATCH_DRY_RU
 use crate::collector::{read_rate_limits, McpServer, MultiCollector};
 use crate::composer::{
     build_brief, cycle_agent as cycle_dispatch_agent, dispatch_action_for_agent,
-    first_allowed_agent, spawn_dispatch, ComposerState, DispatchOutcome, DispatchRequest,
-    DispatchResult, DispatchTarget, DISPATCH_MAX_DRAFT_LEN,
+    first_allowed_agent, spawn_dispatch, ComposerState, DispatchHistory, DispatchOutcome,
+    DispatchRequest, DispatchResult, DispatchTarget, DISPATCH_MAX_DRAFT_LEN,
 };
 use crate::config::ControlPolicy;
 use crate::evidence::{build_task_evidence, render_task_evidence_markdown};
@@ -473,6 +473,10 @@ pub struct App {
     /// Receiver for an in-flight dispatch's result. `Some` only while a
     /// background thread is running an agent CLI on behalf of the composer.
     composer_rx: Option<std::sync::mpsc::Receiver<DispatchResult>>,
+    /// Per-(project, task-slug) dispatch history. Used by the evidence
+    /// bundle exporter so reviewers see "task X dispatched N times". The
+    /// full audit trail lives in the append-only audit log, not here.
+    pub dispatch_history: HashMap<(String, String), DispatchHistory>,
 }
 
 impl App {
@@ -546,6 +550,7 @@ impl App {
             control_policy,
             composer: ComposerState::default(),
             composer_rx: None,
+            dispatch_history: HashMap::new(),
         }
     }
 
@@ -1742,6 +1747,15 @@ impl App {
         };
         self.composer_rx = None;
 
+        // Record into per-task history before audit + state transitions so
+        // evidence exports surface the latest dispatch even if the user has
+        // already moved on from the composer.
+        let history_key = (result.project.clone(), result.task_id.clone());
+        self.dispatch_history
+            .entry(history_key)
+            .and_modify(|h| h.record(&result))
+            .or_insert_with(|| DispatchHistory::from_result(&result));
+
         let action = crate::audit::dispatch_action_for(&result.agent_cli).unwrap_or("dispatch");
         let outcome = match result.outcome {
             DispatchOutcome::Sent => outcomes::SENT,
@@ -1989,7 +2003,12 @@ impl App {
 
     pub fn task_evidence_markdown(&self) -> String {
         let graph = self.workspace_task_graph();
-        let bundles = build_task_evidence(&self.workspace_projects, &self.sessions, &graph);
+        let bundles = build_task_evidence(
+            &self.workspace_projects,
+            &self.sessions,
+            &graph,
+            &self.dispatch_history,
+        );
         render_task_evidence_markdown(&bundles)
     }
 
