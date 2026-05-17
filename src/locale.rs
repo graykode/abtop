@@ -97,7 +97,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("help.jump_tmux", "jump to tmux pane (when in tmux)");
     m.insert("help.filter", "filter sessions");
     m.insert("help.clear_filter", "clear filter / close overlay");
-    m.insert("help.kill_session", "kill selected session");
+    m.insert("help.kill_session", "confirm kill selected session");
     m.insert("help.kill_orphans", "confirm kill orphan ports");
     m.insert("help.refresh", "force refresh");
     m.insert("help.quit", "quit");

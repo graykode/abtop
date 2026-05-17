@@ -22,8 +22,8 @@ Use it together with `docs/PRODUCT_STRATEGY.md`, `docs/ROADMAP_V2.md`, and
 
 ## Current Focus
 
-`P4-CTL-01`: build audited mutating control actions for kill/restart/archive/
-dispatch workflows with explicit confirmation.
+`P4-POL-01`: add local policy gates before expanding mutating controls beyond
+kill workflows.
 
 ## Task Board
 
@@ -44,9 +44,10 @@ dispatch workflows with explicit confirmation.
 | P2-VIS-04 | Done | Codex | Visual task viewer | Roadmap sequencing view | Compute dependency-aware task order and surface ready/blocked/next task stages before agent assignment. | P2-VIS-03 | roadmap model, workspace UI/export tests | `cargo test roadmap`; `cargo test task`; `cargo test task_graph`; `cargo test workspace`; `cargo fmt -- --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo test`; `cargo build`; `cargo run -- --demo --workspace-summary` |
 | P3-EVD-01 | Done | Codex | Evidence bundles | Per-task evidence bundle | Export safe per-task evidence: sessions, commands, files touched, checks, decisions. | P1-T03, P2-VIS-02 | export module, tests | `cargo test evidence`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo run -- --demo --task-evidence` |
 | P4-AUD-01 | Done | Codex | Controls | Local audit log | Add append-only audit log before any mutating control action. | Product decision | audit module, docs | `cargo test audit`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; kill controls record audit events |
-| P4-CTL-01 | Next | Unassigned | Controls | Mutating control actions | Kill/restart/archive/dispatch actions with confirmation and audit. | P4-AUD-01 | app/ui/control modules | Pending |
+| P4-CTL-01 | Done | GPT-5.5 | Controls | Mutating control actions | Stop selected sessions and kill orphan ports require explicit confirmation, fresh process checks, dry-run support, clear outcomes, and audit events for requested/confirmed/skipped/blocked/sent/failed paths. | P4-AUD-01 | `src/app.rs`, `src/locale.rs`, `src/main.rs`, README | `cargo test audit` exit 0; `cargo test workspace` exit 0; `cargo test control` exit 0; `cargo fmt -- --check` exit 0; `cargo clippy --all-targets --all-features -- -D warnings` exit 0; `cargo test` exit 0; `cargo build` exit 0; `cargo run -- --help` exit 0; `cargo run -- --demo --once` exit 0; `cargo run -- --demo --workspace-summary` exit 0; `cargo run -- --demo --task-evidence` exit 0; `cargo run -- --doctor` exit 0 |
+| P4-POL-01 | Next | Unassigned | Controls | Local control policy gates | Mutating controls can be disabled or scoped from local config before restart/archive/dispatch actions are added. | P4-CTL-01 | config, app/control helpers, docs | Pending |
 
-## Next Task Detail: P4-CTL-01
+## Completed Task Detail: P4-CTL-01
 
 Target user:
 
@@ -74,11 +75,18 @@ Privacy risk:
 - Control labels can reveal local project names and task titles. Keep audit
   entries structured and avoid prompts, file contents, or transcript bodies.
 
-Expected design:
+Implemented design:
 
 - Confirmation window for destructive actions.
-- Audit every requested, confirmed, skipped, or failed action.
-- Reuse fresh process checks before killing or restarting anything.
+- Audit requested, confirmed, skipped, blocked, dry-run, sent, and failed
+  outcomes for existing kill workflows.
+- Reuse fresh process and port checks before killing anything.
+- Provide `ABTOP_CONTROL_DRY_RUN=1` for verified non-mutating test runs.
+
+Deferred:
+
+- Restart, archive, and dispatch remain blocked until local policy gates define
+  when each mutating action is allowed.
 
 Suggested write scope:
 
@@ -87,12 +95,20 @@ Suggested write scope:
 - audit integration tests,
 - focused tests.
 
-EVD target:
+EVD:
 
 - `cargo test audit`,
 - `cargo test workspace`,
+- `cargo test control`,
 - `cargo fmt -- --check`,
-- `cargo clippy --all-targets --all-features -- -D warnings`.
+- `cargo clippy --all-targets --all-features -- -D warnings`,
+- `cargo test`,
+- `cargo build`,
+- `cargo run -- --help`,
+- `cargo run -- --demo --once`,
+- `cargo run -- --demo --workspace-summary`,
+- `cargo run -- --demo --task-evidence`,
+- `cargo run -- --doctor`.
 
 ## Handoff Notes
 

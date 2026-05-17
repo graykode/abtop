@@ -21,6 +21,7 @@ const ATTENTION_CONTEXT_WARN_PCT: f64 = 80.0;
 const ATTENTION_CONTEXT_CRITICAL_PCT: f64 = 90.0;
 const SUMMARY_UNAVAILABLE: &str = "summary unavailable";
 const KILL_CONFIRM_WINDOW_SECS: u64 = 2;
+const CONTROL_DRY_RUN_ENV: &str = "ABTOP_CONTROL_DRY_RUN";
 
 /// Produce a terminal-safe fallback summary from a raw prompt.
 fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
@@ -1064,43 +1065,107 @@ impl App {
 
     pub fn kill_selected(&mut self) {
         if self.sessions.is_empty() {
+            record_audit(&AuditEvent::new(
+                "kill-session",
+                "session",
+                "none",
+                None,
+                "skipped",
+                Some("no session selected"),
+            ));
+            self.set_status("No session selected to kill".to_string());
             return;
         }
-        let session = &self.sessions[self.selected];
-        if session.status == SessionStatus::Done {
+
+        let Some(session) = self.sessions.get(self.selected) else {
+            record_audit(&AuditEvent::new(
+                "kill-session",
+                "session",
+                "none",
+                None,
+                "skipped",
+                Some("selection out of range"),
+            ));
+            self.set_status("No session selected to kill".to_string());
+            return;
+        };
+        let pid = session.pid;
+        let session_id = session.session_id.clone();
+        let project_name = session.project_name.clone();
+        let status = session.status.clone();
+        let name = self
+            .summaries
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_else(|| format!("PID {pid}"));
+
+        if status == SessionStatus::Done {
+            self.kill_confirm = None;
+            record_audit(&AuditEvent::new(
+                "kill-session",
+                "session",
+                &session_id,
+                Some(&project_name),
+                "skipped",
+                Some("session already done"),
+            ));
+            self.set_status(format!("Session is already done: {name}"));
             return;
         }
 
         // Check if we have a pending confirmation for this exact session
         if let Some((idx, ts)) = self.kill_confirm.take() {
             if idx == self.selected && ts.elapsed().as_secs() < KILL_CONFIRM_WINDOW_SECS {
-                // Confirmed — verify PID still runs expected binary before killing
-                let pid = session.pid;
-                let verified = current_process_command(pid)
+                record_audit(&AuditEvent::new(
+                    "kill-session",
+                    "session",
+                    &session_id,
+                    Some(&project_name),
+                    "confirmed",
+                    Some("double-confirmed by user"),
+                ));
+
+                // Confirmed: verify PID still runs an expected agent before mutation.
+                let current_command = current_process_command(pid);
+                let verified = current_command
                     .as_deref()
                     .is_some_and(is_supported_agent_command);
                 if !verified {
                     record_audit(&AuditEvent::new(
                         "kill-session",
                         "session",
-                        &session.session_id,
-                        Some(&session.project_name),
+                        &session_id,
+                        Some(&project_name),
                         "blocked",
                         Some("pid verification failed"),
                     ));
                     self.set_status(format!("PID {} is no longer a known agent process", pid));
                     return;
                 }
+                if control_dry_run_enabled() {
+                    record_audit(&AuditEvent::new(
+                        "kill-session",
+                        "session",
+                        &session_id,
+                        Some(&project_name),
+                        "dry-run",
+                        Some("verified but not terminated"),
+                    ));
+                    self.set_status(format!("Dry-run: would terminate PID {pid}"));
+                    return;
+                }
                 let sent = terminate_process(pid, true);
                 record_audit(&AuditEvent::new(
                     "kill-session",
                     "session",
-                    &session.session_id,
-                    Some(&session.project_name),
+                    &session_id,
+                    Some(&project_name),
                     if sent { "sent" } else { "failed" },
                     Some("double-confirmed by user"),
                 ));
-                if !sent {
+                if sent {
+                    self.set_status(format!("Termination sent to PID {pid}"));
+                } else {
                     self.set_status(format!("Failed to terminate PID {}", pid));
                 }
                 self.tick();
@@ -1109,13 +1174,19 @@ impl App {
         }
 
         // First press — ask for confirmation
-        let name = self
-            .summaries
-            .get(&session.session_id)
-            .cloned()
-            .unwrap_or_else(|| format!("PID {}", session.pid));
         self.kill_confirm = Some((self.selected, Instant::now()));
-        self.set_status(format!("Press x again to kill: {}", name));
+        record_audit(&AuditEvent::new(
+            "kill-session",
+            "session",
+            &session_id,
+            Some(&project_name),
+            "requested",
+            Some("waiting for second confirmation"),
+        ));
+        self.set_status(format!(
+            "Press x again within {}s to kill: {}",
+            KILL_CONFIRM_WINDOW_SECS, name
+        ));
     }
 
     /// Kill all orphan port processes (Shift+X).
@@ -1126,6 +1197,14 @@ impl App {
 
         if self.orphan_ports.is_empty() {
             self.orphan_kill_confirm = None;
+            record_audit(&AuditEvent::new(
+                "kill-orphan-port",
+                "process",
+                "all",
+                None,
+                "skipped",
+                Some("no orphan ports"),
+            ));
             self.set_status("No orphan ports to kill".to_string());
             return;
         }
@@ -1138,6 +1217,14 @@ impl App {
             let count = self.orphan_ports.len();
             let suffix = if count == 1 { "" } else { "es" };
             self.orphan_kill_confirm = Some(Instant::now());
+            record_audit(&AuditEvent::new(
+                "kill-orphan-port",
+                "process",
+                "all",
+                None,
+                "requested",
+                Some("waiting for second confirmation"),
+            ));
             self.set_status(format!(
                 "Press X again within {}s to kill {} orphan port process{}",
                 KILL_CONFIRM_WINDOW_SECS, count, suffix
@@ -1145,8 +1232,23 @@ impl App {
             return;
         }
 
+        record_audit(&AuditEvent::new(
+            "kill-orphan-port",
+            "process",
+            "all",
+            None,
+            "confirmed",
+            Some("double-confirmed by user"),
+        ));
+
         // Fresh port scan right now — don't rely on cached data
         let fresh_ports = get_listening_ports();
+        let dry_run = control_dry_run_enabled();
+        let mut sent_count = 0usize;
+        let mut failed_count = 0usize;
+        let mut blocked_count = 0usize;
+        let mut skipped_count = 0usize;
+        let mut dry_run_count = 0usize;
 
         for orphan in &self.orphan_ports {
             // 1. Verify PID still listens on the expected port
@@ -1154,6 +1256,15 @@ impl App {
                 .get(&orphan.pid)
                 .is_some_and(|ports| ports.contains(&orphan.port));
             if !still_listening {
+                skipped_count += 1;
+                record_audit(&AuditEvent::new(
+                    "kill-orphan-port",
+                    "process",
+                    &orphan.pid.to_string(),
+                    Some(&orphan.project_name),
+                    "skipped",
+                    Some("port no longer listening"),
+                ));
                 continue;
             }
             // 2. Verify PID still runs the expected command (full match, not substring)
@@ -1161,16 +1272,38 @@ impl App {
                 .as_deref()
                 .is_some_and(|cmd| cmd == orphan.command);
             if command_matches {
-                let sent = terminate_process(orphan.pid, false);
+                let sent = if dry_run {
+                    false
+                } else {
+                    terminate_process(orphan.pid, false)
+                };
+                if dry_run {
+                    dry_run_count += 1;
+                } else if sent {
+                    sent_count += 1;
+                } else {
+                    failed_count += 1;
+                }
                 record_audit(&AuditEvent::new(
                     "kill-orphan-port",
                     "process",
                     &orphan.pid.to_string(),
                     Some(&orphan.project_name),
-                    if sent { "sent" } else { "failed" },
-                    Some("orphan port verified"),
+                    if dry_run {
+                        "dry-run"
+                    } else if sent {
+                        "sent"
+                    } else {
+                        "failed"
+                    },
+                    Some(if dry_run {
+                        "verified but not terminated"
+                    } else {
+                        "orphan port verified"
+                    }),
                 ));
             } else {
+                blocked_count += 1;
                 record_audit(&AuditEvent::new(
                     "kill-orphan-port",
                     "process",
@@ -1181,8 +1314,13 @@ impl App {
                 ));
             }
         }
+        self.set_status(format!(
+            "Orphan ports: sent={sent_count} dry-run={dry_run_count} failed={failed_count} blocked={blocked_count} skipped={skipped_count}"
+        ));
         // Re-collect to reflect changes
-        self.tick();
+        if !dry_run {
+            self.tick();
+        }
     }
 
     pub fn quit(&mut self) {
@@ -1657,6 +1795,19 @@ fn current_process_command(pid: u32) -> Option<String> {
     crate::collector::process::get_process_info()
         .remove(&pid)
         .map(|proc| proc.command)
+}
+
+fn control_dry_run_enabled() -> bool {
+    std::env::var(CONTROL_DRY_RUN_ENV)
+        .ok()
+        .is_some_and(|value| control_dry_run_value_enabled(&value))
+}
+
+fn control_dry_run_value_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn terminate_process(pid: u32, force: bool) -> bool {
@@ -2143,6 +2294,23 @@ mod tests {
         assert!(is_supported_agent_command("codex --resume abc"));
         assert!(is_supported_agent_command("/opt/homebrew/bin/opencode"));
         assert!(!is_supported_agent_command("node server.js"));
+    }
+
+    #[test]
+    fn control_dry_run_value_accepts_explicit_truthy_values() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(
+                control_dry_run_value_enabled(value),
+                "{value:?} should enable dry-run controls"
+            );
+        }
+
+        for value in ["", "0", "false", "no", "off", "enabled"] {
+            assert!(
+                !control_dry_run_value_enabled(value),
+                "{value:?} should not enable dry-run controls"
+            );
+        }
     }
 
     #[test]

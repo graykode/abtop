@@ -14,7 +14,8 @@ Claude Code, Codex CLI, and OpenCode sessions are discovered from local process/
 - Agent spawned a server and forgot to kill it? Orphan port detection.
 - Context window filling up? Per-session % bars with warnings.
 
-All read-only. No API keys. No auth.
+Monitoring is read-only until you use an explicit control such as `x` or `X`.
+No API keys. No auth.
 
 ## Install
 
@@ -57,8 +58,11 @@ abtop --doctor --json    # Print machine-readable diagnostics JSON
 abtop --theme dracula    # Launch with a specific theme
 ```
 
-Mutating actions write append-only audit events to the local abtop data
-directory. Set `ABTOP_AUDIT_FILE` to override the JSONL audit path.
+Mutating controls require a second keypress within the confirmation window and
+write append-only audit events to the local abtop data directory. Set
+`ABTOP_AUDIT_FILE` to override the JSONL audit path, or set
+`ABTOP_CONTROL_DRY_RUN=1` to audit verified controls without terminating
+processes.
 Workspace summaries include redacted `.dw` task counts and dependency-aware
 roadmap sequencing so ready, blocked, and staged tasks can be reviewed before
 assigning agents.
@@ -150,7 +154,7 @@ language = "en"
 | ------------------ | ------------------------------------ |
 | `↑`/`↓` or `k`/`j` | Select session                       |
 | `Enter`            | Jump to session terminal (tmux only) |
-| `x`                | Kill selected session                |
+| `x`                | Confirm kill selected session        |
 | `X`                | Confirm kill all orphan ports        |
 | `t`                | Cycle theme                          |
 | `1`–`5`            | Toggle panel visibility              |

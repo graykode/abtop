@@ -392,7 +392,11 @@ Options:
   --exit-on-jump       Quit after jumping to a tmux pane
   --update             Update abtop from GitHub releases
   -V, --version        Print version and exit
-  -h, --help           Print help and exit",
+  -h, --help           Print help and exit
+
+Environment:
+  ABTOP_AUDIT_FILE       Override append-only control audit JSONL path
+  ABTOP_CONTROL_DRY_RUN  Audit verified controls without terminating processes",
         env!("CARGO_PKG_VERSION")
     )
 }
