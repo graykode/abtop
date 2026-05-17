@@ -22,8 +22,8 @@ Use it together with `docs/PRODUCT_STRATEGY.md`, `docs/ROADMAP_V2.md`, and
 
 ## Current Focus
 
-`P4-POL-01`: add local policy gates before expanding mutating controls beyond
-kill workflows.
+`P5-GTM-02`: package the roadmap-to-agent-assignment loop so users can move
+from dependency planning to execution with less manual glue.
 
 ## Task Board
 
@@ -45,7 +45,9 @@ kill workflows.
 | P3-EVD-01 | Done | Codex | Evidence bundles | Per-task evidence bundle | Export safe per-task evidence: sessions, commands, files touched, checks, decisions. | P1-T03, P2-VIS-02 | export module, tests | `cargo test evidence`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo run -- --demo --task-evidence` |
 | P4-AUD-01 | Done | Codex | Controls | Local audit log | Add append-only audit log before any mutating control action. | Product decision | audit module, docs | `cargo test audit`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; kill controls record audit events |
 | P4-CTL-01 | Done | GPT-5.5 | Controls | Mutating control actions | Stop selected sessions and kill orphan ports require explicit confirmation, fresh process checks, dry-run support, clear outcomes, and audit events for requested/confirmed/skipped/blocked/sent/failed paths. | P4-AUD-01 | `src/app.rs`, `src/locale.rs`, `src/main.rs`, README | `cargo test audit` exit 0; `cargo test workspace` exit 0; `cargo test control` exit 0; `cargo fmt -- --check` exit 0; `cargo clippy --all-targets --all-features -- -D warnings` exit 0; `cargo test` exit 0; `cargo build` exit 0; `cargo run -- --help` exit 0; `cargo run -- --demo --once` exit 0; `cargo run -- --demo --workspace-summary` exit 0; `cargo run -- --demo --task-evidence` exit 0; `cargo run -- --doctor` exit 0 |
-| P4-POL-01 | Next | Unassigned | Controls | Local control policy gates | Mutating controls can be disabled or scoped from local config before restart/archive/dispatch actions are added. | P4-CTL-01 | config, app/control helpers, docs | Pending |
+| P4-POL-01 | Done | Codex | Controls | Local control policy gates | Mutating controls can be disabled or scoped from local config before restart/archive/dispatch actions are added. | P4-CTL-01 | `src/config.rs`, `src/app.rs`, `src/main.rs`, README | `cargo test config`; `cargo test control`; `cargo test audit`; `cargo fmt -- --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo test`; `cargo build`; `cargo run -- --demo --workspace-summary` |
+| P5-GTM-01 | Done | Codex | GTM workflow | Roadmap export CLI | Users can export a redacted dependency-aware roadmap before assigning agents to tasks. | P2-VIS-04 | `src/app.rs`, `src/main.rs`, demo, README | `roadmap_markdown_is_redacted_and_structured`; `cargo test roadmap`; `cargo run -- --demo --roadmap`; full validation suite |
+| P5-GTM-02 | Next | Unassigned | GTM workflow | Agent assignment handoff | Turn roadmap stages and task evidence into a safe handoff format for humans or agents to claim next work. | P5-GTM-01, P3-EVD-01 | CLI/export docs, task evidence, handoff docs | Pending |
 
 ## Completed Task Detail: P4-CTL-01
 

@@ -110,14 +110,16 @@ fn main() -> io::Result<()> {
     let exit_on_jump = std::env::args().any(|a| a == "--exit-on-jump");
     let workspace_summary = std::env::args().any(|a| a == "--workspace-summary");
     let task_evidence = std::env::args().any(|a| a == "--task-evidence");
+    let roadmap = std::env::args().any(|a| a == "--roadmap");
 
     // --once flag: print snapshot and exit
-    if std::env::args().any(|a| a == "--once") || workspace_summary || task_evidence {
+    if std::env::args().any(|a| a == "--once") || workspace_summary || task_evidence || roadmap {
         log_info!("snapshot mode demo={}", demo_mode);
-        let mut app = App::new_with_config(
+        let mut app = App::new_with_config_and_policy(
             initial_theme.unwrap_or_default(),
             &cfg.hidden_agents,
             cfg.panels,
+            cfg.control_policy,
         );
         if demo_mode {
             demo::populate_demo(&mut app);
@@ -133,7 +135,9 @@ fn main() -> io::Result<()> {
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
-        if task_evidence {
+        if roadmap {
+            print!("{}", app.roadmap_markdown());
+        } else if task_evidence {
             print!("{}", app.task_evidence_markdown());
         } else if workspace_summary {
             print!("{}", app.workspace_summary_markdown());
@@ -158,6 +162,7 @@ fn main() -> io::Result<()> {
         exit_on_jump,
         &cfg.hidden_agents,
         cfg.panels,
+        cfg.control_policy,
     );
 
     // Always attempt both cleanup steps regardless of app result
@@ -182,8 +187,14 @@ fn run_app(
     exit_on_jump: bool,
     hidden_agents: &[String],
     panels: config::PanelVisibility,
+    control_policy: config::ControlPolicy,
 ) -> io::Result<()> {
-    let mut app = App::new_with_config(initial_theme.unwrap_or_default(), hidden_agents, panels);
+    let mut app = App::new_with_config_and_policy(
+        initial_theme.unwrap_or_default(),
+        hidden_agents,
+        panels,
+        control_policy,
+    );
     if demo_mode {
         demo::populate_demo(&mut app);
     } else {
@@ -384,6 +395,7 @@ Options:
   --once               Print a redacted snapshot and exit
   --workspace-summary  Print redacted Workspace Markdown and exit
   --task-evidence      Print redacted per-task evidence Markdown and exit
+  --roadmap            Print dependency-aware task roadmap Markdown and exit
   --doctor             Check local setup and collector health
   --doctor --json      Print machine-readable diagnostics JSON
   --setup              Install Claude rate-limit collection hook

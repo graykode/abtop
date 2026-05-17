@@ -1,5 +1,6 @@
 use crate::audit::{record as record_audit, AuditEvent};
 use crate::collector::{read_rate_limits, McpServer, MultiCollector};
+use crate::config::ControlPolicy;
 use crate::evidence::{build_task_evidence, render_task_evidence_markdown};
 use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
@@ -393,13 +394,24 @@ pub struct App {
     pub help_open: bool,
     /// View leader overlay (`v`) visibility.
     pub view_open: bool,
+    pub control_policy: ControlPolicy,
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new_with_config(
         theme: Theme,
         hidden_agents: &[String],
         panels: crate::config::PanelVisibility,
+    ) -> Self {
+        Self::new_with_config_and_policy(theme, hidden_agents, panels, ControlPolicy::default())
+    }
+
+    pub fn new_with_config_and_policy(
+        theme: Theme,
+        hidden_agents: &[String],
+        panels: crate::config::PanelVisibility,
+        control_policy: ControlPolicy,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let summaries = load_summary_cache();
@@ -453,6 +465,7 @@ impl App {
             workspace_projects: Vec::new(),
             help_open: false,
             view_open: false,
+            control_policy,
         }
     }
 
@@ -1064,6 +1077,19 @@ impl App {
     }
 
     pub fn kill_selected(&mut self) {
+        if !self.control_policy.allow_kill_sessions {
+            record_audit(&AuditEvent::new(
+                "kill-session",
+                "session",
+                "policy",
+                None,
+                "blocked",
+                Some("control disabled by local policy"),
+            ));
+            self.set_status("Kill session control disabled by local policy".to_string());
+            return;
+        }
+
         if self.sessions.is_empty() {
             record_audit(&AuditEvent::new(
                 "kill-session",
@@ -1194,6 +1220,20 @@ impl App {
     /// immediately before sending any signals to avoid PID reuse / stale cache issues.
     pub fn kill_orphan_ports(&mut self) {
         use crate::collector::process::get_listening_ports;
+
+        if !self.control_policy.allow_kill_orphan_ports {
+            self.orphan_kill_confirm = None;
+            record_audit(&AuditEvent::new(
+                "kill-orphan-port",
+                "process",
+                "policy",
+                None,
+                "blocked",
+                Some("control disabled by local policy"),
+            ));
+            self.set_status("Kill orphan ports control disabled by local policy".to_string());
+            return;
+        }
 
         if self.orphan_ports.is_empty() {
             self.orphan_kill_confirm = None;
@@ -1474,6 +1514,62 @@ impl App {
         let graph = self.workspace_task_graph();
         let bundles = build_task_evidence(&self.workspace_projects, &self.sessions, &graph);
         render_task_evidence_markdown(&bundles)
+    }
+
+    pub fn roadmap_markdown(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# abtop roadmap\n\n");
+        out.push_str(&format!(
+            "- projects: {}\n\n",
+            self.workspace_projects.len()
+        ));
+
+        for project in self
+            .workspace_projects
+            .iter()
+            .filter(|project| project.has_dw && !project.tasks.is_empty())
+        {
+            let plan = self.workspace_project_roadmap(project);
+            out.push_str(&format!("## {}\n\n", safe_export_text(&project.name, 80)));
+            out.push_str(&format!(
+                "- tasks: {}\n- dependencies: {}\n- ready: {}\n- blocked: {}\n- stages: {}\n- risks: {}\n",
+                project.task_count,
+                project.dependency_count,
+                plan.ready_count,
+                plan.blocked_count,
+                plan.stages.len(),
+                plan.risks.len()
+            ));
+
+            if plan.stages.is_empty() {
+                out.push_str("- pipeline: none\n");
+            } else {
+                out.push_str("- pipeline:\n");
+                for stage in &plan.stages {
+                    out.push_str(&format!(
+                        "  - {} {}: {}\n",
+                        stage.label.as_str(),
+                        stage.index,
+                        stage
+                            .tasks
+                            .iter()
+                            .map(|task| safe_export_text(&task.title, 80))
+                            .collect::<Vec<_>>()
+                            .join(" -> ")
+                    ));
+                }
+            }
+
+            if !plan.risks.is_empty() {
+                out.push_str("- risk detail:\n");
+                for risk in plan.risks.iter().take(8) {
+                    out.push_str(&format!("  - {}\n", roadmap_risk_detail(risk)));
+                }
+            }
+            out.push('\n');
+        }
+
+        out
     }
 
     /// Jump to the terminal running the selected session's Claude process.
@@ -1906,6 +2002,32 @@ fn roadmap_risk_summary(plan: &RoadmapPlan) -> Vec<String> {
     summary
 }
 
+fn roadmap_risk_detail(risk: &RoadmapRisk) -> String {
+    match risk {
+        RoadmapRisk::MissingDependency { task, dependency } => format!(
+            "missing dependency: {} <- {}",
+            safe_export_text(task, 64),
+            safe_export_text(dependency, 64)
+        ),
+        RoadmapRisk::BlockedTask { task } => {
+            format!("blocked task: {}", safe_export_text(task, 64))
+        }
+        RoadmapRisk::BlockedByTask { task, dependency } => format!(
+            "blocked by task: {} <- {}",
+            safe_export_text(task, 64),
+            safe_export_text(dependency, 64)
+        ),
+        RoadmapRisk::Cycle { tasks } => format!(
+            "cycle: {}",
+            tasks
+                .iter()
+                .map(|task| safe_export_text(task, 48))
+                .collect::<Vec<_>>()
+                .join(" -> ")
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2152,7 +2274,7 @@ mod tests {
         assert!(summary.contains("workflow: task=Batch inference rollout status=Doing"));
         assert!(summary.contains("next=continue acceptance=6"));
         assert!(summary.contains("deps=3"));
-        assert!(summary.contains("roadmap: ready=0 blocked=3"));
+        assert!(summary.contains("roadmap: ready=2 blocked=1 stages=3 risks=1"));
         assert!(summary.contains("risks: blocked="));
         assert!(summary.contains("verification=2/4"));
         assert!(summary.contains("Batch inference endpoint"));
@@ -2179,6 +2301,25 @@ mod tests {
         assert!(evidence.contains("- agents:"));
         assert!(!evidence.contains("Refactor Terraform modules for multi-region"));
         assert!(!evidence.contains("/Users/demo"));
+    }
+
+    #[test]
+    fn roadmap_markdown_is_redacted_and_structured() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        crate::demo::populate_demo(&mut app);
+
+        let roadmap = app.roadmap_markdown();
+        assert!(roadmap.contains("# abtop roadmap"));
+        assert!(roadmap.contains("## ml-pipeline"));
+        assert!(roadmap.contains("- pipeline:"));
+        assert!(roadmap.contains("- risk detail:"));
+        assert!(roadmap.contains("Batch inference rollout"));
+        assert!(!roadmap.contains("/Users/demo"));
+        assert!(!roadmap.contains("Refactor Terraform modules for multi-region"));
     }
 
     #[test]
@@ -2258,6 +2399,46 @@ mod tests {
         assert!(app.orphan_kill_confirm.is_none());
         let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
         assert_eq!(status, Some("No orphan ports to kill"));
+    }
+
+    #[test]
+    fn control_policy_blocks_session_kill() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            ControlPolicy {
+                allow_kill_sessions: false,
+                allow_kill_orphan_ports: true,
+            },
+        );
+        app.sessions = vec![waiting_session("codex")];
+
+        app.kill_selected();
+
+        assert!(app.kill_confirm.is_none());
+        let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(status.is_some_and(|msg| msg.contains("disabled by local policy")));
+    }
+
+    #[test]
+    fn control_policy_blocks_orphan_port_kill() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            ControlPolicy {
+                allow_kill_sessions: true,
+                allow_kill_orphan_ports: false,
+            },
+        );
+        app.orphan_ports = vec![orphan_port()];
+
+        app.kill_orphan_ports();
+
+        assert!(app.orphan_kill_confirm.is_none());
+        let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(status.is_some_and(|msg| msg.contains("disabled by local policy")));
     }
 
     #[test]

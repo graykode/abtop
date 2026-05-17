@@ -25,12 +25,28 @@ impl Default for PanelVisibility {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct ControlPolicy {
+    pub allow_kill_sessions: bool,
+    pub allow_kill_orphan_ports: bool,
+}
+
+impl Default for ControlPolicy {
+    fn default() -> Self {
+        Self {
+            allow_kill_sessions: true,
+            allow_kill_orphan_ports: true,
+        }
+    }
+}
+
 pub struct AppConfig {
     pub theme: String,
     /// Agent CLI names to exclude from the TUI (e.g. ["codex"] to hide Codex).
     /// Matched case-insensitively against each collector's agent_cli identifier.
     pub hidden_agents: Vec<String>,
     pub panels: PanelVisibility,
+    pub control_policy: ControlPolicy,
     /// UI language override. English is currently the supported UI language.
     /// Kept for config-file compatibility with earlier releases.
     pub language: String,
@@ -42,6 +58,7 @@ impl Default for AppConfig {
             theme: "btop".to_string(),
             hidden_agents: Vec::new(),
             panels: PanelVisibility::default(),
+            control_policy: ControlPolicy::default(),
             language: String::new(),
         }
     }
@@ -62,6 +79,10 @@ pub fn load_config() -> AppConfig {
         Err(_) => return AppConfig::default(),
     };
 
+    parse_config_content(&content)
+}
+
+fn parse_config_content(content: &str) -> AppConfig {
     let mut config = AppConfig::default();
     for line in content.lines() {
         let line = line.trim();
@@ -92,6 +113,12 @@ pub fn load_config() -> AppConfig {
                 "show_ports" => config.panels.ports = parse_bool(val).unwrap_or(true),
                 "show_sessions" => config.panels.sessions = parse_bool(val).unwrap_or(true),
                 "show_mcp" => config.panels.mcp = parse_bool(val).unwrap_or(true),
+                "allow_kill_sessions" => {
+                    config.control_policy.allow_kill_sessions = parse_bool(val).unwrap_or(true)
+                }
+                "allow_kill_orphan_ports" => {
+                    config.control_policy.allow_kill_orphan_ports = parse_bool(val).unwrap_or(true)
+                }
                 _ => {}
             }
         }
@@ -263,6 +290,15 @@ mod tests {
         assert_eq!(parse_bool("true"), Some(true));
         assert_eq!(parse_bool("False"), Some(false));
         assert_eq!(parse_bool("nope"), None);
+    }
+
+    #[test]
+    fn parse_control_policy_keys() {
+        let config =
+            parse_config_content("allow_kill_sessions = false\nallow_kill_orphan_ports = false\n");
+
+        assert!(!config.control_policy.allow_kill_sessions);
+        assert!(!config.control_policy.allow_kill_orphan_ports);
     }
 
     #[test]

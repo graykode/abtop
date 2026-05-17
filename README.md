@@ -52,6 +52,7 @@ abtop                    # Launch TUI
 abtop --once             # Print snapshot and exit
 abtop --workspace-summary # Print redacted Workspace Markdown and exit
 abtop --task-evidence    # Print redacted per-task evidence Markdown and exit
+abtop --roadmap          # Print dependency-aware task roadmap Markdown and exit
 abtop --setup            # Install rate limit collection hook
 abtop --doctor           # Check local setup and collector health
 abtop --doctor --json    # Print machine-readable diagnostics JSON
@@ -144,6 +145,9 @@ theme = "btop"
 hidden_agents = ["codex"]
 # UI language. English is the supported project-facing language.
 language = "en"
+# Local policy gates for mutating controls.
+allow_kill_sessions = true
+allow_kill_orphan_ports = true
 ```
 
 `language` is kept for config-file compatibility. English is currently the supported UI language.
