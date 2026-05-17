@@ -1,4 +1,5 @@
 use crate::collector::{read_rate_limits, McpServer, MultiCollector};
+use crate::evidence::{build_task_evidence, render_task_evidence_markdown};
 use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
 use crate::task::{read_project_state, DwTaskSummary, TaskStatus};
@@ -1241,6 +1242,12 @@ impl App {
         TaskGraph::build(&self.workspace_projects, &self.sessions)
     }
 
+    pub fn task_evidence_markdown(&self) -> String {
+        let graph = self.workspace_task_graph();
+        let bundles = build_task_evidence(&self.workspace_projects, &self.sessions, &graph);
+        render_task_evidence_markdown(&bundles)
+    }
+
     /// Jump to the terminal running the selected session's Claude process.
     /// In tmux: switch to the pane. Otherwise: no-op.
     pub fn jump_to_session(&mut self) -> JumpOutcome {
@@ -1826,6 +1833,25 @@ mod tests {
             !summary.contains("Refactor Terraform modules for multi-region"),
             "workspace summary should not fall back to raw prompt text\n{summary}"
         );
+    }
+
+    #[test]
+    fn task_evidence_markdown_is_redacted_and_structured() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        crate::demo::populate_demo(&mut app);
+
+        let evidence = app.task_evidence_markdown();
+        assert!(evidence.contains("# abtop task evidence"));
+        assert!(evidence.contains("## ml-pipeline / Batch inference rollout"));
+        assert!(evidence.contains("- next: continue"));
+        assert!(evidence.contains("- graph:"));
+        assert!(evidence.contains("- agents:"));
+        assert!(!evidence.contains("Refactor Terraform modules for multi-region"));
+        assert!(!evidence.contains("/Users/demo"));
     }
 
     #[test]

@@ -22,8 +22,8 @@ Use it together with `docs/PRODUCT_STRATEGY.md`, `docs/ROADMAP_V2.md`, and
 
 ## Current Focus
 
-`P3-EVD-01`: add safe per-task evidence bundles on top of the task graph and
-workspace summary surfaces.
+`P4-AUD-01`: decide and implement the local audit log before adding any
+mutating control actions.
 
 ## Task Board
 
@@ -40,58 +40,54 @@ workspace summary surfaces.
 | P1-T04 | Done | Peirce + Codex | Task-aware workspace | Task status normalization | Map dw-kit state to `ready`, `doing`, `blocked`, `review`, `done`, and `unknown`. | P1-T01 | task model, tests | `task::dw::tests::*`; app next-action mapping |
 | P2-VIS-01 | Done | Codex | Visual task viewer | TUI task tree view | Add read-only task tree before any graphical mind map. | P1-T01, P1-T02 | UI module, tests | `cargo fmt -- --check`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; refreshed `assets/workspace-demo.gif` |
 | P2-VIS-02 | Done | Codex | Visual task viewer | Mind-map data model prototype | Create graph nodes/edges for tasks, decisions, sessions, files, and risks. | P2-VIS-01 | `src/task_graph/*`, docs | `cargo test task_graph`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; demo summary graph stats |
-| P3-EVD-01 | Next | Unassigned | Evidence bundles | Per-task evidence bundle | Export safe per-task evidence: sessions, commands, files touched, checks, decisions. | P1-T03, P2-VIS-02 | export module, tests | Pending |
+| P3-EVD-01 | Done | Codex | Evidence bundles | Per-task evidence bundle | Export safe per-task evidence: sessions, commands, files touched, checks, decisions. | P1-T03, P2-VIS-02 | export module, tests | `cargo test evidence`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo run -- --demo --task-evidence` |
 | P4-AUD-01 | Blocked | Unassigned | Controls | Local audit log | Add append-only audit log before any mutating control action. | Product decision | audit module, docs | Pending |
 | P4-CTL-01 | Blocked | Unassigned | Controls | Mutating control actions | Kill/restart/archive/dispatch actions with confirmation and audit. | P4-AUD-01 | app/ui/control modules | Pending |
 
-## Next Task Detail: P3-EVD-01
+## Next Task Detail: P4-AUD-01
 
 Target user:
 
-- Solo power user and small team that need shareable proof that agent work
-  advanced a task safely.
+- Solo power user and small team that want abtop to eventually trigger or
+  modify agent/task state without losing trust.
 
 Pain solved:
 
-- The workspace can show task state and graph stats, but there is no focused
-  per-task evidence bundle for review, handoff, or pitch demos.
+- Mutating controls are powerful but risky. Before kill/restart/archive/dispatch
+  actions, the product needs an append-only local audit trail.
 
 Hypothesis:
 
-- A privacy-safe evidence bundle makes abtop useful beyond live monitoring:
-  users can verify outcomes without exposing prompts or file contents.
+- A visible, local-first audit log makes future controls safer and easier to
+  explain during manual review or demos.
 
 Data sources:
 
-- `WorkspaceTask` summaries,
-- `TaskGraph`,
-- selected session status, sanitized tool names, verification counts, decisions,
-  records, and redacted file identifiers where safe.
+- User-triggered control events,
+- target project/session/task identifiers,
+- timestamp, action, outcome, and sanitized reason.
 
 Privacy risk:
 
-- Evidence exports can leak prompts, absolute paths, and file contents. Keep
-  bundles to labels, counts, statuses, commands/tool names, and sanitized
-  relative identifiers.
+- Audit logs can become sensitive operational history. Store no prompts, file
+  contents, task body text, credentials, or absolute private paths.
 
 Expected design:
 
-- Add a safe export model/function first.
-- Include task title, status, next action, verification progress, related graph
-  node counts, sessions, and decisions/records counts.
-- Avoid raw task markdown, prompts, tool inputs, file contents, and absolute
-  local paths.
+- Add append-only JSONL or structured text log under a local abtop cache/config
+  path.
+- Add a narrow writer API and tests before wiring any mutating control.
+- Keep P4-CTL-01 blocked until this is done.
 
 Suggested write scope:
 
-- `src/evidence/*` or a narrow export module,
-- `src/app.rs` only for bridge methods or CLI surface,
-- tests for privacy and deterministic output.
+- `src/audit/*`,
+- config/path helper if needed,
+- docs and tests.
 
 EVD target:
 
-- `cargo test evidence`,
-- `cargo test workspace`,
+- `cargo test audit`,
 - `cargo fmt -- --check`,
 - `cargo clippy --all-targets --all-features -- -D warnings`.
 
