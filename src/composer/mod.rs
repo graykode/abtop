@@ -352,7 +352,21 @@ fn build_command_for(agent: &DispatchAgent) -> Option<Command> {
             cmd.arg("--print");
             Some(cmd)
         }
-        // Codex + OpenCode dispatch land in P6-UX-01 step 6.
+        "codex-cli" => {
+            // `codex exec` is the non-interactive entry on recent Codex CLI
+            // builds. Older versions may not expose it — operators see a
+            // `spawn failed` / `exit N` audit event and can fall back to
+            // disabling `allow_dispatch_codex`.
+            let mut cmd = Command::new("codex");
+            cmd.arg("exec");
+            Some(cmd)
+        }
+        // OpenCode does not yet expose a documented one-shot
+        // non-interactive surface that matches the dispatch contract
+        // (read brief from stdin, exit on completion). We keep
+        // `allow_dispatch_opencode` for forward compatibility but the
+        // pipeline emits a `Failed` result until a stable command lands.
+        // See `docs/LIMITATIONS.md` § *OpenCode dispatch*.
         _ => None,
     }
 }
@@ -735,6 +749,50 @@ mod tests {
         assert_eq!(result.response_bytes, 0);
         assert!(result.response_path.is_none());
         assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn build_command_for_claude_uses_print_flag() {
+        let cmd = build_command_for(&DispatchAgent::claude()).expect("claude command");
+        assert_eq!(cmd.get_program(), "claude");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["--print"]);
+    }
+
+    #[test]
+    fn build_command_for_codex_uses_exec_subcommand() {
+        let cmd = build_command_for(&DispatchAgent::codex()).expect("codex command");
+        assert_eq!(cmd.get_program(), "codex");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["exec"]);
+    }
+
+    #[test]
+    fn build_command_for_opencode_returns_none() {
+        assert!(build_command_for(&DispatchAgent::opencode()).is_none());
+    }
+
+    #[test]
+    fn spawn_dispatch_opencode_emits_failed_result() {
+        let req = DispatchRequest {
+            agent: DispatchAgent::opencode(),
+            ..sample_request(false)
+        };
+        let rx = spawn_dispatch(req);
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("failed result must arrive promptly");
+        assert_eq!(result.outcome, DispatchOutcome::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|err| err.contains("no dispatch command wired")));
     }
 
     #[test]
