@@ -172,19 +172,37 @@ All five Agentic Workspace surfaces:
 `--handoff --json` carries a stable schema (`abtop.agent_handoff.v1`) suitable
 as startup context for another agent.
 
+### Dispatch composer (`d`)
+
+When a `.dw` task is selected on the Workspace tab and at least one
+`allow_dispatch_*` flag is enabled in `~/.config/abtop/config.toml`, press
+`d` to open the dispatch composer. The composer builds a redacted brief
+from the task and your typed instruction, requires a double-Enter
+confirmation inside a 5s window, and spawns a one-shot non-interactive
+call to the chosen agent. Set `ABTOP_DISPATCH_DRY_RUN=1` to walk the whole
+flow without spawning a real child.
+
+Coverage:
+
+- **Claude** — `claude --print` (stdin = brief + draft)
+- **Codex** — `codex exec` (best-effort; older Codex builds may exit non-zero)
+- **OpenCode** — not wired in the current MVP; see `docs/LIMITATIONS.md`
+
+Dispatch responses are redacted, capped at 256 KB, and saved next to the
+audit log; the TUI never renders the response body.
+
 ### Roadmap of this surface
 
 What is **in scope today**: read-only task/runtime view, redacted exports,
-audited destructive controls (`kill session`, `kill orphan port`).
+audited destructive controls (`kill session`, `kill orphan port`),
+audited one-shot dispatch composer for Claude/Codex.
 
 What is **deliberately deferred** (per `docs/AGENT_HANDOFF.md`):
 
-- automatic task dispatch and reply,
-- direct agent-to-agent private chat in abtop,
+- automatic dispatch loops (multi-turn replies driven by abtop),
+- direct agent-to-agent private chat,
+- keystroke injection into a live REPL,
 - cloud/team sync.
-
-These can only be added after the policy + audit + redaction model is
-extended — see `P4-DSP-01` and `P6-UX-01` in `docs/EXECUTION_BOARD.md`.
 
 ## Supported Agents
 

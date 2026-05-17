@@ -144,25 +144,48 @@ memory files. These can contain secrets.
 
 ## Mutating Controls
 
-Only two mutating actions are wired today:
+Three mutating actions are wired today:
 
 - `x` — kill the selected session,
-- `X` — kill all orphan ports.
+- `X` — kill all orphan ports,
+- `d` — open the dispatch composer for the selected workspace task
+  (`P6-UX-01`, opt-in per agent).
 
-Both require a confirmation keypress within `KILL_CONFIRM_WINDOW_SECS` (2s),
-verify the target PID still matches the expected command, and write an
-append-only audit event for every outcome (`requested`, `confirmed`,
-`skipped`, `blocked`, `sent`, `failed`).
+Kill actions require a confirmation keypress within
+`KILL_CONFIRM_WINDOW_SECS` (2s); dispatch uses a separate
+`DISPATCH_CONFIRM_WINDOW_SECS` (5s). All three verify the target before
+mutating and write an append-only audit event for every outcome
+(`requested`, `confirmed`, `skipped`, `blocked`, `sent`, `failed`,
+`dry-run`).
 
-Set `ABTOP_CONTROL_DRY_RUN=1` to audit a verified control flow without
-actually terminating processes.
+Set `ABTOP_CONTROL_DRY_RUN=1` or `ABTOP_DISPATCH_DRY_RUN=1` to audit a
+verified flow without actually killing or dispatching.
 
 Disable mutating controls entirely in `~/.config/abtop/config.toml`:
 
 ```toml
-allow_kill_sessions = false
+allow_kill_sessions     = false
 allow_kill_orphan_ports = false
+allow_dispatch_claude   = false   # default
+allow_dispatch_codex    = false   # default
+allow_dispatch_opencode = false   # default
 ```
+
+### Dispatch coverage
+
+| Agent     | Status in current MVP                                              |
+|-----------|--------------------------------------------------------------------|
+| Claude    | wired via `claude --print` (stdin = brief + draft)                 |
+| Codex     | wired via `codex exec` (best-effort; older builds may not support) |
+| OpenCode  | **not wired** — no stable non-interactive surface yet; opting in   |
+|           | with `allow_dispatch_opencode = true` emits a `Failed` audit event |
+|           | until a documented command lands.                                  |
+
+Dispatch responses are redacted (`collector::redact_secrets` +
+`sanitize_terminal_text`), truncated at 256 KB, and written to
+`{audit_dir}/dispatch/{rfc3339-ts}-{task-slug}-{agent}.md` so reviewers can
+read them offline. The TUI only shows the byte count, outcome, and saved
+path — never the response body.
 
 ## Deliberately Deferred
 
