@@ -1,39 +1,152 @@
 # Agent Handoff Protocol
 
-This document helps another agent resume work without reading the entire chat.
+This document is the fastest way for another agent to resume work on this fork
+without reading the full chat. It is written for Codex, Claude Code, and any
+future local coding agent working in the same repository.
 
-For a shorter resume brief, read `docs/COMPACT_CONTEXT.md`.
+For a shorter compaction brief, read `docs/COMPACT_CONTEXT.md`.
+
+## Current State
+
+Branch:
+
+```text
+codex/agentic-workspace-mvp
+```
+
+Production baseline:
+
+- Local Agentic Workspace GTM baseline is validated.
+- Claude Code and Codex same-project coordination has been tested on a real
+  `.dw` project.
+- Evidence is recorded in `docs/PRODUCTION_EVIDENCE.md`.
+- Production gate is documented in `docs/PRODUCTION_READINESS.md`.
+- CI now runs format, strict clippy, tests, and release build.
+
+Implemented product surface:
+
+- Claude Code, Codex CLI, and OpenCode session monitoring.
+- Claude and Codex quota display.
+- Windows local setup, StatusLine setup, process scan, and TCP port detection.
+- `.dw` task/workflow reader.
+- Workspace TUI with task/runtime view, roadmap signals, and compact handoff
+  lanes.
+- Dependency-aware roadmap export: `cargo run -- --roadmap`.
+- Cross-agent handoff export:
+  - human Markdown: `cargo run -- --handoff`,
+  - machine JSON: `cargo run -- --handoff --json`.
+- Safe task evidence export: `cargo run -- --task-evidence`.
+- Audited, confirmation-gated destructive controls.
+
+Current next task:
+
+```text
+P5-GTM-05: Release packaging and user-facing onboarding
+```
+
+Goal:
+
+- Make the validated baseline easy for a real user to install, understand, and
+  try.
+- Keep the product promise narrow and honest: local-first monitoring,
+  task-aware workspace intelligence, evidence, roadmap, and handoff.
+
+## Product Strategy
+
+The product is moving from "btop for agents" toward a local-first Agentic
+Workspace.
+
+Core thesis:
+
+```text
+dw-kit task graph + abtop runtime graph = agentic work graph
+```
+
+Moat:
+
+- Cross-agent local telemetry.
+- Task/runtime fusion.
+- Privacy-first evidence and handoff.
+- Local audit and policy controls before automation.
+- A shared workspace protocol that lets Claude Code and Codex coordinate without
+  needing a fragile private chat channel.
+
+Strategic rule:
+
+- Prefer shared task state, evidence, blockers, and handoff artifacts.
+- Do not build direct agent-to-agent chat as the source of truth.
+- Do not add automatic dispatch until policy, audit, rollback, and redaction are
+  explicit.
 
 ## First Five Minutes
 
 1. Read `AGENTS.md`.
-2. Read `docs/EXECUTION_BOARD.md`.
-3. Read `docs/ROADMAP_V2.md`.
-4. Check the current branch and worktree:
+2. Read this file.
+3. Read `docs/EXECUTION_BOARD.md`.
+4. Read `docs/PRODUCTION_READINESS.md`.
+5. Check branch and worktree:
 
    ```powershell
    git status --short --branch
    git log --oneline -5
    ```
 
-5. If the user asks for product direction, read `docs/PRODUCT_STRATEGY.md` and
-   `docs/COMPETITIVE_MAP.md`.
+6. Check the live workspace surface if sessions are running:
 
-## Claiming Work
+   ```powershell
+   cargo run -- --doctor
+   cargo run -- --workspace-summary
+   cargo run -- --roadmap
+   cargo run -- --handoff
+   cargo run -- --handoff --json
+   ```
 
-Before changing files:
+## Coordination Rules
 
-1. Pick one `Next` task from `docs/EXECUTION_BOARD.md`.
-2. Change its status to `Doing`.
-3. Set owner to your agent label, for example `Codex`.
-4. Keep the write scope close to the task.
-5. Update the board again before the final response.
+Use the repository task board as the source of truth:
 
-If you cannot finish:
+- `docs/EXECUTION_BOARD.md` owns task status.
+- Pick one `Next` task.
+- Change it to `Doing` before editing.
+- Set owner to your agent label, for example `Claude Code` or `Codex`.
+- Keep write scope narrow and documented.
+- Mark `Done` only after EVD passes.
 
-- leave status as `Doing`,
-- add a handoff note with the blocker and next command,
-- do not mark EVD as complete.
+Use `.dw` as the workflow substrate when present:
+
+- Read `.dw/tasks/ACTIVE.md` for local active task state.
+- Use `.dw` task docs to understand task intent, dependencies, phase, and
+  progress.
+- Keep `.dw` writes intentional and task-scoped.
+- Do not commit generated dw-kit framework files unless the user explicitly asks.
+- Do not delete or overwrite `.dw` or `.claude` local workflow assets.
+
+Use abtop exports as the cross-agent shared protocol:
+
+- `--roadmap` answers what should happen first, next, and last.
+- `--handoff` gives a human-readable assignment queue.
+- `--handoff --json` gives machine-readable context for another agent.
+- `--task-evidence` gives safe per-task evidence for review.
+
+## Local Workspace Assets
+
+The user has added local `.dw/` and `.claude/` folders in this repository.
+
+Treat them as local workflow assets:
+
+- They may contain generated framework files, hooks, skills, settings, and
+  telemetry.
+- Some files may be useful for Claude Code runtime behavior.
+- Some files may be local-only and should not be committed.
+- Before staging anything under `.dw/` or `.claude/`, inspect `.gitignore`,
+  `.dw/.gitignore`, and ask whether the user wants those assets tracked.
+
+Current `.dw` note:
+
+- `.dw/tasks/ACTIVE.md` exists.
+- It may be auto-generated by `dw active`.
+- If task state looks stale, refresh via the user's dw workflow rather than
+  inventing task state manually.
 
 ## Required Final State
 
@@ -43,26 +156,44 @@ For code changes:
 cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo build
+```
+
+For Workspace, roadmap, handoff, or export changes also run:
+
+```powershell
+cargo test workspace
+cargo run -- --demo --workspace-summary
+cargo run -- --demo --roadmap
+cargo run -- --demo --handoff
+cargo run -- --demo --handoff --json
+```
+
+For live validation when Claude Code/Codex sessions are running:
+
+```powershell
+cargo run -- --doctor
+cargo run -- --workspace-summary
+cargo run -- --roadmap
+cargo run -- --handoff
+cargo run -- --handoff --json
 ```
 
 For docs-only changes:
 
-- run targeted `rg` checks for the new links and terms,
-- ensure docs are in English,
-- keep the board updated.
-
-For visible TUI changes:
-
-- add or update tests,
-- regenerate GIF only when the visible demo flow changes,
-- never commit local EVD files containing private paths or real quota data.
+- Run targeted `rg` checks for new links, task IDs, and key terms.
+- Keep all repo docs in English.
+- Update `docs/EXECUTION_BOARD.md` if task status changed.
 
 ## Privacy Rules
 
 - Do not display prompt text or file contents in Workspace surfaces.
 - Do not log transcript lines, secrets, or full tool inputs.
 - Safe exports should use titles, counts, statuses, and redacted tool labels.
-- Treat local screenshots and GIFs as private unless they use demo data.
+- Treat local screenshots, GIFs, quota data, and real EVD as private unless they
+  use demo data or have been explicitly sanitized.
+- Do not commit private paths, prompt text, transcript bodies, or secret-looking
+  values.
 
 ## Git Rules
 
@@ -71,56 +202,20 @@ For visible TUI changes:
 - Use `docs/UPSTREAM_SYNC.md` for upstream merges.
 - Do not rewrite pushed history.
 - Do not revert user changes.
+- If `.dw/`, `.claude/`, or `.gitignore` have user changes unrelated to your
+  task, leave them alone and mention them in your final status.
 
-## Compact Context Brief
+## Known Limits
 
-Current product thesis:
+Production-ready local baseline does not mean enterprise/cloud product complete.
 
-> abtop should become a local-first Agentic Workspace: a flight recorder,
-> operations cockpit, task/workflow viewer, and safety layer for multi-agent
-> software work.
+Currently out of scope:
 
-Current moat:
-
-```text
-dw-kit task graph + abtop runtime graph = agentic work graph
-```
-
-Current technical state:
-
-- Windows local setup works.
-- Claude and Codex quota work and are labeled as remaining percent.
-- Windows TCP port parsing is fixed.
-- Workspace task/runtime view is implemented.
-- Safe Workspace Markdown export exists.
-- Dependency-aware roadmap export exists.
-- Cross-agent handoff export exists in Markdown and JSON.
-- Workspace TUI renders compact handoff lanes and assignment suggestions.
-- Real same-project Claude Code + Codex validation is captured in
-  `docs/PRODUCTION_EVIDENCE.md`.
-- Upstream sync guide exists.
-- Latest synced upstream fix: OpenCode macOS `lsof -a` cwd lookup.
-
-Current next task:
-
-`P5-GTM-05`: prepare release packaging and user-facing GTM onboarding from the
-validated local Agentic Workspace baseline.
-
-Why it matters:
-
-- It turns the validated local baseline into something a real user can install,
-  understand, and try without reading internal planning docs.
-- It should make production scope and known limitations explicit.
-
-Suggested first implementation:
-
-- Use `docs/PRODUCTION_READINESS.md` and `docs/PRODUCTION_EVIDENCE.md`.
-- Add a concise user-facing onboarding path for the fork.
-- Include install, setup, first run, Workspace, roadmap, handoff, and limitations.
-- Keep all docs in English and avoid private local paths.
-
-Do not start:
-
-- automatic dispatch/reply/restart/archive,
+- automatic agent dispatch,
 - direct agent-to-agent private chat,
-- cloud/team sync before the policy and audit model is explicit.
+- team cloud sync,
+- RBAC,
+- hosted dashboard,
+- remote/SSH monitoring.
+
+Build those only after policy, audit, and redaction gates are designed first.
