@@ -218,6 +218,7 @@ fn run_app(
     let render_interval = Duration::from_millis(500);
 
     loop {
+        app.composer_drain_results();
         terminal.draw(|f| ui::draw(f, &app))?;
 
         // Poll at 500ms for smooth animations; data tick every 2s

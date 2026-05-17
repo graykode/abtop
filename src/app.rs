@@ -2,8 +2,8 @@ use crate::audit::{outcomes, record as record_audit, AuditEvent, DISPATCH_DRY_RU
 use crate::collector::{read_rate_limits, McpServer, MultiCollector};
 use crate::composer::{
     build_brief, cycle_agent as cycle_dispatch_agent, dispatch_action_for_agent,
-    first_allowed_agent, ComposerState, DispatchOutcome, DispatchResult, DispatchTarget,
-    DISPATCH_MAX_DRAFT_LEN,
+    first_allowed_agent, spawn_dispatch, ComposerState, DispatchOutcome, DispatchRequest,
+    DispatchResult, DispatchTarget, DISPATCH_MAX_DRAFT_LEN,
 };
 use crate::config::ControlPolicy;
 use crate::evidence::{build_task_evidence, render_task_evidence_markdown};
@@ -470,6 +470,9 @@ pub struct App {
     /// Composer/dispatch state machine (`P6-UX-01`). `Closed` when no
     /// composer is active. See `docs/COMPOSER_DESIGN.md`.
     pub composer: ComposerState,
+    /// Receiver for an in-flight dispatch's result. `Some` only while a
+    /// background thread is running an agent CLI on behalf of the composer.
+    composer_rx: Option<std::sync::mpsc::Receiver<DispatchResult>>,
 }
 
 impl App {
@@ -542,6 +545,7 @@ impl App {
             view_open: false,
             control_policy,
             composer: ComposerState::default(),
+            composer_rx: None,
         }
     }
 
@@ -1570,8 +1574,8 @@ impl App {
             ComposerState::AwaitConfirm {
                 target,
                 agent,
-                draft: _draft,
-                brief: _brief,
+                draft,
+                brief,
                 requested_at,
             } => {
                 let action = dispatch_action_for_agent(&agent).unwrap_or("dispatch");
@@ -1639,9 +1643,9 @@ impl App {
                     return;
                 }
 
-                // Real dispatch is wired by the spawn subtask (P6-UX-01 step
-                // 4). For now, audit the confirmation but emit `failed` so
-                // operators get a clear signal the pipeline is not yet live.
+                // Real dispatch: audit `confirmed`, then spawn a background
+                // job. The tick loop will receive the result and transition
+                // the composer to `Done` (sent) or `Failed`.
                 record_audit(&AuditEvent::new(
                     action,
                     "task",
@@ -1650,21 +1654,23 @@ impl App {
                     outcomes::CONFIRMED,
                     Some(agent.cli.as_str()),
                 ));
-                record_audit(&AuditEvent::new(
-                    action,
-                    "task",
-                    &target.task_id,
-                    Some(&target.project),
-                    outcomes::FAILED,
-                    Some("spawn pipeline not yet wired"),
+
+                let request = DispatchRequest {
+                    target: target.clone(),
+                    agent: agent.clone(),
+                    brief,
+                    draft,
+                    dry_run: false,
+                };
+                self.composer_rx = Some(spawn_dispatch(request));
+                self.set_status(format!(
+                    "Dispatching {} → {}…",
+                    target.task_title, agent.label
                 ));
-                self.set_status(
-                    "Dispatch spawn pipeline not yet wired (use ABTOP_DISPATCH_DRY_RUN=1 to test)"
-                        .into(),
-                );
-                self.composer = ComposerState::Failed {
-                    agent_cli: agent.cli.clone(),
-                    error: "dispatch spawn not implemented (P6-UX-01 step 4)".into(),
+                self.composer = ComposerState::Dispatching {
+                    target,
+                    agent,
+                    started_at,
                 };
             }
             ComposerState::Dispatching {
@@ -1710,6 +1716,81 @@ impl App {
             }
             ComposerState::Done { .. } | ComposerState::Failed { .. } => {
                 // Already terminal — closing is just cleanup.
+            }
+        }
+    }
+
+    /// Drain any pending dispatch result without blocking. Called from the
+    /// main event loop between polls so a `Dispatching` composer can advance
+    /// to `Done` / `Failed` within one render cycle of the background
+    /// thread finishing.
+    ///
+    /// Always audits `sent` or `failed` regardless of the current composer
+    /// state — if the user cancelled the overlay while the spawn was in
+    /// flight we still want the outcome on record.
+    pub fn composer_drain_results(&mut self) {
+        let Some(rx) = self.composer_rx.as_ref() else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.composer_rx = None;
+                return;
+            }
+        };
+        self.composer_rx = None;
+
+        let action = crate::audit::dispatch_action_for(&result.agent_cli).unwrap_or("dispatch");
+        let outcome = match result.outcome {
+            DispatchOutcome::Sent => outcomes::SENT,
+            DispatchOutcome::DryRun => outcomes::DRY_RUN,
+            DispatchOutcome::Failed => outcomes::FAILED,
+        };
+        let reason: String = match (result.outcome, result.error.as_deref()) {
+            (DispatchOutcome::Failed, Some(err)) => err.to_string(),
+            _ => format!("{} bytes", result.response_bytes),
+        };
+        record_audit(&AuditEvent::new(
+            action,
+            "task",
+            &result.task_id,
+            Some(&result.project),
+            outcome,
+            Some(reason.as_str()),
+        ));
+
+        // Update composer state only if it's still tracking this dispatch.
+        let still_dispatching = matches!(
+            &self.composer,
+            ComposerState::Dispatching { target, agent, .. }
+                if target.task_id == result.task_id && agent.cli == result.agent_cli
+        );
+        if !still_dispatching {
+            return;
+        }
+
+        match result.outcome {
+            DispatchOutcome::Sent | DispatchOutcome::DryRun => {
+                let outcome_label = if matches!(result.outcome, DispatchOutcome::DryRun) {
+                    "dry-run"
+                } else {
+                    "sent"
+                };
+                self.set_status(format!(
+                    "Dispatch {outcome_label}: {} → {} ({} bytes)",
+                    result.task_id, result.agent_cli, result.response_bytes
+                ));
+                self.composer = ComposerState::Done { result };
+            }
+            DispatchOutcome::Failed => {
+                let error = result.error.clone().unwrap_or_else(|| "unknown".into());
+                self.set_status(format!("Dispatch failed: {error}"));
+                self.composer = ComposerState::Failed {
+                    agent_cli: result.agent_cli,
+                    error,
+                };
             }
         }
     }
@@ -3317,6 +3398,150 @@ mod tests {
             app.composer.agent().map(|a| a.cli.as_str()),
             Some("codex-cli")
         );
+    }
+
+    fn sample_dispatch_target() -> DispatchTarget {
+        DispatchTarget {
+            project: "ml-pipeline".into(),
+            task_id: "dataset-drift-guardrails".into(),
+            task_title: "Dataset drift guardrails".into(),
+            task_status: "Ready".into(),
+            task_phase: Some("Plan".into()),
+            acceptance_count: 3,
+            verification_completed: 0,
+            verification_total: 1,
+            dependency_count: 0,
+        }
+    }
+
+    fn put_app_in_dispatching(app: &mut App) {
+        app.workspace_projects = vec![dispatchable_project()];
+        app.composer = ComposerState::Dispatching {
+            target: sample_dispatch_target(),
+            agent: crate::composer::DispatchAgent::claude(),
+            started_at: Utc::now(),
+        };
+    }
+
+    #[test]
+    fn composer_drain_results_is_noop_when_no_rx() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            policy_with_claude(),
+        );
+        put_app_in_dispatching(&mut app);
+
+        app.composer_drain_results();
+
+        assert_eq!(app.composer.stage_label(), "dispatching");
+    }
+
+    #[test]
+    fn composer_drain_results_transitions_to_done_on_sent_result() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            policy_with_claude(),
+        );
+        put_app_in_dispatching(&mut app);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(DispatchResult {
+            outcome: DispatchOutcome::Sent,
+            agent_cli: "claude-code".into(),
+            task_id: "dataset-drift-guardrails".into(),
+            project: "ml-pipeline".into(),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            response_bytes: 1234,
+            response_path: None,
+            error: None,
+        })
+        .unwrap();
+        drop(tx);
+        app.composer_rx = Some(rx);
+
+        app.composer_drain_results();
+
+        assert_eq!(app.composer.stage_label(), "done");
+        let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(
+            status.is_some_and(|msg| msg.contains("1234 bytes")),
+            "status: {status:?}"
+        );
+    }
+
+    #[test]
+    fn composer_drain_results_transitions_to_failed_on_failed_result() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            policy_with_claude(),
+        );
+        put_app_in_dispatching(&mut app);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(DispatchResult {
+            outcome: DispatchOutcome::Failed,
+            agent_cli: "claude-code".into(),
+            task_id: "dataset-drift-guardrails".into(),
+            project: "ml-pipeline".into(),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            response_bytes: 0,
+            response_path: None,
+            error: Some("spawn failed: command not found".into()),
+        })
+        .unwrap();
+        drop(tx);
+        app.composer_rx = Some(rx);
+
+        app.composer_drain_results();
+
+        assert_eq!(app.composer.stage_label(), "failed");
+        let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(
+            status.is_some_and(|msg| msg.contains("Dispatch failed")),
+            "status: {status:?}"
+        );
+    }
+
+    #[test]
+    fn composer_drain_results_drops_result_when_composer_closed() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            policy_with_claude(),
+        );
+        // Composer is Closed; the user already cancelled.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(DispatchResult {
+            outcome: DispatchOutcome::Sent,
+            agent_cli: "claude-code".into(),
+            task_id: "task".into(),
+            project: "proj".into(),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            response_bytes: 10,
+            response_path: None,
+            error: None,
+        })
+        .unwrap();
+        drop(tx);
+        app.composer_rx = Some(rx);
+
+        app.composer_drain_results();
+
+        // State stays Closed: cancelled dispatches do not zombie back to Done.
+        assert_eq!(app.composer.stage_label(), "closed");
+        // But the audit-side effect (record_audit) still happened — verified
+        // implicitly by the function returning without panicking.
+        assert!(app.composer_rx.is_none(), "receiver should be drained");
     }
 
     #[test]
