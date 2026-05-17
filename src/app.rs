@@ -1,5 +1,10 @@
-use crate::audit::{record as record_audit, AuditEvent};
+use crate::audit::{outcomes, record as record_audit, AuditEvent, DISPATCH_DRY_RUN_ENV};
 use crate::collector::{read_rate_limits, McpServer, MultiCollector};
+use crate::composer::{
+    build_brief, cycle_agent as cycle_dispatch_agent, dispatch_action_for_agent,
+    first_allowed_agent, ComposerState, DispatchOutcome, DispatchResult, DispatchTarget,
+    DISPATCH_MAX_DRAFT_LEN,
+};
 use crate::config::ControlPolicy;
 use crate::evidence::{build_task_evidence, render_task_evidence_markdown};
 use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
@@ -8,6 +13,7 @@ use crate::roadmap::{build_project_roadmap, RoadmapPlan, RoadmapRisk};
 use crate::task::{read_project_state, DwTaskSummary, TaskStatus};
 use crate::task_graph::{GraphNodeKind, TaskGraph};
 use crate::theme::Theme;
+use chrono::Utc;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -334,6 +340,43 @@ fn task_status_rank(status: TaskStatus) -> u8 {
     }
 }
 
+/// Pick the best dispatchable task from a workspace project, mapping it to
+/// a sanitized `DispatchTarget` ready for the composer.
+///
+/// Preference: the project's active task (if any and not `Done`), otherwise
+/// the first task in `Ready` / `Doing` / `Review`. Returns `None` if the
+/// project has no `.dw` task data or nothing dispatchable.
+fn pick_dispatchable_task(project: &WorkspaceProject) -> Option<DispatchTarget> {
+    if !project.has_dw || project.tasks.is_empty() {
+        return None;
+    }
+
+    let task = project
+        .tasks
+        .iter()
+        .find(|task| task.is_active && task.status != TaskStatus::Done)
+        .or_else(|| {
+            project.tasks.iter().find(|task| {
+                matches!(
+                    task.status,
+                    TaskStatus::Ready | TaskStatus::Doing | TaskStatus::Review
+                )
+            })
+        })?;
+
+    Some(DispatchTarget {
+        project: project.name.clone(),
+        task_id: DispatchTarget::slug_from_title(&task.title),
+        task_title: task.title.clone(),
+        task_status: task.status_label().to_string(),
+        task_phase: task.phase.clone(),
+        acceptance_count: task.acceptance_count,
+        verification_completed: task.completed_verification_count,
+        verification_total: task.verification_count,
+        dependency_count: task.dependencies.len(),
+    })
+}
+
 fn workspace_identity_key(cwd: &str) -> String {
     let path = std::path::Path::new(cwd);
     let normalized = path
@@ -424,6 +467,9 @@ pub struct App {
     /// View leader overlay (`v`) visibility.
     pub view_open: bool,
     pub control_policy: ControlPolicy,
+    /// Composer/dispatch state machine (`P6-UX-01`). `Closed` when no
+    /// composer is active. See `docs/COMPOSER_DESIGN.md`.
+    pub composer: ComposerState,
 }
 
 impl App {
@@ -495,6 +541,7 @@ impl App {
             help_open: false,
             view_open: false,
             control_policy,
+            composer: ComposerState::default(),
         }
     }
 
@@ -1392,6 +1439,326 @@ impl App {
         }
     }
 
+    // ─── Composer / dispatch (P6-UX-01) ──────────────────────────────────
+    // Spawn pipeline is wired by a follow-up subtask; this layer only owns
+    // the state machine and the audit events for every transition. See
+    // `docs/COMPOSER_DESIGN.md`.
+
+    /// Open the composer for the currently selected workspace project's
+    /// active (or best-available) task. Emits a `blocked` audit event when
+    /// no dispatch agent is allowed by policy, and a `skipped` event when
+    /// no dispatchable task is available.
+    pub fn open_composer(&mut self) {
+        if self.composer.is_open() {
+            // Idempotent: already open, do nothing.
+            return;
+        }
+
+        let Some(project) = self.workspace_projects.get(self.workspace_selected) else {
+            self.set_status("No workspace project selected for dispatch".into());
+            return;
+        };
+        let project_name = project.name.clone();
+
+        let Some(task) = pick_dispatchable_task(project) else {
+            record_audit(&AuditEvent::new(
+                "dispatch",
+                "task",
+                "none",
+                Some(&project_name),
+                outcomes::SKIPPED,
+                Some("no dispatchable task in selected project"),
+            ));
+            self.set_status(format!("No dispatchable task in project {project_name}"));
+            return;
+        };
+
+        let Some(agent) = first_allowed_agent(&self.control_policy) else {
+            // No dispatch policy enabled — audit and refuse to open.
+            record_audit(&AuditEvent::new(
+                "dispatch",
+                "task",
+                &task.task_id,
+                Some(&project_name),
+                outcomes::BLOCKED,
+                Some("no dispatch agent enabled in local policy"),
+            ));
+            self.set_status("Dispatch disabled by local policy (allow_dispatch_* = false)".into());
+            return;
+        };
+
+        let brief = build_brief(&task, project.active_task_next_action());
+
+        self.composer = ComposerState::Drafting {
+            target: task,
+            agent,
+            draft: String::new(),
+            brief,
+        };
+        self.set_status("Composer opened — Enter to preview, Esc to cancel".into());
+    }
+
+    /// Append a character to the composer draft. No-op outside `Drafting`.
+    pub fn composer_input_char(&mut self, ch: char) {
+        if let ComposerState::Drafting { draft, .. } = &mut self.composer {
+            if draft.chars().count() < DISPATCH_MAX_DRAFT_LEN {
+                draft.push(ch);
+            }
+        }
+    }
+
+    /// Remove the last character of the composer draft. No-op outside
+    /// `Drafting`.
+    pub fn composer_backspace(&mut self) {
+        if let ComposerState::Drafting { draft, .. } = &mut self.composer {
+            draft.pop();
+        }
+    }
+
+    /// Advance the composer state machine by one step (Enter pressed).
+    ///
+    /// Transitions:
+    /// - `Drafting` → `PreviewBrief`
+    /// - `PreviewBrief` → `AwaitConfirm` (audit `requested`)
+    /// - `AwaitConfirm` → `Done` (dry-run env) / `Failed` (spawn-not-wired)
+    ///   / `Closed` (policy blocked or confirm expired)
+    /// - `Done` / `Failed` → `Closed`
+    pub fn composer_advance(&mut self) {
+        let state = std::mem::replace(&mut self.composer, ComposerState::Closed);
+        match state {
+            ComposerState::Closed => {}
+            ComposerState::Drafting {
+                target,
+                agent,
+                draft,
+                brief,
+            } => {
+                self.composer = ComposerState::PreviewBrief {
+                    target,
+                    agent,
+                    draft,
+                    brief,
+                };
+            }
+            ComposerState::PreviewBrief {
+                target,
+                agent,
+                draft,
+                brief,
+            } => {
+                let action = dispatch_action_for_agent(&agent).unwrap_or("dispatch");
+                record_audit(&AuditEvent::new(
+                    action,
+                    "task",
+                    &target.task_id,
+                    Some(&target.project),
+                    outcomes::REQUESTED,
+                    Some(agent.cli.as_str()),
+                ));
+                self.set_status(format!(
+                    "Press Enter within 5s to dispatch to {} — Esc cancels",
+                    agent.label
+                ));
+                self.composer = ComposerState::AwaitConfirm {
+                    target,
+                    agent,
+                    draft,
+                    brief,
+                    requested_at: Instant::now(),
+                };
+            }
+            ComposerState::AwaitConfirm {
+                target,
+                agent,
+                draft: _draft,
+                brief: _brief,
+                requested_at,
+            } => {
+                let action = dispatch_action_for_agent(&agent).unwrap_or("dispatch");
+
+                if requested_at.elapsed().as_secs() >= crate::composer::DISPATCH_CONFIRM_WINDOW_SECS
+                {
+                    record_audit(&AuditEvent::new(
+                        action,
+                        "task",
+                        &target.task_id,
+                        Some(&target.project),
+                        outcomes::SKIPPED,
+                        Some("confirm window expired"),
+                    ));
+                    self.set_status("Dispatch cancelled — confirm window expired".into());
+                    self.composer = ComposerState::Closed;
+                    return;
+                }
+
+                if !self.control_policy.is_dispatch_allowed(&agent.cli) {
+                    record_audit(&AuditEvent::new(
+                        action,
+                        "task",
+                        &target.task_id,
+                        Some(&target.project),
+                        outcomes::BLOCKED,
+                        Some("disabled by local policy"),
+                    ));
+                    self.set_status(format!(
+                        "Dispatch to {} blocked by local policy",
+                        agent.label
+                    ));
+                    self.composer = ComposerState::Closed;
+                    return;
+                }
+
+                let dry_run = dispatch_dry_run_enabled();
+
+                let started_at = Utc::now();
+                if dry_run {
+                    record_audit(&AuditEvent::new(
+                        action,
+                        "task",
+                        &target.task_id,
+                        Some(&target.project),
+                        outcomes::DRY_RUN,
+                        Some(agent.cli.as_str()),
+                    ));
+                    let result = DispatchResult {
+                        outcome: DispatchOutcome::DryRun,
+                        agent_cli: agent.cli.clone(),
+                        task_id: target.task_id.clone(),
+                        project: target.project.clone(),
+                        started_at,
+                        finished_at: Utc::now(),
+                        response_bytes: 0,
+                        response_path: None,
+                        error: None,
+                    };
+                    self.set_status(format!(
+                        "Dispatch dry-run: {} → {}",
+                        target.task_title, agent.label
+                    ));
+                    self.composer = ComposerState::Done { result };
+                    return;
+                }
+
+                // Real dispatch is wired by the spawn subtask (P6-UX-01 step
+                // 4). For now, audit the confirmation but emit `failed` so
+                // operators get a clear signal the pipeline is not yet live.
+                record_audit(&AuditEvent::new(
+                    action,
+                    "task",
+                    &target.task_id,
+                    Some(&target.project),
+                    outcomes::CONFIRMED,
+                    Some(agent.cli.as_str()),
+                ));
+                record_audit(&AuditEvent::new(
+                    action,
+                    "task",
+                    &target.task_id,
+                    Some(&target.project),
+                    outcomes::FAILED,
+                    Some("spawn pipeline not yet wired"),
+                ));
+                self.set_status(
+                    "Dispatch spawn pipeline not yet wired (use ABTOP_DISPATCH_DRY_RUN=1 to test)"
+                        .into(),
+                );
+                self.composer = ComposerState::Failed {
+                    agent_cli: agent.cli.clone(),
+                    error: "dispatch spawn not implemented (P6-UX-01 step 4)".into(),
+                };
+            }
+            ComposerState::Dispatching {
+                target,
+                agent,
+                started_at,
+            } => {
+                // Background job in flight — Enter is a no-op; the tick loop
+                // will transition to Done/Failed when the channel resolves.
+                self.composer = ComposerState::Dispatching {
+                    target,
+                    agent,
+                    started_at,
+                };
+            }
+            ComposerState::Done { .. } | ComposerState::Failed { .. } => {
+                self.composer = ComposerState::Closed;
+            }
+        }
+    }
+
+    /// Cancel the composer (Esc). Audits `skipped` when cancelling past the
+    /// `Drafting` stage; closes the overlay either way.
+    pub fn composer_cancel(&mut self) {
+        let state = std::mem::replace(&mut self.composer, ComposerState::Closed);
+        match state {
+            ComposerState::Closed | ComposerState::Drafting { .. } => {
+                // No audit: user never declared intent to dispatch.
+            }
+            ComposerState::PreviewBrief { target, agent, .. }
+            | ComposerState::AwaitConfirm { target, agent, .. }
+            | ComposerState::Dispatching { target, agent, .. } => {
+                let action = dispatch_action_for_agent(&agent).unwrap_or("dispatch");
+                record_audit(&AuditEvent::new(
+                    action,
+                    "task",
+                    &target.task_id,
+                    Some(&target.project),
+                    outcomes::SKIPPED,
+                    Some("cancelled by user"),
+                ));
+                self.set_status("Dispatch cancelled".into());
+            }
+            ComposerState::Done { .. } | ComposerState::Failed { .. } => {
+                // Already terminal — closing is just cleanup.
+            }
+        }
+    }
+
+    /// Cycle the target agent to the next one allowed by local policy.
+    /// No-op outside the editable stages (`Drafting` / `PreviewBrief`).
+    pub fn composer_cycle_agent(&mut self) {
+        let state = std::mem::replace(&mut self.composer, ComposerState::Closed);
+        match state {
+            ComposerState::Drafting {
+                target,
+                agent,
+                draft,
+                brief,
+            } => {
+                let next = cycle_dispatch_agent(&agent, &self.control_policy);
+                let changed = next.cli != agent.cli;
+                self.composer = ComposerState::Drafting {
+                    target,
+                    agent: next,
+                    draft,
+                    brief,
+                };
+                if !changed {
+                    self.set_status("Only one dispatch agent allowed by local policy".into());
+                }
+            }
+            ComposerState::PreviewBrief {
+                target,
+                agent,
+                draft,
+                brief,
+            } => {
+                let next = cycle_dispatch_agent(&agent, &self.control_policy);
+                let changed = next.cli != agent.cli;
+                self.composer = ComposerState::PreviewBrief {
+                    target,
+                    agent: next,
+                    draft,
+                    brief,
+                };
+                if !changed {
+                    self.set_status("Only one dispatch agent allowed by local policy".into());
+                }
+            }
+            other => self.composer = other,
+        }
+    }
+
     pub fn quit(&mut self) {
         self.should_quit = true;
     }
@@ -2108,6 +2475,12 @@ fn control_dry_run_enabled() -> bool {
         .is_some_and(|value| control_dry_run_value_enabled(&value))
 }
 
+fn dispatch_dry_run_enabled() -> bool {
+    std::env::var(DISPATCH_DRY_RUN_ENV)
+        .ok()
+        .is_some_and(|value| control_dry_run_value_enabled(&value))
+}
+
 fn control_dry_run_value_enabled(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -2702,6 +3075,271 @@ mod tests {
         assert!(app.orphan_kill_confirm.is_none());
         let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
         assert_eq!(status, Some("No orphan ports to kill"));
+    }
+
+    fn dispatchable_project() -> WorkspaceProject {
+        let mut project = WorkspaceProject {
+            name: "ml-pipeline".into(),
+            cwd: "/tmp/ml-pipeline".into(),
+            identity_key: "/tmp/ml-pipeline".into(),
+            has_dw: true,
+            task_count: 1,
+            has_active_task: true,
+            active_task_title: Some("Dataset drift guardrails".into()),
+            active_task_phase: Some("Plan".into()),
+            active_task_status: TaskStatus::Ready,
+            active_task_acceptance_count: 3,
+            tasks: vec![WorkspaceTask {
+                title: "Dataset drift guardrails".into(),
+                phase: Some("Plan".into()),
+                status: TaskStatus::Ready,
+                raw_status: Some("Ready".into()),
+                acceptance_count: 3,
+                verification_count: 1,
+                completed_verification_count: 0,
+                dependencies: Vec::new(),
+                is_active: true,
+            }],
+            ..WorkspaceProject::default()
+        };
+        project.dependency_count = project
+            .tasks
+            .iter()
+            .map(|task| task.dependencies.len())
+            .sum();
+        project
+    }
+
+    fn policy_with_claude() -> ControlPolicy {
+        ControlPolicy {
+            allow_dispatch_claude: true,
+            ..ControlPolicy::default()
+        }
+    }
+
+    #[test]
+    fn open_composer_blocks_when_no_dispatch_policy_enabled() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        app.workspace_projects = vec![dispatchable_project()];
+
+        app.open_composer();
+
+        assert!(!app.composer.is_open(), "composer must stay closed");
+        let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(
+            status.is_some_and(|msg| msg.contains("disabled by local policy")),
+            "status: {status:?}"
+        );
+    }
+
+    #[test]
+    fn open_composer_skips_when_no_dispatchable_task() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            policy_with_claude(),
+        );
+        // Project exists but has no .dw task data.
+        app.workspace_projects = vec![WorkspaceProject {
+            name: "empty".into(),
+            ..WorkspaceProject::default()
+        }];
+
+        app.open_composer();
+
+        assert!(!app.composer.is_open());
+        let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(status.is_some_and(|msg| msg.contains("No dispatchable task")));
+    }
+
+    #[test]
+    fn open_composer_enters_drafting_when_policy_allows_and_task_present() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            policy_with_claude(),
+        );
+        app.workspace_projects = vec![dispatchable_project()];
+
+        app.open_composer();
+
+        assert!(app.composer.is_open());
+        assert_eq!(app.composer.stage_label(), "drafting");
+        let target = app.composer.target().expect("target set");
+        assert_eq!(target.task_id, "dataset-drift-guardrails");
+        assert_eq!(target.project, "ml-pipeline");
+        let agent = app.composer.agent().expect("agent set");
+        assert_eq!(agent.cli, "claude-code");
+        assert!(app.composer.brief().is_some_and(|b| !b.is_empty()));
+    }
+
+    #[test]
+    fn composer_input_char_caps_at_max_draft_len() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            policy_with_claude(),
+        );
+        app.workspace_projects = vec![dispatchable_project()];
+        app.open_composer();
+
+        for _ in 0..(DISPATCH_MAX_DRAFT_LEN + 50) {
+            app.composer_input_char('a');
+        }
+
+        let draft = app.composer.draft().expect("drafting state");
+        assert_eq!(draft.chars().count(), DISPATCH_MAX_DRAFT_LEN);
+    }
+
+    #[test]
+    fn composer_advance_walks_drafting_to_await_confirm() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            policy_with_claude(),
+        );
+        app.workspace_projects = vec![dispatchable_project()];
+        app.open_composer();
+        assert_eq!(app.composer.stage_label(), "drafting");
+
+        app.composer_advance();
+        assert_eq!(app.composer.stage_label(), "preview");
+
+        app.composer_advance();
+        assert_eq!(app.composer.stage_label(), "await-confirm");
+    }
+
+    #[test]
+    fn composer_advance_await_confirm_blocked_when_policy_revoked() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            policy_with_claude(),
+        );
+        app.workspace_projects = vec![dispatchable_project()];
+        app.open_composer();
+        app.composer_advance(); // → Preview
+        app.composer_advance(); // → AwaitConfirm
+
+        // Operator flips policy off between request and confirm.
+        app.control_policy.allow_dispatch_claude = false;
+        app.composer_advance();
+
+        assert!(!app.composer.is_open());
+        let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(
+            status.is_some_and(|msg| msg.contains("blocked by local policy")),
+            "status: {status:?}"
+        );
+    }
+
+    #[test]
+    fn composer_advance_await_confirm_expired_returns_to_closed() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            policy_with_claude(),
+        );
+        app.workspace_projects = vec![dispatchable_project()];
+        app.open_composer();
+        app.composer_advance(); // → Preview
+        app.composer_advance(); // → AwaitConfirm
+
+        // Backdate the request beyond the confirm window.
+        if let ComposerState::AwaitConfirm { requested_at, .. } = &mut app.composer {
+            *requested_at = Instant::now()
+                - std::time::Duration::from_secs(crate::composer::DISPATCH_CONFIRM_WINDOW_SECS + 1);
+        } else {
+            panic!("expected AwaitConfirm");
+        }
+
+        app.composer_advance();
+
+        assert!(!app.composer.is_open());
+        let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(
+            status.is_some_and(|msg| msg.contains("confirm window expired")),
+            "status: {status:?}"
+        );
+    }
+
+    #[test]
+    fn composer_cancel_resets_state_past_drafting() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            policy_with_claude(),
+        );
+        app.workspace_projects = vec![dispatchable_project()];
+        app.open_composer();
+        app.composer_advance(); // → Preview
+
+        app.composer_cancel();
+
+        assert!(!app.composer.is_open());
+        let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(status.is_some_and(|msg| msg.contains("Dispatch cancelled")));
+    }
+
+    #[test]
+    fn composer_cycle_agent_changes_agent_when_multiple_allowed() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            ControlPolicy {
+                allow_dispatch_claude: true,
+                allow_dispatch_codex: true,
+                ..ControlPolicy::default()
+            },
+        );
+        app.workspace_projects = vec![dispatchable_project()];
+        app.open_composer();
+        assert_eq!(
+            app.composer.agent().map(|a| a.cli.as_str()),
+            Some("claude-code")
+        );
+
+        app.composer_cycle_agent();
+
+        assert_eq!(
+            app.composer.agent().map(|a| a.cli.as_str()),
+            Some("codex-cli")
+        );
+    }
+
+    #[test]
+    fn composer_cycle_agent_keeps_current_when_only_one_allowed() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+            policy_with_claude(),
+        );
+        app.workspace_projects = vec![dispatchable_project()];
+        app.open_composer();
+        app.composer_cycle_agent();
+
+        assert_eq!(
+            app.composer.agent().map(|a| a.cli.as_str()),
+            Some("claude-code")
+        );
+        let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(
+            status.is_some_and(|msg| msg.contains("Only one dispatch agent")),
+            "status: {status:?}"
+        );
     }
 
     #[test]

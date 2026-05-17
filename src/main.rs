@@ -1,6 +1,7 @@
 mod app;
 mod audit;
 mod collector;
+mod composer;
 mod config;
 mod demo;
 mod diagnostics;
@@ -226,6 +227,22 @@ fn run_app(
                     if app.help_open {
                         // Any key dismisses help.
                         app.help_open = false;
+                    } else if app.composer.is_open() {
+                        match key.code {
+                            KeyCode::Esc => app.composer_cancel(),
+                            KeyCode::Enter => app.composer_advance(),
+                            KeyCode::Backspace => app.composer_backspace(),
+                            KeyCode::Char(c)
+                                if key
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::CONTROL)
+                                    && (c == 'r' || c == 'R') =>
+                            {
+                                app.composer_cycle_agent()
+                            }
+                            KeyCode::Char(c) => app.composer_input_char(c),
+                            _ => {}
+                        }
                     } else if app.view_open {
                         match key.code {
                             KeyCode::Esc | KeyCode::Char('v') => app.view_open = false,
@@ -282,6 +299,7 @@ fn run_app(
                             KeyCode::Char('-') => app.restore_narrow_sections(),
                             KeyCode::Char('x') if !demo_mode => app.kill_selected(),
                             KeyCode::Char('X') if !demo_mode => app.kill_orphan_ports(),
+                            KeyCode::Char('d') if app.workspace_focus => app.open_composer(),
                             KeyCode::Char('t') => app.cycle_theme(),
                             KeyCode::Char('T') => app.tree_view = !app.tree_view,
                             KeyCode::Char('l') | KeyCode::Char('L') => app.toggle_timeline(),
