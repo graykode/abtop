@@ -22,8 +22,9 @@ Use it together with `docs/PRODUCT_STRATEGY.md`, `docs/ROADMAP_V2.md`, and
 
 ## Current Focus
 
-`P5-GTM-05`: prepare release packaging and user-facing GTM onboarding from the
-validated local Agentic Workspace baseline.
+`P6-UX-01`: design and ship the task-aware dispatch composer. Pre-requisites
+`P5-GTM-05` (release packaging) and `P4-DSP-01` (dispatch audit + policy
+gates) are now Done; the composer can begin.
 
 ## Task Board
 
@@ -50,7 +51,9 @@ validated local Agentic Workspace baseline.
 | P5-GTM-02 | Done | Codex | GTM workflow | Agent assignment handoff | Turn roadmap stages and task evidence into safe human-readable and machine-readable handoff formats for humans or agents to claim next work. | P5-GTM-01, P3-EVD-01, user cross-agent feedback | `src/app.rs`, `src/main.rs`, README, strategy docs | `handoff_markdown_is_redacted_and_actionable`; `handoff_json_is_redacted_and_structured`; `cargo test handoff`; `cargo run -- --demo --handoff`; `cargo run -- --demo --handoff --json`; full validation suite |
 | P5-GTM-03 | Done | Codex | GTM workflow | Visual assignment surface | Show Claude/Codex same-project coordination lanes in the TUI Workspace view, backed by the handoff model. | P5-GTM-02 | `src/ui/workspace.rs`, `src/ui/mod.rs`, README | `desktop_workspace_focus_renders_dw_task_lens`; `cargo test workspace`; `cargo fmt -- --check`; full validation suite |
 | P5-GTM-04 | Done | Codex | GTM workflow | Real same-project validation | Run Claude Code and Codex against the same `.dw` project and capture non-demo handoff/roadmap evidence without prompt or file-content leaks. | P5-GTM-03 | `src/app.rs`, `src/ui/workspace.rs`, `src/task_graph/mod.rs`, `src/evidence/mod.rs`, docs | `workspace_projects_merge_canonical_same_directory_sessions`; live `--handoff --json` reported one project with both `claude` and `codex`; `cargo run -- --doctor`; `cargo run -- --workspace-summary`; `cargo run -- --roadmap`; `cargo run -- --handoff`; `cargo run -- --handoff --json` |
-| P5-GTM-05 | Next | Unassigned | GTM workflow | Release packaging and onboarding | Prepare the branch for user-facing trial: install path, usage guide, known limitations, and release checklist. | P5-GTM-04 | README, release notes, docs | Pending |
+| P5-GTM-05 | Done | Claude | GTM workflow | Release packaging and onboarding | README Agentic Workspace section with walkthrough; consolidated user-facing limitations; fork release checklist covering pre-tag validation, contribute-upstream vs fork-only release options. | P5-GTM-04 | `README.md`, `docs/LIMITATIONS.md`, `docs/RELEASE_CHECKLIST.md` | `cargo fmt -- --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo test` (208 passed); `cargo build`; `cargo run -- --help`; `cargo run -- --demo --workspace-summary`; `cargo run -- --demo --roadmap`; `cargo run -- --demo --handoff`; `cargo run -- --demo --handoff --json`; `cargo run -- --demo --task-evidence`; README link check |
+| P4-DSP-01 | Done | Claude | Controls | Dispatch action audit + policy | Extend `ControlPolicy` with `allow_dispatch_claude/codex/opencode` (opt-in, default `false`) + `is_dispatch_allowed`. Add `audit::actions`/`audit::outcomes` constants + `dispatch_action_for` helper + `DISPATCH_DRY_RUN_ENV` (`ABTOP_DISPATCH_DRY_RUN`). Infra-only — no UI, no real spawn. | P4-POL-01, P4-AUD-01 | `src/config.rs`, `src/audit/mod.rs`, `src/app.rs` (struct-init `..Default::default()`), focused tests | `cargo test config` (incl. `parse_dispatch_policy_keys`, `is_dispatch_allowed_matches_agent_cli_synonyms`, `dispatch_flags_default_false`); `cargo test audit` (incl. `dispatch_action_for_maps_known_agents`, `dispatch_event_uses_stable_vocabulary`, `dispatch_dry_run_env_name_is_stable`, `outcome_labels_match_kill_control_strings`); full production gate (see P5-GTM-05 EVD) |
+| P6-UX-01 | Next | Unassigned | Composer | Task-aware dispatch composer | TUI composer in Workspace tab. Pick a task, preview safe handoff brief, choose agent, confirm, spawn one-shot `claude --print` / `codex exec` non-interactive call, capture response into evidence + audit. No keystroke injection into running CLI sessions. | P4-DSP-01, P5-GTM-02 | `src/app.rs`, `src/ui/workspace.rs` (new composer pane), evidence module | Pending |
 
 ## Completed Task Detail: P4-CTL-01
 
@@ -122,6 +125,11 @@ EVD:
 - User feedback: Claude Code and Codex often run on the same project; the
   product should coordinate them through a shared task/evidence protocol before
   exploring direct agent-to-agent messaging.
+- User feedback (2026-05-17): UX pain of switching between two CLI panes for
+  Claude Code and Codex. Considered options A/B/C; chose option A — audited
+  one-shot dispatch from prepared task context. Explicitly rejected direct
+  keystroke injection (option B) and broadcast-to-both-agents chat (option C)
+  for the current milestone.
 - Avoid large refactors in `src/app.rs`; prefer extracting new task/workspace
   modules.
 - Do not commit local EVD files that include private paths, quota, prompts, or
