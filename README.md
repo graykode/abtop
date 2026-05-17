@@ -75,6 +75,9 @@ task state, dependency order, evidence, and blockers rather than an unaudited
 private chat.
 Use Markdown output for human planning and JSON output when another tool or
 agent needs stable structured handoff context.
+The Workspace TUI also shows compact handoff lanes and assignment suggestions
+when a `.dw` project has dependency-aware tasks.
+Production readiness checks live in `docs/PRODUCTION_READINESS.md`.
 
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 

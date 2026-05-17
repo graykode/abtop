@@ -91,31 +91,38 @@ Current technical state:
 - Windows local setup works.
 - Claude and Codex quota work and are labeled as remaining percent.
 - Windows TCP port parsing is fixed.
-- Workspace read-only MVP is implemented.
+- Workspace task/runtime view is implemented.
 - Safe Workspace Markdown export exists.
+- Dependency-aware roadmap export exists.
+- Cross-agent handoff export exists in Markdown and JSON.
+- Workspace TUI renders compact handoff lanes and assignment suggestions.
 - Upstream sync guide exists.
 - Latest synced upstream fix: OpenCode macOS `lsof -a` cwd lookup.
 
 Current next task:
 
-`P1-T01`: build the dw-kit task index reader.
+`P5-GTM-04`: validate real Claude Code + Codex same-project workflows and
+capture non-demo handoff/roadmap evidence without leaking prompts, file
+contents, or private paths.
 
 Why it matters:
 
-- It connects live agent sessions to structured task state.
-- It moves abtop from monitoring into task-aware Agentic Workspace territory.
-- It strengthens the moat against provider-native dashboards.
+- It proves the cross-agent handoff loop outside demo data.
+- It validates the main user pain: Claude Code and Codex working on one project
+  through shared task/evidence state.
+- It hardens the GTM story with real manual EVD.
 
 Suggested first implementation:
 
-- Add `src/task/` module.
-- Parse safe metadata from `.dw` task files.
-- Expose a task/project summary model.
-- Integrate minimally into Workspace.
-- Keep everything read-only.
+- Use `docs/PRODUCTION_READINESS.md`.
+- Start a `.dw` project with at least one Claude Code and one Codex session.
+- Capture redacted CLI outputs from `--roadmap`, `--handoff`, and
+  `--handoff --json`.
+- Add only sanitized notes to docs; do not commit private screenshots, quota,
+  prompt text, or file contents.
 
 Do not start:
 
-- mutating control actions,
-- dispatch/reply/restart/archive,
-- generic mind-map UI without task/runtime data model.
+- automatic dispatch/reply/restart/archive,
+- direct agent-to-agent private chat,
+- cloud/team sync before the policy and audit model is explicit.

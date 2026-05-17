@@ -1529,6 +1529,22 @@ mod tests {
             text.contains("roadmap"),
             "workspace should render dependency-aware roadmap sequencing\n{text}"
         );
+        assert!(
+            text.contains("handoff"),
+            "workspace should render cross-agent handoff lanes\n{text}"
+        );
+        assert!(
+            text.contains("codex-cli"),
+            "workspace handoff should include Codex lane\n{text}"
+        );
+        assert!(
+            text.contains("assign"),
+            "workspace handoff should include assignment queue\n{text}"
+        );
+        assert!(
+            text.contains("[impl]"),
+            "workspace handoff should show suggested agent fit\n{text}"
+        );
     }
 
     #[test]

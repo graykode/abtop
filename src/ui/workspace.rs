@@ -365,6 +365,53 @@ pub(crate) fn draw_workspace_panel_active(
                     ),
                 ]));
             }
+            lines.push(Line::from(vec![
+                Span::styled(" handoff ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    "claude-code | codex-cli | opencode",
+                    Style::default().fg(theme.proc_misc),
+                ),
+            ]));
+            if roadmap.stages.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("   assign ", Style::default().fg(theme.graph_text)),
+                    Span::styled("none ready", Style::default().fg(theme.inactive_fg)),
+                ]));
+            } else {
+                for stage in roadmap.stages.iter().take(handoff_stage_limit(area.height)) {
+                    let task_names = stage
+                        .tasks
+                        .iter()
+                        .take(2)
+                        .map(|task| {
+                            format!(
+                                "{} [{}]",
+                                task.title,
+                                handoff_agent_fit(&task.status, task.dependency_count)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" -> ");
+                    lines.push(Line::from(vec![
+                        Span::styled("   assign ", Style::default().fg(theme.graph_text)),
+                        Span::styled(stage.label.as_str(), Style::default().fg(theme.proc_misc)),
+                        Span::styled(" ", Style::default().fg(theme.graph_text)),
+                        Span::styled(
+                            truncate_str(&task_names, area.width.saturating_sub(18) as usize),
+                            Style::default().fg(theme.main_fg),
+                        ),
+                    ]));
+                }
+            }
+            if !roadmap.risks.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("   hold ", Style::default().fg(theme.graph_text)),
+                    Span::styled(
+                        format!("{} blocked/risky", roadmap.risks.len()),
+                        Style::default().fg(theme.warning_fg),
+                    ),
+                ]));
+            }
             if !project.tasks.is_empty() {
                 lines.push(Line::from(vec![
                     Span::styled(" task tree ", Style::default().fg(theme.graph_text)),
@@ -492,11 +539,32 @@ pub(crate) fn draw_workspace_panel_active(
 
 fn task_tree_limit(height: u16) -> usize {
     if height >= 36 {
-        6
-    } else if height >= 28 {
         4
+    } else if height >= 28 {
+        3
     } else {
         2
+    }
+}
+
+fn handoff_stage_limit(height: u16) -> usize {
+    if height >= 36 {
+        3
+    } else if height >= 28 {
+        2
+    } else {
+        1
+    }
+}
+
+fn handoff_agent_fit(status: &str, dependency_count: usize) -> &'static str {
+    match status.to_ascii_lowercase().as_str() {
+        "review" => "review",
+        "doing" => "owner",
+        "blocked" => "human",
+        "ready" if dependency_count > 0 => "plan",
+        "ready" => "impl",
+        _ => "triage",
     }
 }
 
