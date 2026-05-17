@@ -1,3 +1,4 @@
+mod composer;
 mod config;
 mod context;
 mod footer;
@@ -720,6 +721,9 @@ fn draw_narrow_zoom_button(
 }
 
 fn draw_overlays(f: &mut Frame, app: &App, theme: &Theme) {
+    if app.composer.is_open() {
+        composer::draw_composer_overlay(f, app, theme);
+    }
     if app.config_open {
         config::draw_config_overlay(f, app, theme);
     }
@@ -1597,6 +1601,67 @@ mod tests {
         assert!(
             text.contains("tasks"),
             "workspace should render task lens label\n{text}"
+        );
+    }
+
+    #[test]
+    fn desktop_workspace_focus_renders_composer_overlay() {
+        let mut app = App::new_with_config_and_policy(
+            Theme::default(),
+            &[],
+            PanelVisibility::default(),
+            crate::config::ControlPolicy {
+                allow_dispatch_claude: true,
+                ..crate::config::ControlPolicy::default()
+            },
+        );
+        crate::demo::populate_demo(&mut app);
+        app.set_narrow_tab(NarrowTab::Workspace);
+        app.workspace_selected = app
+            .workspace_projects
+            .iter()
+            .position(|project| project.name == "ml-pipeline")
+            .expect("demo project should exist");
+
+        app.open_composer();
+        assert!(
+            app.composer.is_open(),
+            "composer should open for a .dw project under enabled policy"
+        );
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains("Dispatch task → Claude Code"),
+            "composer overlay should show the dispatch title with target agent\n{text}"
+        );
+        assert!(
+            text.contains("Project: ml-pipeline"),
+            "composer overlay should show selected project name\n{text}"
+        );
+        assert!(
+            text.contains("Auto context"),
+            "composer overlay should label the auto context preview block\n{text}"
+        );
+        assert!(
+            text.contains("suggested agent"),
+            "composer overlay should include suggested agent line from the brief\n{text}"
+        );
+        assert!(
+            text.contains("Your question"),
+            "composer overlay should expose the draft input section\n{text}"
+        );
+        assert!(
+            text.contains("Esc cancel"),
+            "composer overlay should show the cancel hint\n{text}"
+        );
+        // No prompt/file content leaks: only redacted bullets.
+        assert!(
+            !text.contains("BEGIN RSA PRIVATE KEY"),
+            "composer must not surface secret-shaped strings"
         );
     }
 
