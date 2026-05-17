@@ -298,6 +298,7 @@ Tracks child processes that have open ports. When a parent session dies but the 
 <type>: <description>
 ```
 Types: `feat`, `fix`, `refactor`, `docs`, `chore`
+Commit messages must not include `Co-authored-by` or other AI attribution trailers.
 
 ## Commands
 

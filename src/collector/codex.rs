@@ -751,8 +751,7 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                         result.thinking_since_ms = event_timestamp_ms(&val).unwrap_or(0);
                         if let Some(msg) = payload["message"].as_str() {
                             if result.initial_prompt.is_empty() {
-                                let truncated: String = msg.chars().take(120).collect();
-                                result.initial_prompt = super::redact_secrets(&truncated);
+                                result.initial_prompt = clean_chat_text(msg, 120);
                             }
                             push_chat_message(
                                 &mut result.chat_messages,

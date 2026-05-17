@@ -52,6 +52,8 @@ abtop --once             # Print snapshot and exit
 abtop --workspace-summary # Print redacted Workspace Markdown and exit
 abtop --task-evidence    # Print redacted per-task evidence Markdown and exit
 abtop --setup            # Install rate limit collection hook
+abtop --doctor           # Check local setup and collector health
+abtop --doctor --json    # Print machine-readable diagnostics JSON
 abtop --theme dracula    # Launch with a specific theme
 ```
 
@@ -92,6 +94,10 @@ tmux new -s work
 
 OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` and requires `sqlite3` in `PATH`.
 
+## Diagnostics
+
+Run `abtop --doctor` when session discovery, quota display, OpenCode support, tmux jumping, process termination, or port detection does not look right. It checks local-only dependencies and collector prerequisites without reading transcript contents. Use `abtop --doctor --json` in scripts or bug reports; warning-only results exit successfully, while hard collector failures exit non-zero.
+
 ## Themes
 
 12 built-in themes, including 4 colorblind-friendly options (`high-contrast`, `protanopia`, `deuteranopia`, `tritanopia`). Press `t` to cycle at runtime, or launch with `--theme <name>`. Your choice is saved to `~/.config/abtop/config.toml`.
@@ -129,18 +135,11 @@ theme = "btop"
 # Hide specific agent CLIs from the TUI (case-insensitive).
 # Useful if you only use one agent and want a cleaner view.
 hidden_agents = ["codex"]
-# UI language. Omit or leave empty to auto-detect from LANG.
-language = "zh"
+# UI language. English is the supported project-facing language.
+language = "en"
 ```
 
-### Supported Languages
-
-| Code | Language            |
-| ---- | ------------------- |
-| `en` | English (default)   |
-| `zh` | Simplified Chinese  |
-
-When `language` is unset, abtop auto-detects from `LANG` — any value starting with `zh` switches to Simplified Chinese, otherwise English.
+`language` is kept for config-file compatibility. English is currently the supported UI language.
 
 ## Key Bindings
 
@@ -149,7 +148,7 @@ When `language` is unset, abtop auto-detects from `LANG` — any value starting 
 | `↑`/`↓` or `k`/`j` | Select session                       |
 | `Enter`            | Jump to session terminal (tmux only) |
 | `x`                | Kill selected session                |
-| `X`                | Kill all orphan ports                |
+| `X`                | Confirm kill all orphan ports        |
 | `t`                | Cycle theme                          |
 | `1`–`5`            | Toggle panel visibility              |
 | `Esc`              | Open/close config page               |
@@ -158,7 +157,7 @@ When `language` is unset, abtop auto-detects from `LANG` — any value starting 
 
 ## Privacy
 
-abtop reads local files and local process/open-file metadata only. No API keys, no auth. Tool names and file paths are shown in the UI, but file contents and prompt text are never displayed. Session summaries are generated via `claude --print`, which makes its own API call — this is the only indirect network usage.
+abtop reads local files and local process/open-file metadata only. No API keys, no auth. Tool names and file paths are shown in the UI, but file contents are never displayed. Session summaries are generated via `claude --print`, which makes its own API call — this is the only indirect network usage. Prompt text is sanitized and secret-redacted before summary generation, and local fallback titles do not include prompt text. Set `ABTOP_DISABLE_SUMMARIES=1` to skip summary generation and show generic local titles.
 
 ## Acknowledgements
 

@@ -18,14 +18,14 @@ const MAX_SUMMARY_JOBS: usize = 3;
 const MAX_SUMMARY_RETRIES: u32 = 2;
 const ATTENTION_CONTEXT_WARN_PCT: f64 = 80.0;
 const ATTENTION_CONTEXT_CRITICAL_PCT: f64 = 90.0;
+const SUMMARY_UNAVAILABLE: &str = "summary unavailable";
+const KILL_CONFIRM_WINDOW_SECS: u64 = 2;
 
 /// Produce a terminal-safe fallback summary from a raw prompt.
 fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
-    prompt
-        .chars()
-        .filter(|c| !c.is_control() || *c == ' ')
-        .take(max_len)
-        .collect()
+    let terminal_safe = crate::collector::sanitize_terminal_text(prompt);
+    let redacted = crate::collector::redact_secrets(&terminal_safe);
+    redacted.chars().take(max_len).collect()
 }
 
 /// Outcome of an Enter-key jump attempt. Distinct from `Option<String>` so
@@ -348,6 +348,8 @@ pub struct App {
     pub status_msg: Option<(String, Instant)>,
     /// Kill confirmation: (selected_index, timestamp). Expires after 2s.
     kill_confirm: Option<(usize, Instant)>,
+    /// Orphan-port kill confirmation timestamp. Expires after 2s.
+    orphan_kill_confirm: Option<Instant>,
     pub theme: Theme,
     pub show_context: bool,
     pub show_quota: bool,
@@ -418,6 +420,7 @@ impl App {
             orphan_ports: Vec::new(),
             status_msg: None,
             kill_confirm: None,
+            orphan_kill_confirm: None,
             theme,
             show_context: panels.context,
             show_quota: panels.quota,
@@ -894,7 +897,7 @@ impl App {
     /// Drain completed summary results and spawn retries. Does NOT recollect
     /// sessions, so it is safe for `--once` mode (stable snapshot).
     pub fn drain_and_retry_summaries(&mut self) {
-        while let Ok((sid, prompt, maybe_summary)) = self.summary_rx.try_recv() {
+        while let Ok((sid, _prompt, maybe_summary)) = self.summary_rx.try_recv() {
             self.pending_summaries.remove(&sid);
             match maybe_summary {
                 Some(summary) => {
@@ -908,12 +911,16 @@ impl App {
                     *count += 1;
                     crate::log_warn!("summary generation failed sid={} attempt={}", sid, *count);
                     if *count >= MAX_SUMMARY_RETRIES {
-                        // Exhausted — store sanitized fallback using prompt from worker
-                        self.summaries.insert(sid, sanitize_fallback(&prompt, 80));
+                        // Exhausted: keep prompt text out of session lists and snapshots.
+                        self.summaries.insert(sid, SUMMARY_UNAVAILABLE.to_string());
                         save_summary_cache(&self.summaries);
                     }
                 }
             }
+        }
+
+        if summary_generation_disabled() {
+            return;
         }
 
         // Spawn summary jobs for sessions that need one
@@ -954,6 +961,9 @@ impl App {
 
     /// True if any session still qualifies for a summary retry.
     pub fn has_retryable_summaries(&self) -> bool {
+        if summary_generation_disabled() {
+            return false;
+        }
         self.sessions.iter().any(|s| {
             (!s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty())
                 && !self.summaries.contains_key(&s.session_id)
@@ -1062,18 +1072,12 @@ impl App {
 
         // Check if we have a pending confirmation for this exact session
         if let Some((idx, ts)) = self.kill_confirm.take() {
-            if idx == self.selected && ts.elapsed().as_secs() < 2 {
+            if idx == self.selected && ts.elapsed().as_secs() < KILL_CONFIRM_WINDOW_SECS {
                 // Confirmed — verify PID still runs expected binary before killing
                 let pid = session.pid;
-                let verified = std::process::Command::new("ps")
-                    .args(["-p", &pid.to_string(), "-o", "command="])
-                    .output()
-                    .ok()
-                    .map(|output| {
-                        let cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        is_supported_agent_command(&cmd)
-                    })
-                    .unwrap_or(false);
+                let verified = current_process_command(pid)
+                    .as_deref()
+                    .is_some_and(is_supported_agent_command);
                 if !verified {
                     record_audit(&AuditEvent::new(
                         "kill-session",
@@ -1086,17 +1090,18 @@ impl App {
                     self.set_status(format!("PID {} is no longer a known agent process", pid));
                     return;
                 }
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
-                    .output();
+                let sent = terminate_process(pid, true);
                 record_audit(&AuditEvent::new(
                     "kill-session",
                     "session",
                     &session.session_id,
                     Some(&session.project_name),
-                    "sent",
+                    if sent { "sent" } else { "failed" },
                     Some("double-confirmed by user"),
                 ));
+                if !sent {
+                    self.set_status(format!("Failed to terminate PID {}", pid));
+                }
                 self.tick();
                 return;
             }
@@ -1118,6 +1123,27 @@ impl App {
     pub fn kill_orphan_ports(&mut self) {
         use crate::collector::process::get_listening_ports;
 
+        if self.orphan_ports.is_empty() {
+            self.orphan_kill_confirm = None;
+            self.set_status("No orphan ports to kill".to_string());
+            return;
+        }
+
+        let confirmed = self
+            .orphan_kill_confirm
+            .take()
+            .is_some_and(|ts| ts.elapsed().as_secs() < KILL_CONFIRM_WINDOW_SECS);
+        if !confirmed {
+            let count = self.orphan_ports.len();
+            let suffix = if count == 1 { "" } else { "es" };
+            self.orphan_kill_confirm = Some(Instant::now());
+            self.set_status(format!(
+                "Press X again within {}s to kill {} orphan port process{}",
+                KILL_CONFIRM_WINDOW_SECS, count, suffix
+            ));
+            return;
+        }
+
         // Fresh port scan right now — don't rely on cached data
         let fresh_ports = get_listening_ports();
 
@@ -1130,33 +1156,28 @@ impl App {
                 continue;
             }
             // 2. Verify PID still runs the expected command (full match, not substring)
-            if let Ok(output) = std::process::Command::new("ps")
-                .args(["-p", &orphan.pid.to_string(), "-o", "command="])
-                .output()
-            {
-                let current_cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if current_cmd == orphan.command {
-                    let _ = std::process::Command::new("kill")
-                        .args([&orphan.pid.to_string()])
-                        .output();
-                    record_audit(&AuditEvent::new(
-                        "kill-orphan-port",
-                        "process",
-                        &orphan.pid.to_string(),
-                        Some(&orphan.project_name),
-                        "sent",
-                        Some("orphan port verified"),
-                    ));
-                } else {
-                    record_audit(&AuditEvent::new(
-                        "kill-orphan-port",
-                        "process",
-                        &orphan.pid.to_string(),
-                        Some(&orphan.project_name),
-                        "blocked",
-                        Some("command verification failed"),
-                    ));
-                }
+            let command_matches = current_process_command(orphan.pid)
+                .as_deref()
+                .is_some_and(|cmd| cmd == orphan.command);
+            if command_matches {
+                let sent = terminate_process(orphan.pid, false);
+                record_audit(&AuditEvent::new(
+                    "kill-orphan-port",
+                    "process",
+                    &orphan.pid.to_string(),
+                    Some(&orphan.project_name),
+                    if sent { "sent" } else { "failed" },
+                    Some("orphan port verified"),
+                ));
+            } else {
+                record_audit(&AuditEvent::new(
+                    "kill-orphan-port",
+                    "process",
+                    &orphan.pid.to_string(),
+                    Some(&orphan.project_name),
+                    "blocked",
+                    Some("command verification failed"),
+                ));
             }
         }
         // Re-collect to reflect changes
@@ -1348,20 +1369,16 @@ impl App {
         Some("pane not found".to_string())
     }
 
-    /// Get the display summary for a session: LLM summary > "..." if pending > raw prompt > "—"
+    /// Get the display summary for a session: cached/generated summary > pending dots > safe fallback.
     /// Done sessions skip pending state to avoid stuck "..." display.
     pub fn session_summary(&self, session: &AgentSession) -> String {
+        if summary_generation_disabled() {
+            return SUMMARY_UNAVAILABLE.to_string();
+        }
         if let Some(summary) = self.summaries.get(&session.session_id) {
             summary.clone()
         } else if matches!(session.status, SessionStatus::Done) {
-            // Done sessions: don't wait for pending summary, show fallback immediately
-            if !session.initial_prompt.is_empty() {
-                sanitize_fallback(&session.initial_prompt, 80)
-            } else if !session.first_assistant_text.is_empty() {
-                sanitize_fallback(&session.first_assistant_text, 80)
-            } else {
-                "—".to_string()
-            }
+            SUMMARY_UNAVAILABLE.to_string()
         } else if self.pending_summaries.contains(&session.session_id) {
             // Animate dots: . → .. → ... (cycles every ~1.5s at 2s tick)
             let dots = match (std::time::SystemTime::now()
@@ -1376,12 +1393,8 @@ impl App {
                 _ => "...",
             };
             dots.to_string()
-        } else if !session.initial_prompt.is_empty() {
-            sanitize_fallback(&session.initial_prompt, 80)
-        } else if !session.first_assistant_text.is_empty() {
-            sanitize_fallback(&session.first_assistant_text, 80)
         } else {
-            "—".to_string()
+            SUMMARY_UNAVAILABLE.to_string()
         }
     }
 }
@@ -1393,9 +1406,16 @@ fn generate_summary(prompt: &str, assistant_text: &str) -> Option<String> {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
+    if summary_generation_disabled() {
+        return Some(SUMMARY_UNAVAILABLE.to_string());
+    }
+
+    let safe_prompt = sanitize_fallback(prompt, 200);
+    let safe_assistant_text = sanitize_fallback(assistant_text, 200);
+
     // Build input from user prompt and/or first assistant response
-    let user_part: String = prompt.chars().take(200).collect();
-    let assistant_part: String = assistant_text.chars().take(200).collect();
+    let user_part: String = safe_prompt.chars().take(200).collect();
+    let assistant_part: String = safe_assistant_text.chars().take(200).collect();
 
     let context = if !user_part.is_empty() && !assistant_part.is_empty() {
         format!(
@@ -1422,7 +1442,7 @@ fn generate_summary(prompt: &str, assistant_text: &str) -> Option<String> {
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return Some(sanitize_fallback(prompt, 80)),
+        Err(_) => return Some(SUMMARY_UNAVAILABLE.to_string()),
     };
 
     // Write prompt via stdin (no shell injection)
@@ -1442,14 +1462,12 @@ fn generate_summary(prompt: &str, assistant_text: &str) -> Option<String> {
         Ok(r) => r,
         Err(_) => {
             // Timeout or disconnected — kill the child so the helper thread can exit.
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &child_pid.to_string()])
-                .status();
+            let _ = terminate_process(child_pid, true);
             return None;
         }
     };
 
-    let fallback = sanitize_fallback(prompt, 80);
+    let fallback = SUMMARY_UNAVAILABLE.to_string();
 
     match result {
         Ok(output) if output.status.success() => {
@@ -1468,11 +1486,23 @@ fn generate_summary(prompt: &str, assistant_text: &str) -> Option<String> {
             {
                 Some(fallback)
             } else {
-                Some(raw.trim_matches('"').trim_matches('\'').to_string())
+                Some(sanitize_fallback(
+                    raw.trim_matches('"').trim_matches('\''),
+                    80,
+                ))
             }
         }
         _ => Some(fallback),
     }
+}
+
+fn summary_generation_disabled() -> bool {
+    std::env::var("ABTOP_DISABLE_SUMMARIES")
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
 }
 
 /// Cache directory: ~/.cache/abtop/
@@ -1593,6 +1623,45 @@ fn is_supported_agent_command(cmd: &str) -> bool {
         || crate::collector::process::cmd_has_binary(cmd, "opencode")
 }
 
+fn current_process_command(pid: u32) -> Option<String> {
+    crate::collector::process::get_process_info()
+        .remove(&pid)
+        .map(|proc| proc.command)
+}
+
+fn terminate_process(pid: u32, force: bool) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
+    terminate_process_impl(pid, force)
+}
+
+#[cfg(windows)]
+fn terminate_process_impl(pid: u32, force: bool) -> bool {
+    let pid = pid.to_string();
+    let mut args = vec!["/PID", pid.as_str()];
+    if force {
+        args.push("/F");
+    }
+    std::process::Command::new("taskkill")
+        .args(args)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn terminate_process_impl(pid: u32, force: bool) -> bool {
+    let pid = pid.to_string();
+    let signal = if force { "-9" } else { "-TERM" };
+    std::process::Command::new("kill")
+        .args([signal, pid.as_str()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn safe_export_text(value: &str, max_len: usize) -> String {
     value
         .chars()
@@ -1684,6 +1753,15 @@ mod tests {
             seven_day_pct: None,
             seven_day_resets_at: None,
             updated_at: None,
+        }
+    }
+
+    fn orphan_port() -> OrphanPort {
+        OrphanPort {
+            port: 3000,
+            pid: 999_999,
+            command: "node server.js".to_string(),
+            project_name: "demo".to_string(),
         }
     }
 
@@ -1896,6 +1974,31 @@ mod tests {
     }
 
     #[test]
+    fn fallback_summaries_redact_secrets_and_control_text() {
+        let fallback = sanitize_fallback("ship sk-proj-secret\u{202E}\nnow", 80);
+        assert_eq!(fallback, "ship [REDACTED]");
+    }
+
+    #[test]
+    fn session_summary_does_not_fallback_to_prompt_text() {
+        let app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        let mut session = waiting_session("claude");
+        session.initial_prompt = "ship sk-proj-secret now".to_string();
+        session.first_assistant_text = "edited src/payments.rs".to_string();
+
+        let summary = app.session_summary(&session);
+
+        assert_eq!(summary, "summary unavailable");
+        assert!(!summary.contains("ship"));
+        assert!(!summary.contains("payments.rs"));
+        assert!(!summary.contains("sk-proj-secret"));
+    }
+
+    #[test]
     fn activating_workspace_project_selects_its_first_session() {
         let mut app = App::new_with_config(
             Theme::default(),
@@ -1915,6 +2018,38 @@ mod tests {
         assert_eq!(app.narrow_tab, NarrowTab::Work);
         assert_eq!(app.active_narrow_section, Some(NarrowSection::Sessions));
         assert_eq!(app.sessions[app.selected].project_name, "api-server");
+    }
+
+    #[test]
+    fn kill_orphan_ports_requires_second_confirmation() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        app.orphan_ports = vec![orphan_port()];
+
+        app.kill_orphan_ports();
+
+        assert!(app.orphan_kill_confirm.is_some());
+        let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
+        assert!(status.is_some_and(|msg| msg.contains("Press X again")));
+    }
+
+    #[test]
+    fn kill_orphan_ports_empty_list_clears_confirmation() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        app.orphan_kill_confirm = Some(Instant::now());
+
+        app.kill_orphan_ports();
+
+        assert!(app.orphan_kill_confirm.is_none());
+        let status = app.status_msg.as_ref().map(|(msg, _)| msg.as_str());
+        assert_eq!(status, Some("No orphan ports to kill"));
     }
 
     #[test]
@@ -1951,5 +2086,11 @@ mod tests {
         assert!(is_supported_agent_command("codex --resume abc"));
         assert!(is_supported_agent_command("/opt/homebrew/bin/opencode"));
         assert!(!is_supported_agent_command("node server.js"));
+    }
+
+    #[test]
+    fn terminate_process_rejects_pid_zero() {
+        assert!(!terminate_process(0, true));
+        assert!(!terminate_process(0, false));
     }
 }

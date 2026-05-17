@@ -48,9 +48,14 @@ pub(crate) fn redact_secrets(s: &str) -> String {
     let mut result = s.to_string();
     for pat in PATTERNS {
         while let Some(pos) = result.find(pat) {
-            let end = result[pos..]
+            let search_start = if pat.ends_with(char::is_whitespace) {
+                pos + pat.len()
+            } else {
+                pos
+            };
+            let end = result[search_start..]
                 .find(char::is_whitespace)
-                .map(|i| pos + i)
+                .map(|i| search_start + i)
                 .unwrap_or(result.len());
             result.replace_range(pos..end, "[REDACTED]");
         }
@@ -395,5 +400,17 @@ mod tests {
             "opencode".to_string(),
         ]);
         assert!(mc.collectors.is_empty());
+    }
+
+    #[test]
+    fn redacts_common_secret_prefixes() {
+        assert_eq!(
+            redact_secrets("token sk-proj-secret and github_pat_123"),
+            "token [REDACTED] and [REDACTED]"
+        );
+        assert_eq!(
+            redact_secrets("Authorization: Bearer secret-value"),
+            "Authorization: [REDACTED]"
+        );
     }
 }

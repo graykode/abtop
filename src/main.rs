@@ -4,6 +4,7 @@ mod collector;
 mod config;
 mod demo;
 mod diagnostics;
+mod doctor;
 mod evidence;
 mod host_info;
 mod locale;
@@ -38,6 +39,13 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    // --help / -h flag: print CLI usage and exit before entering the TUI.
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        log_debug!("help command");
+        println!("{}", usage_text());
+        return Ok(());
+    }
+
     // --update flag: self-update via GitHub releases installer
     if std::env::args().any(|a| a == "--update") {
         log_info!("update command");
@@ -49,6 +57,18 @@ fn main() -> io::Result<()> {
         log_info!("setup command");
         setup::run_setup();
         return Ok(());
+    }
+
+    // --doctor flag: local-only setup and collector diagnostics.
+    if std::env::args().any(|a| a == "--doctor") {
+        let json = std::env::args().any(|a| a == "--json");
+        log_info!("doctor command json={}", json);
+        let code = if json {
+            doctor::run_doctor_json()
+        } else {
+            doctor::run_doctor()
+        };
+        std::process::exit(code);
     }
 
     // Load config once; it drives both the default theme and the hidden-agents list.
@@ -335,7 +355,8 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent, area: Rect) {
 /// overrides from a string for safe terminal output. Defeats CVE-2021-42574
 /// (Trojan Source) style attacks via RTLO/LRO/PDF/isolate characters.
 fn sanitize_output(s: &str) -> String {
-    s.chars()
+    let terminal_safe: String = s
+        .chars()
         .filter(|c| {
             !c.is_control()
                 && !matches!(*c,
@@ -344,7 +365,35 @@ fn sanitize_output(s: &str) -> String {
                 | '\u{200E}'
                 | '\u{200F}')
         })
-        .collect()
+        .collect();
+    collector::redact_secrets(&terminal_safe)
+}
+
+fn usage_text() -> String {
+    format!(
+        "\
+abtop {}
+
+AI agent monitor for your terminal.
+
+Usage:
+  abtop [OPTIONS]
+
+Options:
+  --once               Print a redacted snapshot and exit
+  --workspace-summary  Print redacted Workspace Markdown and exit
+  --task-evidence      Print redacted per-task evidence Markdown and exit
+  --doctor             Check local setup and collector health
+  --doctor --json      Print machine-readable diagnostics JSON
+  --setup              Install Claude rate-limit collection hook
+  --demo               Show demo data
+  --theme <NAME>       Launch with a specific theme
+  --exit-on-jump       Quit after jumping to a tmux pane
+  --update             Update abtop from GitHub releases
+  -V, --version        Print version and exit
+  -h, --help           Print help and exit",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 fn print_snapshot(app: &App) {
@@ -497,5 +546,19 @@ fn fmt_tok(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         format!("{}", n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_text_documents_non_interactive_flags() {
+        let usage = usage_text();
+
+        assert!(usage.contains("--help"));
+        assert!(usage.contains("--doctor"));
+        assert!(usage.contains("--once"));
     }
 }
