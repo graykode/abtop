@@ -9,6 +9,7 @@ mod evidence;
 mod host_info;
 mod locale;
 mod model;
+mod roadmap;
 mod setup;
 mod task;
 mod task_graph;

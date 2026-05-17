@@ -253,6 +253,7 @@ pub(crate) fn draw_workspace_panel_active(
             Span::styled("lens", Style::default().fg(theme.main_fg)),
         ]));
         if project.has_dw {
+            let roadmap = app.workspace_project_roadmap(project);
             let task_title =
                 project
                     .active_task_title
@@ -328,6 +329,42 @@ pub(crate) fn draw_workspace_panel_active(
                     Style::default().fg(theme.proc_misc),
                 ),
             ]));
+            lines.push(Line::from(vec![
+                Span::styled(" roadmap ", Style::default().fg(theme.graph_text)),
+                Span::styled(
+                    format!(
+                        "ready {} blocked {} stages {}",
+                        roadmap.ready_count,
+                        roadmap.blocked_count,
+                        roadmap.stages.len()
+                    ),
+                    Style::default().fg(if roadmap.blocked_count > 0 {
+                        theme.warning_fg
+                    } else {
+                        theme.main_fg
+                    }),
+                ),
+            ]));
+            if let Some(stage) = roadmap.stages.first() {
+                lines.push(Line::from(vec![
+                    Span::styled("   ", Style::default().fg(theme.graph_text)),
+                    Span::styled(stage.label.as_str(), Style::default().fg(theme.proc_misc)),
+                    Span::styled(" ", Style::default().fg(theme.graph_text)),
+                    Span::styled(
+                        truncate_str(
+                            &stage
+                                .tasks
+                                .iter()
+                                .take(3)
+                                .map(|task| task.title.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" -> "),
+                            area.width.saturating_sub(12) as usize,
+                        ),
+                        Style::default().fg(theme.main_fg),
+                    ),
+                ]));
+            }
             if !project.tasks.is_empty() {
                 lines.push(Line::from(vec![
                     Span::styled(" task tree ", Style::default().fg(theme.graph_text)),

@@ -59,6 +59,9 @@ abtop --theme dracula    # Launch with a specific theme
 
 Mutating actions write append-only audit events to the local abtop data
 directory. Set `ABTOP_AUDIT_FILE` to override the JSONL audit path.
+Workspace summaries include redacted `.dw` task counts and dependency-aware
+roadmap sequencing so ready, blocked, and staged tasks can be reviewed before
+assigning agents.
 
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 

@@ -1525,6 +1525,10 @@ mod tests {
             text.contains("deps"),
             "workspace should render dependency rollup\n{text}"
         );
+        assert!(
+            text.contains("roadmap"),
+            "workspace should render dependency-aware roadmap sequencing\n{text}"
+        );
     }
 
     #[test]

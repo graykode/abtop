@@ -22,8 +22,8 @@ Use it together with `docs/PRODUCT_STRATEGY.md`, `docs/ROADMAP_V2.md`, and
 
 ## Current Focus
 
-`P2-VIS-04`: build dependency-aware roadmap sequencing so users can see which
-tasks should happen first, next, and last before assigning agents.
+`P4-CTL-01`: build audited mutating control actions for kill/restart/archive/
+dispatch workflows with explicit confirmation.
 
 ## Task Board
 
@@ -41,56 +41,55 @@ tasks should happen first, next, and last before assigning agents.
 | P2-VIS-01 | Done | Codex | Visual task viewer | TUI task tree view | Add read-only task tree before any graphical mind map. | P1-T01, P1-T02 | UI module, tests | `cargo fmt -- --check`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; refreshed `assets/workspace-demo.gif` |
 | P2-VIS-02 | Done | Codex | Visual task viewer | Mind-map data model prototype | Create graph nodes/edges for tasks, decisions, sessions, files, and risks. | P2-VIS-01 | `src/task_graph/*`, docs | `cargo test task_graph`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; demo summary graph stats |
 | P2-VIS-03 | Done | Codex | Visual task viewer | Task dependency roadmap signals | Parse task dependencies and expose first graph/UI signals for task order and blockers. | P2-VIS-02, user feedback | `src/task/*`, `src/app.rs`, `src/task_graph/*`, UI tests | `cargo test task`; `cargo test task_graph`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; demo summary shows `deps=3` |
-| P2-VIS-04 | Next | Unassigned | Visual task viewer | Roadmap sequencing view | Compute dependency-aware task order and surface ready/blocked/next task stages before agent assignment. | P2-VIS-03 | roadmap model, workspace UI/export tests | Pending |
+| P2-VIS-04 | Done | Codex | Visual task viewer | Roadmap sequencing view | Compute dependency-aware task order and surface ready/blocked/next task stages before agent assignment. | P2-VIS-03 | roadmap model, workspace UI/export tests | `cargo test roadmap`; `cargo test task`; `cargo test task_graph`; `cargo test workspace`; `cargo fmt -- --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo test`; `cargo build`; `cargo run -- --demo --workspace-summary` |
 | P3-EVD-01 | Done | Codex | Evidence bundles | Per-task evidence bundle | Export safe per-task evidence: sessions, commands, files touched, checks, decisions. | P1-T03, P2-VIS-02 | export module, tests | `cargo test evidence`; `cargo test workspace`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo run -- --demo --task-evidence` |
 | P4-AUD-01 | Done | Codex | Controls | Local audit log | Add append-only audit log before any mutating control action. | Product decision | audit module, docs | `cargo test audit`; `cargo test`; `cargo clippy --all-targets --all-features -- -D warnings`; kill controls record audit events |
 | P4-CTL-01 | Next | Unassigned | Controls | Mutating control actions | Kill/restart/archive/dispatch actions with confirmation and audit. | P4-AUD-01 | app/ui/control modules | Pending |
 
-## Next Task Detail: P2-VIS-04
+## Next Task Detail: P4-CTL-01
 
 Target user:
 
-- Users converting a large legacy project with many dependent tasks split via
-  dw-kit before assigning work to agents.
+- Users who need to stop runaway sessions, restart failed work, archive finished
+  work, or dispatch a task without leaving the local monitoring workflow.
 
 Pain solved:
 
-- Users need to see which tasks depend on which, what must happen first, and
-  how the task roadmap flows toward the final goal.
+- Mutating controls need a consistent confirmation and audit trail before abtop
+  grows beyond read-only monitoring.
 
 Hypothesis:
 
-- A dependency-aware roadmap makes abtop useful before execution, not only while
-  agents are already running.
+- Small audited controls let users recover from common agent failures while
+  preserving local-only privacy and operator intent.
 
 Data sources:
 
-- parsed `.dw` task dependency metadata,
-- `WorkspaceTask` summaries,
-- `TaskGraph` edges.
+- current sessions, child processes, and orphan ports,
+- `.dw` task/project metadata for archive or dispatch targets,
+- append-only audit events from `P4-AUD-01`.
 
 Privacy risk:
 
-- Dependency labels can reveal project internals. Keep them short sanitized task
-  identifiers or titles; do not render body text.
+- Control labels can reveal local project names and task titles. Keep audit
+  entries structured and avoid prompts, file contents, or transcript bodies.
 
 Expected design:
 
-- Compute ready/blocked/ordered task stages from dependency edges.
-- Detect missing dependency labels and cycles as explicit risks.
-- Surface a compact roadmap/pipeline flow in workspace summary and later UI.
+- Confirmation window for destructive actions.
+- Audit every requested, confirmed, skipped, or failed action.
+- Reuse fresh process checks before killing or restarting anything.
 
 Suggested write scope:
 
-- roadmap module or `src/task_graph/*`,
-- `src/app.rs` bridge/export,
-- `src/ui/workspace.rs` if compact surface is added,
+- `src/app.rs` and focused control helpers,
+- `src/ui/*` confirmation/status surfaces,
+- audit integration tests,
 - focused tests.
 
 EVD target:
 
-- `cargo test task`,
-- `cargo test task_graph`,
+- `cargo test audit`,
 - `cargo test workspace`,
 - `cargo fmt -- --check`,
 - `cargo clippy --all-targets --all-features -- -D warnings`.

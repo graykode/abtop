@@ -3,6 +3,7 @@ use crate::collector::{read_rate_limits, McpServer, MultiCollector};
 use crate::evidence::{build_task_evidence, render_task_evidence_markdown};
 use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
+use crate::roadmap::{build_project_roadmap, RoadmapPlan, RoadmapRisk};
 use crate::task::{read_project_state, DwTaskSummary, TaskStatus};
 use crate::task_graph::{GraphNodeKind, TaskGraph};
 use crate::theme::Theme;
@@ -1227,6 +1228,7 @@ impl App {
                 project.port_count
             ));
             if project.has_dw {
+                let roadmap = self.workspace_project_roadmap(project);
                 out.push_str(&format!(
                     "- workflow: task={} status={} phase={} next={} acceptance={} tasks={} deps={} decisions={} records={} verification={}/{}\n",
                     project
@@ -1259,6 +1261,30 @@ impl App {
                     project.completed_verification_count,
                     project.verification_count
                 ));
+                out.push_str(&format!(
+                    "- roadmap: ready={} blocked={} stages={} risks={}\n",
+                    roadmap.ready_count,
+                    roadmap.blocked_count,
+                    roadmap.stages.len(),
+                    roadmap.risks.len()
+                ));
+                for stage in roadmap.stages.iter().take(3) {
+                    out.push_str(&format!(
+                        "  - {}: {}\n",
+                        stage.label.as_str(),
+                        stage
+                            .tasks
+                            .iter()
+                            .take(4)
+                            .map(|task| safe_export_text(&task.title, 64))
+                            .collect::<Vec<_>>()
+                            .join(" -> ")
+                    ));
+                }
+                let risk_summary = roadmap_risk_summary(&roadmap);
+                if !risk_summary.is_empty() {
+                    out.push_str(&format!("  - risks: {}\n", risk_summary.join(", ")));
+                }
             }
 
             let project_sessions: Vec<_> = self
@@ -1300,6 +1326,10 @@ impl App {
 
     pub fn workspace_task_graph(&self) -> TaskGraph {
         TaskGraph::build(&self.workspace_projects, &self.sessions)
+    }
+
+    pub fn workspace_project_roadmap(&self, project: &WorkspaceProject) -> RoadmapPlan {
+        build_project_roadmap(project)
     }
 
     pub fn task_evidence_markdown(&self) -> String {
@@ -1700,6 +1730,31 @@ fn workspace_export_idle_text(status: &SessionStatus) -> &'static str {
     }
 }
 
+fn roadmap_risk_summary(plan: &RoadmapPlan) -> Vec<String> {
+    let mut missing = 0;
+    let mut blocked = 0;
+    let mut cycles = 0;
+    for risk in &plan.risks {
+        match risk {
+            RoadmapRisk::MissingDependency { .. } => missing += 1,
+            RoadmapRisk::BlockedTask { .. } | RoadmapRisk::BlockedByTask { .. } => blocked += 1,
+            RoadmapRisk::Cycle { .. } => cycles += 1,
+        }
+    }
+
+    let mut summary = Vec::new();
+    if missing > 0 {
+        summary.push(format!("missing-deps={missing}"));
+    }
+    if blocked > 0 {
+        summary.push(format!("blocked={blocked}"));
+    }
+    if cycles > 0 {
+        summary.push(format!("cycles={cycles}"));
+    }
+    summary
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1946,6 +2001,8 @@ mod tests {
         assert!(summary.contains("workflow: task=Batch inference rollout status=Doing"));
         assert!(summary.contains("next=continue acceptance=6"));
         assert!(summary.contains("deps=3"));
+        assert!(summary.contains("roadmap: ready=0 blocked=3"));
+        assert!(summary.contains("risks: blocked="));
         assert!(summary.contains("verification=2/4"));
         assert!(summary.contains("Batch inference endpoint"));
         assert!(
