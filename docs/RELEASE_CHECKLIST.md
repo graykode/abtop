@@ -38,6 +38,7 @@ cargo run -- --demo --roadmap
 cargo run -- --demo --handoff
 cargo run -- --demo --handoff --json
 cargo run -- --demo --task-evidence
+cargo run -- --demo --dispatch-task dataset-drift-guardrails --dispatch-dry-run
 ```
 
 Expected:
@@ -66,6 +67,15 @@ session, not the demo fixture.
 - [ ] `cargo run -- --handoff` and `cargo run -- --handoff --json` run end-to-end.
 - [ ] Exported output contains **no** prompt text, file contents, secrets, or
       absolute local paths.
+- [ ] Composer flow (skip when no `allow_dispatch_*` flag is set in
+      `~/.config/abtop/config.toml`):
+  - press `d` from the Workspace tab on a `.dw` task,
+  - verify the brief preview redacts file contents and absolute paths,
+  - with `ABTOP_DISPATCH_DRY_RUN=1` set, complete the double-Enter confirm
+    and verify `outcome: dry-run` plus a fresh `dispatch-*` audit event,
+  - with the env var unset (and the agent CLI on `PATH`), verify a
+    response file is written to `{audit_dir}/dispatch/`, byte count > 0,
+    and no prompt or file content is leaked in any output surface.
 
 Capture the outcome in `docs/PRODUCTION_EVIDENCE.md` with today's date and
 sanitized values only.
