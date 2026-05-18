@@ -130,6 +130,8 @@ abtop --roadmap              # Markdown — ready/blocked/staged tasks + risks
 abtop --handoff              # Markdown — task assignment queue per agent
 abtop --handoff --json       # JSON  — schema: abtop.agent_handoff.v1
 abtop --task-evidence        # Markdown — per-task counts, tools, files, risks
+abtop --dispatch-task <slug> --agent claude --dispatch-dry-run
+                             # Headless composer: build brief, verify pipeline
 ```
 
 Example (`--demo --handoff`, abbreviated):

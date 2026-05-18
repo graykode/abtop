@@ -17,7 +17,11 @@ mod task_graph;
 mod theme;
 mod ui;
 
-use app::{App, JumpOutcome};
+use app::{App, JumpOutcome, WorkspaceProject, WorkspaceTask};
+use composer::{
+    build_brief, spawn_dispatch, DispatchAgent, DispatchOutcome, DispatchRequest, DispatchResult,
+    DispatchTarget,
+};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
     MouseEvent, MouseEventKind,
@@ -114,6 +118,36 @@ fn main() -> io::Result<()> {
     let roadmap = std::env::args().any(|a| a == "--roadmap");
     let handoff = std::env::args().any(|a| a == "--handoff");
     let json_output = std::env::args().any(|a| a == "--json");
+    let dispatch_task = flag_value("--dispatch-task");
+    let dispatch_agent = flag_value("--agent");
+    let dispatch_dry_run_flag = std::env::args().any(|a| a == "--dispatch-dry-run");
+
+    if let Some(task_id) = dispatch_task {
+        log_info!("dispatch-task mode demo={} task={}", demo_mode, task_id);
+        // In demo mode the synthetic workspace has no real targets to
+        // protect, so we open the dispatch policy to make the headless
+        // pipeline trivially runnable without editing config.toml.
+        let mut policy = cfg.control_policy;
+        if demo_mode {
+            policy.allow_dispatch_claude = true;
+            policy.allow_dispatch_codex = true;
+            policy.allow_dispatch_opencode = true;
+        }
+        let mut app = App::new_with_config_and_policy(
+            initial_theme.unwrap_or_default(),
+            &cfg.hidden_agents,
+            cfg.panels,
+            policy,
+        );
+        if demo_mode {
+            demo::populate_demo(&mut app);
+        } else {
+            app.tick();
+        }
+        let agent_name = dispatch_agent.as_deref().unwrap_or("claude");
+        let exit_code = run_headless_dispatch(&app, &task_id, agent_name, dispatch_dry_run_flag);
+        std::process::exit(exit_code);
+    }
 
     // --once flag: print snapshot and exit
     if std::env::args().any(|a| a == "--once")
@@ -428,6 +462,10 @@ Options:
   --roadmap            Print dependency-aware task roadmap Markdown and exit
   --handoff            Print cross-agent assignment handoff Markdown and exit
   --handoff --json     Print machine-readable handoff JSON and exit
+  --dispatch-task <ID> Headless dispatch: build a brief, drive the spawn
+                       pipeline once, print the result and exit
+  --agent <NAME>       Dispatch target: claude (default) | codex | opencode
+  --dispatch-dry-run   Force dispatch dry-run (verify pipeline without spawn)
   --doctor             Check local setup and collector health
   --doctor --json      Print machine-readable diagnostics JSON
   --setup              Install Claude rate-limit collection hook
@@ -439,10 +477,180 @@ Options:
   -h, --help           Print help and exit
 
 Environment:
-  ABTOP_AUDIT_FILE       Override append-only control audit JSONL path
-  ABTOP_CONTROL_DRY_RUN  Audit verified controls without terminating processes",
+  ABTOP_AUDIT_FILE        Override append-only control audit JSONL path
+  ABTOP_CONTROL_DRY_RUN   Audit verified kill controls without terminating
+  ABTOP_DISPATCH_DRY_RUN  Audit verified dispatch flow without spawning",
         env!("CARGO_PKG_VERSION")
     )
+}
+
+/// Extract the value following `--name <VALUE>` from `std::env::args()`.
+/// Returns `None` when the flag is absent or the trailing value is missing /
+/// looks like another flag.
+fn flag_value(name: &str) -> Option<String> {
+    let mut iter = std::env::args();
+    while let Some(arg) = iter.next() {
+        if arg == name {
+            return iter.next().filter(|v| !v.starts_with("--"));
+        }
+        if let Some(rest) = arg.strip_prefix(&format!("{name}=")) {
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Headless dispatch: locate a `.dw` task by slug, drive the spawn pipeline
+/// once, print the result to stdout, and return the desired process exit
+/// code. The audit log captures the full outcome regardless of the printed
+/// summary.
+fn run_headless_dispatch(app: &App, task_id: &str, agent_name: &str, dry_run_flag: bool) -> i32 {
+    let Some(agent) = resolve_agent(agent_name) else {
+        eprintln!("unknown agent '{agent_name}'. supported: claude, codex, opencode",);
+        return 2;
+    };
+
+    let Some((project, task)) = find_dispatch_target(&app.workspace_projects, task_id) else {
+        eprintln!("no .dw task matches '{task_id}'. dispatchable tasks:");
+        for line in list_dispatchable_tasks(&app.workspace_projects) {
+            eprintln!("  - {line}");
+        }
+        return 3;
+    };
+
+    let target = DispatchTarget {
+        project: project.name.clone(),
+        task_id: DispatchTarget::slug_from_title(&task.title),
+        task_title: task.title.clone(),
+        task_status: task.status_label().to_string(),
+        task_phase: task.phase.clone(),
+        acceptance_count: task.acceptance_count,
+        verification_completed: task.completed_verification_count,
+        verification_total: task.verification_count,
+        dependency_count: task.dependencies.len(),
+    };
+    let brief = build_brief(&target, project.active_task_next_action());
+
+    if !app.control_policy.is_dispatch_allowed(&agent.cli) {
+        eprintln!(
+            "dispatch to {} blocked by local policy (set allow_dispatch_{}=true in config.toml)",
+            agent.cli,
+            agent_cli_short(&agent.cli)
+        );
+        return 4;
+    }
+
+    let env_dry_run = std::env::var("ABTOP_DISPATCH_DRY_RUN")
+        .ok()
+        .is_some_and(|v| !v.is_empty() && v != "0");
+    let dry_run = dry_run_flag || env_dry_run;
+
+    let req = DispatchRequest {
+        target: target.clone(),
+        agent: agent.clone(),
+        brief: brief.clone(),
+        draft: String::new(),
+        dry_run,
+    };
+
+    let rx = spawn_dispatch(req);
+    let result = match rx.recv_timeout(Duration::from_secs(90)) {
+        Ok(r) => r,
+        Err(error) => {
+            eprintln!("dispatch did not return within 90s: {error}");
+            return 5;
+        }
+    };
+
+    print_headless_dispatch(&target, &agent, &brief, &result, dry_run);
+
+    match result.outcome {
+        DispatchOutcome::Sent | DispatchOutcome::DryRun => 0,
+        DispatchOutcome::Failed => 1,
+    }
+}
+
+fn resolve_agent(name: &str) -> Option<DispatchAgent> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "claude" | "claude-code" | "claude_code" | "cc" => Some(DispatchAgent::claude()),
+        "codex" | "codex-cli" | "codex_cli" => Some(DispatchAgent::codex()),
+        "opencode" | "open-code" | "open_code" => Some(DispatchAgent::opencode()),
+        _ => None,
+    }
+}
+
+fn agent_cli_short(cli: &str) -> &'static str {
+    match cli {
+        "claude-code" => "claude",
+        "codex-cli" => "codex",
+        "opencode" => "opencode",
+        _ => "<agent>",
+    }
+}
+
+fn find_dispatch_target<'a>(
+    projects: &'a [WorkspaceProject],
+    task_id: &str,
+) -> Option<(&'a WorkspaceProject, &'a WorkspaceTask)> {
+    let needle = task_id.trim().to_ascii_lowercase();
+    for project in projects.iter().filter(|p| p.has_dw) {
+        for task in &project.tasks {
+            if DispatchTarget::slug_from_title(&task.title) == needle {
+                return Some((project, task));
+            }
+        }
+    }
+    None
+}
+
+fn list_dispatchable_tasks(projects: &[WorkspaceProject]) -> Vec<String> {
+    let mut out = Vec::new();
+    for project in projects.iter().filter(|p| p.has_dw) {
+        for task in &project.tasks {
+            out.push(format!(
+                "{} / {} [{}]",
+                project.name,
+                DispatchTarget::slug_from_title(&task.title),
+                task.status_label()
+            ));
+        }
+    }
+    out
+}
+
+fn print_headless_dispatch(
+    target: &DispatchTarget,
+    agent: &DispatchAgent,
+    brief: &str,
+    result: &DispatchResult,
+    dry_run: bool,
+) {
+    println!("# abtop dispatch");
+    println!();
+    println!("- project: {}", target.project);
+    println!("- task: {} ({})", target.task_title, target.task_id);
+    println!("- status: {}", target.task_status);
+    println!("- agent: {} ({})", agent.label, agent.cli);
+    println!("- mode: {}", if dry_run { "dry-run" } else { "live" });
+    let outcome = match result.outcome {
+        DispatchOutcome::Sent => "sent",
+        DispatchOutcome::DryRun => "dry-run",
+        DispatchOutcome::Failed => "failed",
+    };
+    println!("- outcome: {}", outcome);
+    println!("- response bytes: {}", result.response_bytes);
+    if let Some(path) = &result.response_path {
+        println!("- response saved: {}", path.display());
+    }
+    if let Some(err) = &result.error {
+        println!("- error: {}", err);
+    }
+    println!();
+    println!("## brief");
+    println!();
+    print!("{brief}");
 }
 
 fn print_snapshot(app: &App) {
