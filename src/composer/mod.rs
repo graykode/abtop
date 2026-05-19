@@ -348,7 +348,7 @@ pub fn spawn_dispatch(req: DispatchRequest) -> Receiver<DispatchResult> {
 fn build_command_for(agent: &DispatchAgent) -> Option<Command> {
     match agent.cli.as_str() {
         "claude-code" => {
-            let mut cmd = Command::new("claude");
+            let mut cmd = windows_safe_command("claude");
             cmd.arg("--print");
             Some(cmd)
         }
@@ -357,7 +357,7 @@ fn build_command_for(agent: &DispatchAgent) -> Option<Command> {
             // builds. Older versions may not expose it — operators see a
             // `spawn failed` / `exit N` audit event and can fall back to
             // disabling `allow_dispatch_codex`.
-            let mut cmd = Command::new("codex");
+            let mut cmd = windows_safe_command("codex");
             cmd.arg("exec");
             Some(cmd)
         }
@@ -368,6 +368,27 @@ fn build_command_for(agent: &DispatchAgent) -> Option<Command> {
         // pipeline emits a `Failed` result until a stable command lands.
         // See `docs/LIMITATIONS.md` § *OpenCode dispatch*.
         _ => None,
+    }
+}
+
+/// Build a [`Command`] that resolves `.exe` / `.cmd` / `.bat` shims on
+/// Windows. Rust's `Command::new(program)` only searches for `.exe` on
+/// Windows — it does NOT walk `PATHEXT`. npm-installed CLIs such as Claude
+/// Code and Codex are typically `.cmd` shims, so Windows users would
+/// otherwise see `program not found` even with the shim on `PATH`. Routing
+/// through `cmd /C` lets the system PATHEXT resolver pick the right
+/// extension transparently. On non-Windows targets this is a plain
+/// `Command::new(program)`.
+pub(crate) fn windows_safe_command(program: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(program);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new(program)
     }
 }
 
@@ -751,26 +772,63 @@ mod tests {
         assert!(result.error.is_none());
     }
 
+    /// Collect program + args into a single token list so assertions stay
+    /// platform-agnostic: on Windows the program is `cmd` and the original
+    /// program name moves into the args (`/C claude --print`).
+    fn command_tokens(cmd: &Command) -> Vec<String> {
+        std::iter::once(cmd.get_program().to_string_lossy().into_owned())
+            .chain(cmd.get_args().map(|s| s.to_string_lossy().into_owned()))
+            .collect()
+    }
+
     #[test]
     fn build_command_for_claude_uses_print_flag() {
         let cmd = build_command_for(&DispatchAgent::claude()).expect("claude command");
-        assert_eq!(cmd.get_program(), "claude");
-        let args: Vec<_> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args, vec!["--print"]);
+        let tokens = command_tokens(&cmd);
+        assert!(
+            tokens.iter().any(|t| t == "claude"),
+            "tokens missing 'claude': {tokens:?}"
+        );
+        assert!(
+            tokens.iter().any(|t| t == "--print"),
+            "tokens missing '--print': {tokens:?}"
+        );
     }
 
     #[test]
     fn build_command_for_codex_uses_exec_subcommand() {
         let cmd = build_command_for(&DispatchAgent::codex()).expect("codex command");
-        assert_eq!(cmd.get_program(), "codex");
+        let tokens = command_tokens(&cmd);
+        assert!(
+            tokens.iter().any(|t| t == "codex"),
+            "tokens missing 'codex': {tokens:?}"
+        );
+        assert!(
+            tokens.iter().any(|t| t == "exec"),
+            "tokens missing 'exec': {tokens:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn build_command_for_claude_wraps_via_cmd_on_windows() {
+        // Regression: npm-installed Claude is `claude.cmd`, which
+        // `Command::new("claude")` cannot resolve. We must go through
+        // `cmd /C` so PATHEXT applies.
+        let cmd = build_command_for(&DispatchAgent::claude()).expect("claude command");
+        assert_eq!(cmd.get_program(), "cmd");
         let args: Vec<_> = cmd
             .get_args()
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, vec!["exec"]);
+        assert_eq!(args, vec!["/C", "claude", "--print"]);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn build_command_for_claude_invokes_program_directly_on_unix() {
+        let cmd = build_command_for(&DispatchAgent::claude()).expect("claude command");
+        assert_eq!(cmd.get_program(), "claude");
     }
 
     #[test]

@@ -2342,8 +2342,9 @@ impl App {
 /// Call `claude --print` via stdin pipe to summarize a prompt.
 /// Returns `None` on timeout so the caller can retry later.
 fn generate_summary(prompt: &str, assistant_text: &str) -> Option<String> {
+    use crate::composer::windows_safe_command;
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::Duration;
 
     if summary_generation_disabled() {
@@ -2373,7 +2374,7 @@ fn generate_summary(prompt: &str, assistant_text: &str) -> Option<String> {
         context
     );
 
-    let mut child = match Command::new("claude")
+    let mut child = match windows_safe_command("claude")
         .args(["--print", "-"])
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::piped())
