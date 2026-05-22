@@ -1,0 +1,129 @@
+{
+  "includeCoAuthoredBy": false,
+  "permissions": {
+    "allow": [
+      "Read(*)",
+      "Grep(*)",
+      "Glob(*)",
+      "Bash(git log *)",
+      "Bash(git diff *)",
+      "Bash(git show *)",
+      "Bash(git status)",
+      "Bash(git blame *)",
+      "Bash(git stash list)",
+      "Bash(ls *)",
+      "Bash(wc *)",
+      "Bash(node src/smoke-test.mjs)",
+      "Bash(xargs echo *)",
+      "Edit(/.claude/skills/dw-decision/**)",
+      "Bash(node bin/dw.mjs active)",
+      "Bash(node bin/dw.mjs metrics show)",
+      "Bash(node bin/dw.mjs dashboard)",
+      "Bash(node bin/dw.mjs init --help)",
+      "Bash(mkdir -p /tmp/test-solo)",
+      "Read(//tmp/**)",
+      "Bash(DW_NAME=test node /d/huygdv_projects/dw-kit/bin/dw.mjs init --solo)",
+      "Bash(npm test *)",
+      "Bash(node bin/dw.mjs metrics cut-analysis)",
+      "Bash(bash -n .claude/hooks/pre-commit-gate.sh)",
+      "Bash(bash -n /dev/stdin)",
+      "Bash(dos2unix .claude/hooks/pre-commit-gate.sh)",
+      "Bash(sed -i 's/\\\\r$//' .claude/hooks/pre-commit-gate.sh)",
+      "Bash(git add *)",
+      "Edit(/.claude/skills/dw-task-init/**)",
+      "Edit(/.claude/skills/dw-retroactive/**)",
+      "Edit(/.claude/skills/dw-research/**)",
+      "Edit(/.claude/skills/dw-plan/**)",
+      "Edit(/.claude/skills/dw-execute/**)",
+      "Edit(/.claude/skills/dw-handoff/**)",
+      "Bash(git commit -m 'fix\\(v1.3.3\\): writer skills v1/v2 compat + cleanup legacy slash-command refs *)",
+      "Bash(git commit -m 'feat\\(v1.3.4\\): /dw:plan integrated Quick Debate \\(red/blue team\\) - depth-driven *)"
+    ]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/session-init.sh\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Read|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/scout-block.sh\""
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/privacy-block.sh\""
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/pre-commit-gate.sh\""
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/safety-guard.sh\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/post-write.sh\""
+          },
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/supply-chain-scan.sh\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/stop-check.sh\""
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/progress-ping.sh\""
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {}
+}

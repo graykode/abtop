@@ -5,3 +5,8 @@
 demo.tape
 assets/claude-quota-evd.gif
 .idea/
+
+# dw-kit
+CLAUDE.local.md
+.claude/settings.local.json
+.dw/config/dw.config.local.yml

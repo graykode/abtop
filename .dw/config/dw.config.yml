@@ -1,0 +1,34 @@
+project:
+  name: New project
+  language: vi
+workflow:
+  default_depth: standard
+team:
+  roles:
+    - dev
+    - techlead
+quality:
+  test_command: ""
+  lint_command: ""
+  block_on_fail: false
+tracking:
+  estimation: true
+  log_work: false
+  estimation_unit: hours
+paths:
+  tasks: .dw/tasks
+  docs: .dw/docs
+claude:
+  models:
+    plan: ""
+    execute: ""
+    review: ""
+  structured_output: true
+  worktree_execution: false
+  mcp: []
+_toolkit:
+  core_version: "1.2"
+  platform_version: "1.0"
+  capability_version: "1.2"
+  installed: "2026-05-17"
+  last_upgrade: "2026-05-17"
