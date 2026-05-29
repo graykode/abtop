@@ -60,6 +60,9 @@ pub struct DwProjectState {
     pub has_dw: bool,
     pub active_task: Option<DwTaskSummary>,
     pub tasks: Vec<DwTaskSummary>,
+    /// Goals projected from `.dw/goals/goals-index.json` (dw-kit ADR-0017).
+    /// Empty when the project has no Goals layer or no index.
+    pub goals: Vec<super::dw_index::DwGoalSummary>,
     pub decision_count: usize,
     pub record_count: usize,
     pub verification_count: usize,
@@ -116,6 +119,10 @@ pub fn read_project_state(cwd: &Path) -> DwProjectState {
         .map(|task| task.completed_verification_count)
         .sum();
     state.tasks = tasks;
+
+    // Goals layer (dw-kit ADR-0017): read the committed index instead of
+    // scraping. Empty when absent — purely additive to the existing task view.
+    state.goals = super::dw_index::read_goals_index(cwd);
 
     state
 }
