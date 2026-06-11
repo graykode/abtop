@@ -471,17 +471,18 @@ impl App {
     }
 
     pub fn cycle_theme(&mut self) {
-        let names = crate::theme::THEME_NAMES;
+        let cfg = crate::config::load_config();
+        let names = crate::theme::available_theme_names(&cfg.custom_themes);
         let current = names
             .iter()
-            .position(|&n| n == self.theme.name)
+            .position(|name| name.as_str() == self.theme.name.as_str())
             .unwrap_or(0);
-        let next = (current + 1) % names.len();
-        self.theme = Theme::by_name(names[next]).unwrap_or_default();
-        if let Err(e) = crate::config::save_theme(names[next]) {
-            self.set_status(format!("theme: {} (save failed: {})", names[next], e));
+        let next_name = &names[(current + 1) % names.len()];
+        self.theme = Theme::from_config_name(next_name, &cfg.custom_themes).unwrap_or_default();
+        if let Err(e) = crate::config::save_theme(next_name) {
+            self.set_status(format!("theme: {} (save failed: {})", next_name, e));
         } else {
-            self.set_status(format!("theme: {}", names[next]));
+            self.set_status(format!("theme: {}", next_name));
         }
     }
 

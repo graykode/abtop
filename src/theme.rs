@@ -1,5 +1,7 @@
+use crate::config::CustomThemeConfig;
 use ratatui::style::Color;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Gradient {
     pub start: (u8, u8, u8),
     pub mid: (u8, u8, u8),
@@ -7,7 +9,7 @@ pub struct Gradient {
 }
 
 pub struct Theme {
-    pub name: &'static str,
+    pub name: String,
 
     // base
     pub main_bg: Color,
@@ -81,10 +83,24 @@ impl Theme {
         }
     }
 
+    pub fn from_config_name(name: &str, custom_themes: &[CustomThemeConfig]) -> Option<Self> {
+        Self::by_name(name).or_else(|| custom_theme_by_name(name, custom_themes))
+    }
+
+    pub fn available_names(custom_themes: &[CustomThemeConfig]) -> Vec<String> {
+        let mut names: Vec<String> = THEME_NAMES.iter().map(|name| (*name).to_string()).collect();
+        for custom in custom_themes {
+            if !names.iter().any(|name| name == &custom.name) {
+                names.push(custom.name.clone());
+            }
+        }
+        names
+    }
+
     /// btop default — exact RGB values from btop_theme.cpp Default_theme
     pub fn btop() -> Self {
         Self {
-            name: "btop",
+            name: "btop".to_string(),
             main_bg: Color::Rgb(25, 25, 25),
             main_fg: Color::Rgb(204, 204, 204),
             title: Color::Rgb(238, 238, 238),
@@ -133,7 +149,7 @@ impl Theme {
 
     pub fn dracula() -> Self {
         Self {
-            name: "dracula",
+            name: "dracula".to_string(),
             main_bg: Color::Rgb(40, 42, 54),
             main_fg: Color::Rgb(248, 248, 242),
             title: Color::Rgb(248, 248, 242),
@@ -183,7 +199,7 @@ impl Theme {
     pub fn catppuccin() -> Self {
         // Catppuccin Mocha palette
         Self {
-            name: "catppuccin",
+            name: "catppuccin".to_string(),
             main_bg: Color::Rgb(30, 30, 46),
             main_fg: Color::Rgb(205, 214, 244),
             title: Color::Rgb(205, 214, 244),
@@ -233,7 +249,7 @@ impl Theme {
     pub fn tokyo_night() -> Self {
         // Tokyo Night — night variant
         Self {
-            name: "tokyo-night",
+            name: "tokyo-night".to_string(),
             main_bg: Color::Rgb(26, 27, 38),        // bg #1a1b26
             main_fg: Color::Rgb(169, 177, 214),     // fg_dark #a9b1d6
             title: Color::Rgb(192, 202, 245),       // fg #c0caf5
@@ -283,7 +299,7 @@ impl Theme {
     pub fn gruvbox() -> Self {
         // gruvbox dark — bright accent variants for TUI visibility
         Self {
-            name: "gruvbox",
+            name: "gruvbox".to_string(),
             main_bg: Color::Rgb(40, 40, 40),        // bg0 #282828
             main_fg: Color::Rgb(235, 219, 178),     // fg1 #ebdbb2
             title: Color::Rgb(251, 241, 199),       // fg0 #fbf1c7
@@ -333,7 +349,7 @@ impl Theme {
     pub fn nord() -> Self {
         // Nord — arctic color palette
         Self {
-            name: "nord",
+            name: "nord".to_string(),
             main_bg: Color::Rgb(46, 52, 64),        // nord0 #2e3440
             main_fg: Color::Rgb(216, 222, 233),     // nord4 #d8dee9
             title: Color::Rgb(236, 239, 244),       // nord6 #eceff4
@@ -384,7 +400,7 @@ impl Theme {
     /// muted accents for users on bright terminals.
     pub fn light() -> Self {
         Self {
-            name: "light",
+            name: "light".to_string(),
             main_bg: Color::Rgb(253, 246, 227), // base3 #fdf6e3
             main_fg: Color::Rgb(88, 110, 117),  // base01 #586e75
             title: Color::Rgb(7, 54, 66),       // base02 #073642
@@ -435,7 +451,7 @@ impl Theme {
     /// crisp accent colors for users on bright terminals.
     pub fn white() -> Self {
         Self {
-            name: "white",
+            name: "white".to_string(),
             main_bg: Color::Rgb(255, 255, 255),     // white
             main_fg: Color::Rgb(31, 35, 40),        // gh fg.default #1f2328
             title: Color::Rgb(0, 0, 0),             // black
@@ -487,7 +503,7 @@ impl Theme {
     /// any color vision deficiency).
     pub fn high_contrast() -> Self {
         Self {
-            name: "high-contrast",
+            name: "high-contrast".to_string(),
             main_bg: Color::Rgb(0, 0, 0),
             main_fg: Color::Rgb(255, 255, 255),
             title: Color::Rgb(255, 255, 255),
@@ -539,7 +555,7 @@ impl Theme {
     /// magenta #DC267F, orange #FE6100, yellow #FFB000.
     pub fn protanopia() -> Self {
         Self {
-            name: "protanopia",
+            name: "protanopia".to_string(),
             main_bg: Color::Rgb(20, 20, 32),
             main_fg: Color::Rgb(220, 220, 220),
             title: Color::Rgb(255, 255, 255),
@@ -591,7 +607,7 @@ impl Theme {
     /// distinguish most reliably.
     pub fn deuteranopia() -> Self {
         Self {
-            name: "deuteranopia",
+            name: "deuteranopia".to_string(),
             main_bg: Color::Rgb(18, 24, 40),
             main_fg: Color::Rgb(222, 222, 230),
             title: Color::Rgb(255, 255, 255),
@@ -642,7 +658,7 @@ impl Theme {
     /// confusion. Inspired by GitHub's tritanopia-friendly colors.
     pub fn tritanopia() -> Self {
         Self {
-            name: "tritanopia",
+            name: "tritanopia".to_string(),
             main_bg: Color::Rgb(24, 20, 22),
             main_fg: Color::Rgb(224, 224, 224),
             title: Color::Rgb(255, 255, 255),
@@ -690,6 +706,93 @@ impl Theme {
     }
 }
 
+pub fn available_theme_names(custom_themes: &[CustomThemeConfig]) -> Vec<String> {
+    Theme::available_names(custom_themes)
+}
+
+fn custom_theme_by_name(name: &str, custom_themes: &[CustomThemeConfig]) -> Option<Theme> {
+    let custom = custom_themes.iter().find(|theme| theme.name == name)?;
+    let base_name = custom
+        .values
+        .get("base")
+        .map(|raw| unquote(raw))
+        .unwrap_or("btop");
+    let mut theme = Theme::by_name(base_name).unwrap_or_default();
+    theme.name = custom.name.clone();
+
+    for (key, raw) in &custom.values {
+        match key.as_str() {
+            "base" => {}
+            "main_bg" => set_color(&mut theme.main_bg, raw),
+            "main_fg" => set_color(&mut theme.main_fg, raw),
+            "title" => set_color(&mut theme.title, raw),
+            "hi_fg" => set_color(&mut theme.hi_fg, raw),
+            "selected_bg" => set_color(&mut theme.selected_bg, raw),
+            "selected_fg" => set_color(&mut theme.selected_fg, raw),
+            "inactive_fg" => set_color(&mut theme.inactive_fg, raw),
+            "graph_text" => set_color(&mut theme.graph_text, raw),
+            "meter_bg" => set_color(&mut theme.meter_bg, raw),
+            "proc_misc" => set_color(&mut theme.proc_misc, raw),
+            "div_line" => set_color(&mut theme.div_line, raw),
+            "session_id" => set_color(&mut theme.session_id, raw),
+            "status_fg" => set_color(&mut theme.status_fg, raw),
+            "warning_fg" => set_color(&mut theme.warning_fg, raw),
+            "cpu_box" => set_color(&mut theme.cpu_box, raw),
+            "mem_box" => set_color(&mut theme.mem_box, raw),
+            "net_box" => set_color(&mut theme.net_box, raw),
+            "proc_box" => set_color(&mut theme.proc_box, raw),
+            "cpu_grad" => set_gradient(&mut theme.cpu_grad, raw),
+            "proc_grad" => set_gradient(&mut theme.proc_grad, raw),
+            "used_grad" => set_gradient(&mut theme.used_grad, raw),
+            "free_grad" => set_gradient(&mut theme.free_grad, raw),
+            "cached_grad" => set_gradient(&mut theme.cached_grad, raw),
+            _ => {}
+        }
+    }
+
+    Some(theme)
+}
+
+fn set_color(target: &mut Color, raw: &str) {
+    if let Some((r, g, b)) = parse_rgb(raw) {
+        *target = Color::Rgb(r, g, b);
+    }
+}
+
+fn set_gradient(target: &mut Gradient, raw: &str) {
+    if let Some(gradient) = parse_gradient(raw) {
+        *target = gradient;
+    }
+}
+
+fn parse_gradient(raw: &str) -> Option<Gradient> {
+    let inner = raw.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let parts: Vec<&str> = inner.split(',').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let start = parse_rgb(parts[0])?;
+    let mid = parse_rgb(parts[1])?;
+    let end = parse_rgb(parts[2])?;
+    Some(Gradient { start, mid, end })
+}
+
+fn parse_rgb(raw: &str) -> Option<(u8, u8, u8)> {
+    let value = unquote(raw.trim());
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
+fn unquote(raw: &str) -> &str {
+    raw.trim().trim_matches('"').trim_matches('\'')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,5 +813,98 @@ mod tests {
     fn default_is_btop() {
         let t = Theme::default();
         assert_eq!(t.name, "btop");
+    }
+
+    #[test]
+    fn custom_theme_inherits_base_and_overrides_fields() {
+        let custom = CustomThemeConfig {
+            name: "midnight".to_string(),
+            values: [
+                ("base", r#""dracula""#),
+                ("main_bg", r##""#010203""##),
+                ("cpu_grad", r##"["#000000", "#111111", "#ffffff"]"##),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        };
+
+        let theme = Theme::from_config_name("midnight", &[custom]).unwrap();
+
+        assert_eq!(theme.name, "midnight");
+        assert_eq!(theme.main_bg, Color::Rgb(1, 2, 3));
+        assert_eq!(theme.main_fg, Theme::dracula().main_fg);
+        assert_eq!(theme.cpu_grad.start, (0, 0, 0));
+        assert_eq!(theme.cpu_grad.mid, (17, 17, 17));
+        assert_eq!(theme.cpu_grad.end, (255, 255, 255));
+    }
+
+    #[test]
+    fn malformed_custom_theme_values_fall_back_to_base() {
+        let base = Theme::dracula();
+        let custom = CustomThemeConfig {
+            name: "broken".to_string(),
+            values: [
+                ("base", r#""dracula""#),
+                ("main_bg", r#""010203""#),
+                ("main_fg", r##""#nothex""##),
+                ("cpu_grad", r##"["#000000", "#111111"]"##),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        };
+
+        let theme = Theme::from_config_name("broken", &[custom]).unwrap();
+
+        assert_eq!(theme.name, "broken");
+        assert_eq!(theme.main_bg, base.main_bg);
+        assert_eq!(theme.main_fg, base.main_fg);
+        assert_eq!(theme.cpu_grad, base.cpu_grad);
+    }
+
+    #[test]
+    fn custom_theme_with_unknown_base_falls_back_to_btop() {
+        let custom = CustomThemeConfig {
+            name: "unknown-base".to_string(),
+            values: [("base", r#""not-a-theme""#)]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        };
+
+        let theme = Theme::from_config_name("unknown-base", &[custom]).unwrap();
+
+        assert_eq!(theme.name, "unknown-base");
+        assert_eq!(theme.main_bg, Theme::btop().main_bg);
+    }
+
+    #[test]
+    fn built_in_theme_names_are_not_overridden_by_custom_themes() {
+        let custom = CustomThemeConfig {
+            name: "btop".to_string(),
+            values: [("main_bg", r##""#000000""##)]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        };
+
+        let theme = Theme::from_config_name("btop", &[custom]).unwrap();
+
+        assert_eq!(theme.name, "btop");
+        assert_eq!(theme.main_bg, Theme::btop().main_bg);
+    }
+
+    #[test]
+    fn custom_names_are_available_after_presets() {
+        let custom = CustomThemeConfig {
+            name: "midnight".to_string(),
+            values: Default::default(),
+        };
+
+        let names = available_theme_names(&[custom]);
+
+        assert_eq!(names.first().map(String::as_str), Some("btop"));
+        assert!(names.iter().any(|name| name == "midnight"));
     }
 }

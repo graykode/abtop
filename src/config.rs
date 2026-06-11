@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy)]
@@ -25,6 +26,12 @@ impl Default for PanelVisibility {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomThemeConfig {
+    pub name: String,
+    pub values: BTreeMap<String, String>,
+}
+
 pub struct AppConfig {
     pub theme: String,
     /// Agent CLI names to exclude from the TUI (e.g. ["codex"] to hide Codex).
@@ -37,6 +44,9 @@ pub struct AppConfig {
     /// UI language override. Empty string means auto-detect from `LANG`.
     /// Recognized values: "en", "zh" (anything starting with "zh" maps to Simplified Chinese).
     pub language: String,
+    /// User-defined theme sections from `[themes.<name>]`. Values remain raw
+    /// so the theme module can validate color-specific syntax.
+    pub custom_themes: Vec<CustomThemeConfig>,
 }
 
 impl Default for AppConfig {
@@ -47,6 +57,7 @@ impl Default for AppConfig {
             claude_config_dirs: Vec::new(),
             panels: PanelVisibility::default(),
             language: String::new(),
+            custom_themes: Vec::new(),
         }
     }
 }
@@ -71,20 +82,35 @@ pub fn load_config() -> AppConfig {
 
 fn parse_config_body(content: &str) -> AppConfig {
     let mut config = AppConfig::default();
-    for line in content.lines() {
-        let line = line.trim();
+    let mut current_custom_theme: Option<String> = None;
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
+
+        if let Some(section) = parse_section_header(line) {
+            current_custom_theme = section
+                .strip_prefix("themes.")
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| name.trim().to_string());
+            continue;
+        }
+
         if let Some((key, val)) = line.split_once('=') {
             let key = key.trim();
-            // Strip quotes (double or single) and inline comments
-            let val = val.trim();
-            let val = if let Some(comment_pos) = val.find('#') {
-                val[..comment_pos].trim()
-            } else {
-                val
-            };
+            let val = strip_inline_comment(val.trim());
+
+            if let Some(name) = &current_custom_theme {
+                if !key.is_empty() {
+                    custom_theme_mut(&mut config.custom_themes, name)
+                        .values
+                        .insert(key.to_string(), val.to_string());
+                }
+                continue;
+            }
+
             if key == "hidden_agents" {
                 config.hidden_agents = parse_string_array(val);
                 continue;
@@ -93,7 +119,7 @@ fn parse_config_body(content: &str) -> AppConfig {
                 config.claude_config_dirs = parse_path_array(val);
                 continue;
             }
-            let val = val.trim_matches('"').trim_matches('\'');
+            let val = val.trim_matches('\"').trim_matches('\'');
             match key {
                 "theme" => config.theme = val.to_string(),
                 "language" => config.language = val.to_string(),
@@ -109,6 +135,52 @@ fn parse_config_body(content: &str) -> AppConfig {
         }
     }
     config
+}
+
+fn parse_section_header(line: &str) -> Option<&str> {
+    let line = strip_inline_comment(line);
+    let inner = line.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
+fn custom_theme_mut<'a>(
+    themes: &'a mut Vec<CustomThemeConfig>,
+    name: &str,
+) -> &'a mut CustomThemeConfig {
+    if let Some(pos) = themes.iter().position(|theme| theme.name == name) {
+        return &mut themes[pos];
+    }
+    themes.push(CustomThemeConfig {
+        name: name.to_string(),
+        values: BTreeMap::new(),
+    });
+    themes.last_mut().expect("just pushed custom theme")
+}
+
+fn strip_inline_comment(raw: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for (idx, ch) in raw.char_indices() {
+        match ch {
+            '\\' if in_double => {
+                escaped = !escaped;
+                continue;
+            }
+            '"' if !in_single && !escaped => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            '#' if !in_single && !in_double => return raw[..idx].trim(),
+            _ => {}
+        }
+        escaped = false;
+    }
+
+    raw.trim()
 }
 
 fn parse_bool(raw: &str) -> Option<bool> {
@@ -193,8 +265,21 @@ fn write_with_updates(updates: &[(&str, String)]) -> Result<(), String> {
 fn rewrite_kv_lines(content: &str, updates: &[(&str, String)]) -> String {
     let mut found = vec![false; updates.len()];
     let mut out: Vec<String> = Vec::new();
+    let mut in_section = false;
+    let mut appended_missing = false;
+
     for line in content.lines() {
-        let line_key = line.split_once('=').map(|(k, _)| k.trim().to_string());
+        let starts_section = parse_section_header(line.trim()).is_some();
+        if starts_section && !appended_missing {
+            append_missing_updates(&mut out, updates, &found);
+            appended_missing = true;
+        }
+
+        let line_key = if in_section {
+            None
+        } else {
+            line.split_once('=').map(|(k, _)| k.trim().to_string())
+        };
         let mut replaced = false;
         if let Some(key) = line_key {
             if let Some(idx) = updates.iter().position(|(k, _)| *k == key) {
@@ -206,13 +291,24 @@ fn rewrite_kv_lines(content: &str, updates: &[(&str, String)]) -> String {
         if !replaced {
             out.push(line.to_string());
         }
+        if starts_section {
+            in_section = true;
+        }
     }
+
+    if !appended_missing {
+        append_missing_updates(&mut out, updates, &found);
+    }
+
+    out.join("\n") + "\n"
+}
+
+fn append_missing_updates(out: &mut Vec<String>, updates: &[(&str, String)], found: &[bool]) {
     for (idx, (k, v)) in updates.iter().enumerate() {
         if !found[idx] {
             out.push(format!("{} = {}", k, v));
         }
     }
-    out.join("\n") + "\n"
 }
 
 #[cfg(test)]
@@ -262,6 +358,46 @@ mod tests {
         assert_eq!(cfg.claude_config_dirs, vec![home.join(".claude-personal")]);
     }
 
+    #[test]
+    fn parse_config_body_loads_custom_theme_sections() {
+        let cfg = parse_config_body(
+            r##"
+theme = "midnight" # active custom theme
+[themes.midnight]
+base = "dracula"
+main_bg = "#101010"
+cpu_grad = ["#000000", "#111111", "#ffffff"]
+"##,
+        );
+
+        assert_eq!(cfg.theme, "midnight");
+        assert_eq!(cfg.custom_themes.len(), 1);
+        assert_eq!(cfg.custom_themes[0].name, "midnight");
+        assert_eq!(
+            cfg.custom_themes[0]
+                .values
+                .get("main_bg")
+                .map(String::as_str),
+            Some("\"#101010\"")
+        );
+        assert_eq!(
+            cfg.custom_themes[0]
+                .values
+                .get("cpu_grad")
+                .map(String::as_str),
+            Some("[\"#000000\", \"#111111\", \"#ffffff\"]")
+        );
+    }
+
+    #[test]
+    fn strip_inline_comment_preserves_hash_inside_quotes() {
+        assert_eq!(
+            strip_inline_comment(r##""#101010" # color"##),
+            r##""#101010""##
+        );
+        assert_eq!(strip_inline_comment("true # comment"), "true");
+    }
+
     fn theme_update(name: &str) -> Vec<(&'static str, String)> {
         vec![("theme", format!("\"{}\"", name))]
     }
@@ -292,6 +428,22 @@ mod tests {
         let after = rewrite_kv_lines(before, &theme_update("gruvbox"));
         assert!(after.contains("hidden_agents = [\"codex\"]"));
         assert!(after.contains("theme = \"gruvbox\""));
+    }
+
+    #[test]
+    fn rewrite_theme_appends_before_custom_theme_section() {
+        let before = "[themes.midnight]\nmain_bg = \"#101010\"\n";
+        let after = rewrite_kv_lines(before, &theme_update("midnight"));
+        assert!(after.starts_with("theme = \"midnight\"\n[themes.midnight]"));
+        assert!(after.contains("main_bg = \"#101010\""));
+    }
+
+    #[test]
+    fn rewrite_theme_ignores_theme_keys_inside_sections() {
+        let before = "theme = \"btop\"\n[themes.midnight]\ntheme = \"not-a-root-key\"\n";
+        let after = rewrite_kv_lines(before, &theme_update("dracula"));
+        assert!(after.contains("theme = \"dracula\"\n[themes.midnight]"));
+        assert!(after.contains("theme = \"not-a-root-key\""));
     }
 
     #[test]

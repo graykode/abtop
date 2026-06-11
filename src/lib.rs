@@ -105,8 +105,10 @@ pub fn run() -> io::Result<()> {
         return Ok(());
     }
 
-    // Load config once; it drives both the default theme and the hidden-agents list.
+    // Load config once; it drives the default theme, user themes, and hidden-agent list.
     let cfg = config::load_config();
+    let available_theme_names = theme::available_theme_names(&cfg.custom_themes);
+    let available_theme_list = available_theme_names.join(", ");
 
     // --theme flag > config file > default
     let initial_theme = std::env::args()
@@ -117,27 +119,26 @@ pub fn run() -> io::Result<()> {
                 Some(name) if !name.starts_with('-') => name,
                 Some(name) => {
                     eprintln!("--theme requires a theme name, got '{}'", name);
-                    eprintln!("available: {}", theme::THEME_NAMES.join(", "));
+                    eprintln!("available: {}", available_theme_list);
                     std::process::exit(1);
                 }
                 None => {
                     eprintln!("--theme requires a theme name");
-                    eprintln!("available: {}", theme::THEME_NAMES.join(", "));
+                    eprintln!("available: {}", available_theme_list);
                     std::process::exit(1);
                 }
             }
         })
         .map(|name| {
-            theme::Theme::by_name(&name).unwrap_or_else(|| {
+            theme::Theme::from_config_name(&name, &cfg.custom_themes).unwrap_or_else(|| {
                 eprintln!(
                     "unknown theme '{}'. available: {}",
-                    name,
-                    theme::THEME_NAMES.join(", ")
+                    name, available_theme_list
                 );
                 std::process::exit(1);
             })
         })
-        .or_else(|| theme::Theme::by_name(&cfg.theme));
+        .or_else(|| theme::Theme::from_config_name(&cfg.theme, &cfg.custom_themes));
 
     let demo_mode = std::env::args().any(|a| a == "--demo");
     let exit_on_jump = std::env::args().any(|a| a == "--exit-on-jump");

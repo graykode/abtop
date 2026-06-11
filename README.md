@@ -87,7 +87,7 @@ OpenCode support reads the local SQLite database at `~/.local/share/opencode/ope
 
 ## Themes
 
-12 built-in themes, including 4 colorblind-friendly options (`high-contrast`, `protanopia`, `deuteranopia`, `tritanopia`). Press `t` to cycle at runtime, or launch with `--theme <name>`. Your choice is saved to `~/.config/abtop/config.toml`.
+12 built-in themes, including 4 colorblind-friendly options (`high-contrast`, `protanopia`, `deuteranopia`, `tritanopia`). Press `t` to cycle built-in and configured custom themes at runtime, or launch with `--theme <name>`. Your choice is saved to `~/.config/abtop/config.toml`.
 
 | btop (default) | dracula | catppuccin |
 |:-:|:-:|:-:|
@@ -128,6 +128,49 @@ hidden_agents = ["codex"]
 claude_config_dirs = ["~/.claude-personal", "~/.claude-work-team"]
 # UI language. Omit or leave empty to auto-detect from LANG.
 language = "zh"
+```
+
+### Custom themes
+
+Define custom themes in the same config file with `[themes.<name>]`, then set `theme = "<name>"` or launch `abtop --theme <name>`. Custom themes are appended to the `t` cycle after built-ins. Names matching built-ins do not override built-ins. Malformed color/gradient values are ignored and inherit from the base theme; config values are parsed as data only, with no code execution.
+
+Exact schema:
+
+```toml
+theme = "midnight"
+
+[themes.midnight]
+# Optional built-in base to inherit from. Defaults to "btop".
+base = "dracula"
+
+# Color fields accept quoted #RRGGBB values. Any omitted or malformed field
+# inherits from base.
+main_bg = "#101018"
+main_fg = "#e6e6f0"
+title = "#ffffff"
+hi_fg = "#ff79c6"
+selected_bg = "#303050"
+selected_fg = "#ffffff"
+inactive_fg = "#666680"
+graph_text = "#8888aa"
+meter_bg = "#24243a"
+proc_misc = "#50fa7b"
+div_line = "#303050"
+session_id = "#f1fa8c"
+status_fg = "#ff5555"
+warning_fg = "#f1fa8c"
+cpu_box = "#8be9fd"
+mem_box = "#bd93f9"
+net_box = "#ff79c6"
+proc_box = "#ff5555"
+
+# Gradient fields are arrays of three quoted #RRGGBB values:
+# [low, mid, high].
+cpu_grad = ["#50fa7b", "#f1fa8c", "#ff5555"]
+proc_grad = ["#50fa7b", "#f1fa8c", "#ff5555"]
+used_grad = ["#44475a", "#ff79c6", "#ff5555"]
+free_grad = ["#282a36", "#50fa7b", "#8be9fd"]
+cached_grad = ["#282a36", "#8be9fd", "#bd93f9"]
 ```
 
 ### Supported Languages
