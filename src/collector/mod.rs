@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod codex;
+pub mod hermes;
 pub mod mcp;
 pub mod opencode;
 pub mod process;
@@ -7,6 +8,7 @@ pub mod rate_limit;
 
 pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
+pub use hermes::HermesCollector;
 pub use mcp::McpServer;
 pub use opencode::OpenCodeCollector;
 pub use rate_limit::read_rate_limits;
@@ -319,6 +321,9 @@ impl MultiCollector {
         if !is_hidden("opencode") {
             collectors.push(Box::new(OpenCodeCollector::new()));
         }
+        if !is_hidden("hermes") {
+            collectors.push(Box::new(HermesCollector::new()));
+        }
         let codex_enabled = !is_hidden("codex");
         Self {
             collectors,
@@ -491,27 +496,27 @@ mod tests {
     #[test]
     fn with_hidden_empty_keeps_all_collectors() {
         let mc = MultiCollector::with_hidden(&[]);
-        assert_eq!(mc.collectors.len(), 3);
+        assert_eq!(mc.collectors.len(), 4);
     }
 
     #[test]
     fn with_hidden_codex_drops_codex_only() {
         let mc = MultiCollector::with_hidden(&["codex".to_string()]);
-        assert_eq!(mc.collectors.len(), 2);
+        assert_eq!(mc.collectors.len(), 3);
     }
 
     #[test]
     fn with_hidden_is_case_insensitive() {
         let mc = MultiCollector::with_hidden(&["CODEX".to_string()]);
-        assert_eq!(mc.collectors.len(), 2);
+        assert_eq!(mc.collectors.len(), 3);
         let mc = MultiCollector::with_hidden(&["Claude".to_string()]);
-        assert_eq!(mc.collectors.len(), 2);
+        assert_eq!(mc.collectors.len(), 3);
     }
 
     #[test]
     fn with_hidden_unknown_names_are_ignored() {
         let mc = MultiCollector::with_hidden(&["kiro".to_string(), "gemini".to_string()]);
-        assert_eq!(mc.collectors.len(), 3);
+        assert_eq!(mc.collectors.len(), 4);
     }
 
     #[test]
@@ -520,6 +525,7 @@ mod tests {
             "claude".to_string(),
             "codex".to_string(),
             "opencode".to_string(),
+            "hermes".to_string(),
         ]);
         assert!(mc.collectors.is_empty());
     }
