@@ -6,8 +6,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Maximum sessions to fetch from the DB per query.
-const MAX_SESSIONS: u32 = 20;
+/// Maximum sessions to fetch from the DB per query. With 140+ active Hermes
+/// sessions, a simple `LIMIT` would miss older sessions that still have
+/// running workers, so we use a two-phase approach: collect running PIDs
+/// first, then query only those session IDs.
+const MAX_SESSIONS: u32 = 100;
 
 /// Model -> context window size (tokens) lookup.
 /// Hermes doesn't store context_window in the DB, so we maintain a table.
@@ -73,8 +76,8 @@ fn expand_home(path_str: &str) -> PathBuf {
 /// so we don't fork a sqlite3 process every 2s.
 pub struct HermesCollector {
     db_path: PathBuf,
-    /// Whether sqlite3 CLI is available (checked once).
-    sqlite3_available: Option<bool>,
+    /// Whether Python (with sqlite3 module) is available (checked once).
+    python_available: Option<bool>,
     /// Cached DB rows from the last slow-tick query.
     cached_db_sessions: Vec<DbSession>,
 }
@@ -84,7 +87,7 @@ impl HermesCollector {
         let db_path = Self::discover_db_path();
         Self {
             db_path,
-            sqlite3_available: None,
+            python_available: None,
             cached_db_sessions: Vec::new(),
         }
     }
@@ -121,12 +124,16 @@ impl HermesCollector {
         }
     }
 
-    fn check_sqlite3(&mut self) -> bool {
-        if let Some(available) = self.sqlite3_available {
+    fn check_python(&mut self) -> bool {
+        if let Some(available) = self.python_available {
             return available;
         }
-        let available = Command::new("sqlite3").arg("--version").output().is_ok();
-        self.sqlite3_available = Some(available);
+        // Check if we can run python -c "import sqlite3, json"
+        let available = Command::new("python")
+            .args(["-c", "import sqlite3, json; print('ok')"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        self.python_available = Some(available);
         available
     }
 
@@ -165,15 +172,44 @@ impl HermesCollector {
             .collect()
     }
 
-    /// Run a single sqlite3 query and parse the JSON output.
+    /// Run a sqlite3 query using Python's built-in sqlite3 module.
+    /// This avoids depending on the sqlite3 CLI being installed.
+    /// Writes SQL to a temp file to avoid quoting/escaping issues.
     fn run_query(&self, sql: &str) -> Option<Vec<Value>> {
         let db = self.db_path.to_str()?;
-        let output = Command::new("sqlite3")
-            .args(["-readonly", "-json", db])
-            .arg(sql)
+
+        // Write SQL to a temp file to avoid shell quoting issues.
+        // File is cleaned up on next call (PID-based naming = one temp file per process).
+        let sql_path = format!(
+            "{}\\hermes_query_{}.sql",
+            std::env::temp_dir().to_string_lossy(),
+            std::process::id()
+        );
+        if std::fs::write(&sql_path, sql).is_err() {
+            return None;
+        }
+
+        let script = format!(
+            "import sqlite3, json, sys
+with open(r'{}') as f:
+    query = f.read()
+conn = sqlite3.connect(r'{}')
+conn.row_factory = sqlite3.Row
+cur = conn.execute(query)
+rows = [dict(row) for row in cur.fetchall()]
+conn.close()
+json.dump(rows, sys.stdout, ensure_ascii=False, default=str)",
+            sql_path.replace('\\', "/"),
+            db.replace('\\', "/"),
+        );
+
+        let output = Command::new("python")
+            .args(["-c", &script])
             .output()
             .ok()?;
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("Hermes collector python error: {}", stderr);
             return None;
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -185,7 +221,7 @@ impl HermesCollector {
 
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         // Security: skip if db_path is a symlink (fail-closed)
-        if is_symlink(&self.db_path) || !self.db_path.exists() || !self.check_sqlite3() {
+        if is_symlink(&self.db_path) || !self.db_path.exists() || !self.check_python() {
             self.cached_db_sessions.clear();
             return vec![];
         }
@@ -495,15 +531,16 @@ impl HermesCollector {
     }
 
     fn query_sessions(&self) -> Option<Vec<DbSession>> {
-        // Query: active sessions (last 24h) and ended sessions in last 60s,
-        // with aggregated token counts.
+        // Query: all active (not ended) sessions, plus ended sessions in last 60s.
+        // The `s.ended_at IS NULL` clause catches long-running sessions that
+        // may be older than 24h but still have a running process.
         //
         // The Hermes state.db schema:
         //   sessions(id, source, model, title, cwd, started_at, ended_at,
         //            message_count, tool_call_count, api_call_count,
         //            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
         //            reasoning_tokens, ...)
-        // NOTE: no explicit 'version' column — we use 'estim' suffix as fallback.
+        // NOTE: no explicit 'version' column — we use empty string as fallback.
         let sql = format!(
             r#"
 SELECT
@@ -519,7 +556,7 @@ SELECT
   COALESCE(s.cache_write_tokens, 0) as total_cache_write,
   COALESCE(s.api_call_count, s.message_count, 0) as turn_count
 FROM sessions s
-WHERE s.started_at > CAST((strftime('%%s', 'now') - 86400) AS REAL)
+WHERE s.ended_at IS NULL
    OR (s.ended_at IS NOT NULL AND s.ended_at > CAST((strftime('%%s', 'now') - 60) AS REAL))
 ORDER BY s.started_at DESC
 LIMIT {};
