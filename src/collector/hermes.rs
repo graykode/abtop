@@ -336,10 +336,21 @@ json.dump(rows, sys.stdout, ensure_ascii=False, default=str)",
 
             let current_tasks = if matches!(status, SessionStatus::Waiting) {
                 vec!["waiting for input".to_string()]
+            } else if !ds.last_tool.is_empty() {
+                vec![format!("{} ...", ds.last_tool)]
             } else if matches!(status, SessionStatus::Executing) {
                 vec!["executing...".to_string()]
             } else {
                 vec!["thinking...".to_string()]
+            };
+
+            // Show thinking_since if recent activity without a response yet
+            let thinking_since_ms = if matches!(status, SessionStatus::Thinking)
+                && ds.last_activity_ts > 0
+            {
+                ds.last_activity_ts
+            } else {
+                0
             };
 
             let project_name = if !ds.project_name.is_empty() {
@@ -399,7 +410,7 @@ json.dump(rows, sys.stdout, ensure_ascii=False, default=str)",
                 chat_messages: vec![],
                 tool_calls: vec![],
                 pending_since_ms: 0,
-                thinking_since_ms: 0,
+                thinking_since_ms,
                 file_accesses: vec![],
                 config_root: super::abbrev_path(
                     self.db_path
@@ -554,7 +565,10 @@ SELECT
   COALESCE(s.output_tokens, 0) as total_output,
   COALESCE(s.cache_read_tokens, 0) as total_cache_read,
   COALESCE(s.cache_write_tokens, 0) as total_cache_write,
-  COALESCE(s.api_call_count, s.message_count, 0) as turn_count
+  COALESCE(s.api_call_count, s.message_count, 0) as turn_count,
+  COALESCE((SELECT json_extract(m.tool_calls, '$[0].function.name') FROM messages m WHERE m.session_id = s.id AND m.role = 'assistant' AND m.tool_calls IS NOT NULL ORDER BY m.id DESC LIMIT 1), '') as last_tool,
+  COALESCE((SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = s.id), s.started_at) as last_activity_ts,
+  COALESCE((SELECT m.content FROM messages m WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL AND m.content != '' ORDER BY m.id DESC LIMIT 1), '') as last_prompt
 FROM sessions s
 WHERE s.ended_at IS NULL
    OR (s.ended_at IS NOT NULL AND s.ended_at > CAST((strftime('%%s', 'now') - 60) AS REAL))
@@ -572,17 +586,26 @@ LIMIT {};
             let mut directory = row["directory"].as_str().unwrap_or("").to_string();
             let mut model = row["model"].as_str().unwrap_or("").to_string();
 
+            let mut last_tool = row["last_tool"].as_str().unwrap_or("").to_string();
+            let mut last_prompt = row["last_prompt"].as_str().unwrap_or("").to_string();
+
             truncate_field(&mut id, 256);
             truncate_field(&mut title, 512);
             truncate_field(&mut directory, 4096);
             truncate_field(&mut model, 128);
+            truncate_field(&mut last_tool, 64);
+            truncate_field(&mut last_prompt, 512);
 
             let title = super::redact_secrets(&title);
+            let last_prompt = super::redact_secrets(&last_prompt);
 
             // Hermes stores timestamps as Unix epoch seconds (REAL).
             // Convert to milliseconds for abtop compatibility.
             let time_created = row["time_created_ms"].as_u64().unwrap_or(0);
             let time_updated = row["time_updated_ms"].as_u64().unwrap_or(0);
+            let last_activity_ts = row["last_activity_ts"].as_f64().map(|t| (t * 1000.0) as u64).unwrap_or(0);
+            // If last_activity_ts is somehow 0, fall back to time_updated
+            let last_activity_ts = if last_activity_ts == 0 { time_updated } else { last_activity_ts };
 
             let project_name = directory
                 .trim_end_matches('/')
@@ -598,6 +621,7 @@ LIMIT {};
                 directory,
                 time_created,
                 time_updated,
+                last_activity_ts,
                 project_name,
                 turn_count: row["turn_count"].as_u64().unwrap_or(0) as u32,
                 total_input: row["total_input"].as_u64().unwrap_or(0),
@@ -605,6 +629,8 @@ LIMIT {};
                 total_cache_read: row["total_cache_read"].as_u64().unwrap_or(0),
                 total_cache_write: row["total_cache_write"].as_u64().unwrap_or(0),
                 model,
+                last_tool,
+                last_prompt,
             });
         }
 
@@ -637,6 +663,12 @@ struct DbSession {
     total_cache_read: u64,
     total_cache_write: u64,
     model: String,
+    /// Last tool call name from the assistant (e.g. "terminal", "read_file", "web_search")
+    last_tool: String,
+    /// Timestamp of the most recent message (epoch ms), or started_at if no messages
+    last_activity_ts: u64,
+    /// Last user prompt text (truncated for display)
+    last_prompt: String,
 }
 
 /// Check if a path is a symlink (fail-closed: returns true on error).
