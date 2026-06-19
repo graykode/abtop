@@ -41,10 +41,17 @@ pub struct RateLimitInfo {
     pub five_hour_pct: Option<f64>,
     /// 5-hour window reset timestamp (epoch seconds)
     pub five_hour_resets_at: Option<u64>,
+    /// 5-hour slot duration in minutes, when reported by the source.
+    pub five_hour_window_minutes: Option<u64>,
     /// 7-day window usage percentage (0-100)
+    ///
+    /// Historical field name kept for compatibility; Codex may use this slot
+    /// for a longer account-level window such as 30 days.
     pub seven_day_pct: Option<f64>,
     /// 7-day window reset timestamp (epoch seconds)
     pub seven_day_resets_at: Option<u64>,
+    /// Long-window slot duration in minutes, when reported by the source.
+    pub seven_day_window_minutes: Option<u64>,
     /// When this data was last updated
     pub updated_at: Option<u64>,
 }

@@ -175,7 +175,7 @@ fn draw_source_column(
             String::new()
         };
         let c = grad_at(cpu_grad, used_pct);
-        let label_5h = t("quota.5h");
+        let label_5h = format_window_label(rl.five_hour_window_minutes, t("quota.5h"));
         let mut s = vec![styled_label(
             format!(" {}", label_5h).as_str(),
             theme.graph_text,
@@ -208,7 +208,7 @@ fn draw_source_column(
             String::new()
         };
         let c = grad_at(cpu_grad, used_pct);
-        let label_7d = t("quota.7d");
+        let label_7d = format_window_label(rl.seven_day_window_minutes, t("quota.7d"));
         let mut s = vec![styled_label(
             format!(" {}", label_7d).as_str(),
             theme.graph_text,
@@ -233,6 +233,22 @@ fn draw_source_column(
     }
 
     f.render_widget(Paragraph::new(lines), area);
+}
+
+fn format_window_label(window_minutes: Option<u64>, fallback: String) -> String {
+    let Some(minutes) = window_minutes else {
+        return fallback;
+    };
+
+    if minutes == 0 {
+        fallback
+    } else if minutes % (24 * 60) == 0 {
+        format!("{}{}", minutes / (24 * 60), t("time.d"))
+    } else if minutes % 60 == 0 {
+        format!("{}{}", minutes / 60, t("time.h"))
+    } else {
+        format!("{}{}", minutes, t("time.m"))
+    }
 }
 
 /// Format a reset timestamp as a human countdown labeled "in X" so the
