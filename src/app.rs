@@ -14,6 +14,20 @@ const MAX_SUMMARY_JOBS: usize = 3;
 /// Max summary attempts per session before giving up.
 const MAX_SUMMARY_RETRIES: u32 = 2;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RateLimitWindow {
+    FiveHour,
+    SevenDay,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RateLimitSpendSample {
+    pct: f64,
+    observed_at: u64,
+    burn_pct_per_hour: Option<f64>,
+    eta_secs: Option<u64>,
+}
+
 /// Produce a terminal-safe fallback summary from a raw prompt.
 fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
     prompt
@@ -93,6 +107,8 @@ pub struct App {
     pub rate_limits: Vec<RateLimitInfo>,
     /// Per-session previous token totals, keyed by (agent_cli, session_id).
     prev_tokens: HashMap<(String, String), u64>,
+    /// Last observed quota percentages, keyed by (source, window), for burn-rate estimates.
+    rate_limit_spend_samples: HashMap<(String, RateLimitWindow), RateLimitSpendSample>,
     /// Rate limit poll counter (read every 5 ticks = 10s)
     rate_limit_counter: u32,
     collector: MultiCollector,
@@ -178,6 +194,7 @@ impl App {
             token_rates: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
             rate_limits: Vec::new(),
             prev_tokens: HashMap::new(),
+            rate_limit_spend_samples: HashMap::new(),
             rate_limit_counter: 5,
             collector,
             summaries,
@@ -541,6 +558,11 @@ impl App {
             self.rate_limits = read_rate_limits(&extra_dirs);
             // Merge live rate limits from agent collectors (e.g. Codex JSONL parsing)
             self.rate_limits.extend(self.collector.agent_rate_limits());
+            annotate_rate_limit_spend(
+                &mut self.rate_limits,
+                &mut self.rate_limit_spend_samples,
+                now_secs(),
+            );
         } else {
             self.rate_limit_counter += 1;
         }
@@ -1062,6 +1084,85 @@ fn save_summary_cache(summaries: &HashMap<String, String>) {
     }
 }
 
+fn annotate_rate_limit_spend(
+    rate_limits: &mut [RateLimitInfo],
+    samples: &mut HashMap<(String, RateLimitWindow), RateLimitSpendSample>,
+    now: u64,
+) {
+    for rl in rate_limits {
+        let (burn, eta) = update_rate_limit_spend_sample(
+            &rl.source,
+            RateLimitWindow::FiveHour,
+            rl.five_hour_pct,
+            rl.updated_at,
+            now,
+            samples,
+        );
+        rl.five_hour_burn_pct_per_hour = burn;
+        rl.five_hour_eta_secs = eta;
+
+        let (burn, eta) = update_rate_limit_spend_sample(
+            &rl.source,
+            RateLimitWindow::SevenDay,
+            rl.seven_day_pct,
+            rl.updated_at,
+            now,
+            samples,
+        );
+        rl.seven_day_burn_pct_per_hour = burn;
+        rl.seven_day_eta_secs = eta;
+    }
+}
+
+fn update_rate_limit_spend_sample(
+    source: &str,
+    window: RateLimitWindow,
+    pct: Option<f64>,
+    updated_at: Option<u64>,
+    now: u64,
+    samples: &mut HashMap<(String, RateLimitWindow), RateLimitSpendSample>,
+) -> (Option<f64>, Option<u64>) {
+    let key = (source.to_ascii_lowercase(), window);
+    let Some(pct) = pct.map(|value| value.clamp(0.0, 100.0)) else {
+        samples.remove(&key);
+        return (None, None);
+    };
+    let observed_at = updated_at.unwrap_or(now);
+
+    let mut current = RateLimitSpendSample {
+        pct,
+        observed_at,
+        ..Default::default()
+    };
+
+    if let Some(prev) = samples.get(&key).copied() {
+        if observed_at == prev.observed_at {
+            current.burn_pct_per_hour = prev.burn_pct_per_hour;
+            current.eta_secs = prev.eta_secs;
+        } else if observed_at > prev.observed_at && pct > prev.pct {
+            let elapsed_secs = observed_at - prev.observed_at;
+            let burn_pct_per_hour = (pct - prev.pct) * 3600.0 / elapsed_secs as f64;
+            let remaining_pct = (100.0 - pct).max(0.0);
+            current.burn_pct_per_hour = Some(burn_pct_per_hour);
+            current.eta_secs = if burn_pct_per_hour > 0.0 {
+                Some((remaining_pct * 3600.0 / burn_pct_per_hour).ceil() as u64)
+            } else {
+                None
+            };
+        }
+    }
+
+    samples.insert(key, current);
+    (current.burn_pct_per_hour, current.eta_secs)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Threshold above which a rate-limited bucket is surfaced as RateLimited
 /// in the session list. 90% leaves enough headroom to catch near-saturation
 /// before the account actually blocks.
@@ -1154,7 +1255,50 @@ mod tests {
             seven_day_pct: None,
             seven_day_resets_at: None,
             updated_at: None,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn rate_limit_spend_estimates_burn_and_eta() {
+        let mut samples = HashMap::new();
+        let mut limits = vec![RateLimitInfo {
+            source: "codex".to_string(),
+            five_hour_pct: Some(10.0),
+            five_hour_resets_at: Some(20_000),
+            updated_at: Some(1_000),
+            ..Default::default()
+        }];
+
+        annotate_rate_limit_spend(&mut limits, &mut samples, 1_000);
+        assert_eq!(limits[0].five_hour_burn_pct_per_hour, None);
+        assert_eq!(limits[0].five_hour_eta_secs, None);
+
+        limits[0].five_hour_pct = Some(15.0);
+        limits[0].updated_at = Some(1_600);
+        annotate_rate_limit_spend(&mut limits, &mut samples, 1_600);
+
+        assert_eq!(limits[0].five_hour_burn_pct_per_hour, Some(30.0));
+        assert_eq!(limits[0].five_hour_eta_secs, Some(10_200));
+    }
+
+    #[test]
+    fn rate_limit_spend_clears_on_window_reset() {
+        let mut samples = HashMap::new();
+        let mut limits = vec![RateLimitInfo {
+            source: "codex".to_string(),
+            five_hour_pct: Some(80.0),
+            updated_at: Some(1_000),
+            ..Default::default()
+        }];
+
+        annotate_rate_limit_spend(&mut limits, &mut samples, 1_000);
+        limits[0].five_hour_pct = Some(70.0);
+        limits[0].updated_at = Some(1_600);
+        annotate_rate_limit_spend(&mut limits, &mut samples, 1_600);
+
+        assert_eq!(limits[0].five_hour_burn_pct_per_hour, None);
+        assert_eq!(limits[0].five_hour_eta_secs, None);
     }
 
     #[test]

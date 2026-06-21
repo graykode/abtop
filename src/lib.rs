@@ -165,6 +165,28 @@ pub fn run() -> io::Result<()> {
         }
     }
 
+    // --status-json flag: print a compact, privacy-preserving status summary
+    // for widgets/mobile clients. Unlike --json, it omits cwd, prompts, chat,
+    // session ids, tool args, child commands, and project names.
+    if std::env::args().any(|a| a == "--status-json") {
+        let mut app = build_app(initial_theme.unwrap_or_default(), &cfg);
+        if demo_mode {
+            demo::populate_demo(&mut app);
+        } else {
+            app.tick_no_summaries();
+        }
+        match serde_json::to_string_pretty(&app.to_status_summary(2000)) {
+            Ok(json) => {
+                println!("{}", json);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("failed to serialize status summary: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // --once flag: print snapshot and exit
     if std::env::args().any(|a| a == "--once") {
         let mut app = build_app(initial_theme.unwrap_or_default(), &cfg);

@@ -50,6 +50,63 @@ pub struct Snapshot {
     pub mcp_servers: Vec<McpServerView>,
 }
 
+/// Compact status payload for widgets, notifications, and mobile clients.
+///
+/// Unlike [`Snapshot`], this intentionally omits cwd, prompts, chat text,
+/// session identifiers, tool arguments, child commands, and project names.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusSummary {
+    /// Unix-epoch milliseconds when this summary was built.
+    pub generated_at_ms: u64,
+    /// Collector tick interval in milliseconds.
+    pub interval_ms: u64,
+    /// Most recent per-tick active-token delta across all sessions.
+    pub token_rate: f64,
+    /// Total live sessions across all supported agent CLIs.
+    pub sessions_total: usize,
+    /// Sessions currently doing work.
+    pub sessions_active: usize,
+    /// Per-agent aggregate status, without per-session identifiers.
+    pub agents: Vec<AgentStatusSummary>,
+    /// Account quota windows, when an agent has reported them.
+    pub quota: Vec<QuotaStatusSummary>,
+}
+
+/// Aggregated status for one agent CLI.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentStatusSummary {
+    pub agent_cli: &'static str,
+    pub sessions: usize,
+    pub active: usize,
+    pub waiting: usize,
+    pub rate_limited: usize,
+    pub total_tokens: u64,
+    pub active_tokens: u64,
+    pub avg_context_pct: f64,
+    pub max_context_pct: f64,
+    pub max_turn_count: u32,
+}
+
+/// Compact quota state for one agent source.
+#[derive(Debug, Clone, Serialize)]
+pub struct QuotaStatusSummary {
+    pub source: String,
+    pub five_hour: Option<QuotaWindowStatus>,
+    pub seven_day: Option<QuotaWindowStatus>,
+}
+
+/// Compact quota state for one reset window.
+#[derive(Debug, Clone, Serialize)]
+pub struct QuotaWindowStatus {
+    pub used_pct: f64,
+    pub remaining_pct: f64,
+    pub burn_pct_per_hour: Option<f64>,
+    pub eta_secs: Option<u64>,
+    pub resets_at: Option<u64>,
+    pub cap_before_reset: bool,
+    pub level: &'static str,
+}
+
 /// One chat line from the transcript tail (detail view only).
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatMsgView {
@@ -285,6 +342,133 @@ impl App {
             mcp_servers,
         }
     }
+
+    /// Build a compact, privacy-preserving JSON summary for external clients.
+    ///
+    /// This is intended for dashboards/widgets that need health and quota state
+    /// without local paths, prompts, chat text, tool arguments, or session IDs.
+    pub fn to_status_summary(&self, interval_ms: u64) -> StatusSummary {
+        let now = SystemTime::now();
+        let generated_at_ms = epoch_ms(now).unwrap_or(0);
+        let now_secs = generated_at_ms / 1000;
+
+        let mut agents = Vec::new();
+        for agent_cli in ["claude", "codex", "opencode"] {
+            let matching: Vec<_> = self
+                .sessions
+                .iter()
+                .filter(|s| s.agent_cli.eq_ignore_ascii_case(agent_cli))
+                .collect();
+            if matching.is_empty() {
+                continue;
+            }
+
+            let sessions = matching.len();
+            let active = matching.iter().filter(|s| s.status.is_active()).count();
+            let waiting = matching
+                .iter()
+                .filter(|s| matches!(s.status, SessionStatus::Waiting))
+                .count();
+            let rate_limited = matching
+                .iter()
+                .filter(|s| matches!(s.status, SessionStatus::RateLimited))
+                .count();
+            let total_tokens = matching.iter().map(|s| s.total_tokens()).sum();
+            let active_tokens = matching.iter().map(|s| s.active_tokens()).sum();
+            let max_context_pct = matching
+                .iter()
+                .map(|s| s.context_percent)
+                .fold(0.0, f64::max);
+            let context_sum: f64 = matching.iter().map(|s| s.context_percent).sum();
+            let avg_context_pct = if sessions > 0 {
+                context_sum / sessions as f64
+            } else {
+                0.0
+            };
+            let max_turn_count = matching.iter().map(|s| s.turn_count).max().unwrap_or(0);
+
+            agents.push(AgentStatusSummary {
+                agent_cli,
+                sessions,
+                active,
+                waiting,
+                rate_limited,
+                total_tokens,
+                active_tokens,
+                avg_context_pct,
+                max_context_pct,
+                max_turn_count,
+            });
+        }
+
+        let quota = self
+            .rate_limits
+            .iter()
+            .map(|rl| QuotaStatusSummary {
+                source: rl.source.clone(),
+                five_hour: quota_window_status(
+                    rl.five_hour_pct,
+                    rl.five_hour_resets_at,
+                    rl.five_hour_burn_pct_per_hour,
+                    rl.five_hour_eta_secs,
+                    now_secs,
+                ),
+                seven_day: quota_window_status(
+                    rl.seven_day_pct,
+                    rl.seven_day_resets_at,
+                    rl.seven_day_burn_pct_per_hour,
+                    rl.seven_day_eta_secs,
+                    now_secs,
+                ),
+            })
+            .collect();
+
+        StatusSummary {
+            generated_at_ms,
+            interval_ms,
+            token_rate: self.token_rates.back().copied().unwrap_or(0.0),
+            sessions_total: self.sessions.len(),
+            sessions_active: self
+                .sessions
+                .iter()
+                .filter(|s| s.status.is_active())
+                .count(),
+            agents,
+            quota,
+        }
+    }
+}
+
+fn quota_window_status(
+    used_pct: Option<f64>,
+    resets_at: Option<u64>,
+    burn_pct_per_hour: Option<f64>,
+    eta_secs: Option<u64>,
+    now_secs: u64,
+) -> Option<QuotaWindowStatus> {
+    let used_pct = used_pct?;
+    let remaining_pct = (100.0 - used_pct).clamp(0.0, 100.0);
+    let cap_before_reset = match (eta_secs, resets_at.and_then(|ts| ts.checked_sub(now_secs))) {
+        (Some(eta), Some(reset_secs)) => eta < reset_secs,
+        _ => false,
+    };
+    let level = if used_pct >= 95.0 || remaining_pct <= 5.0 || cap_before_reset {
+        "danger"
+    } else if used_pct >= 75.0 || eta_secs.is_some_and(|eta| eta <= 3600) {
+        "warning"
+    } else {
+        "ok"
+    };
+
+    Some(QuotaWindowStatus {
+        used_pct,
+        remaining_pct,
+        burn_pct_per_hour,
+        eta_secs,
+        resets_at,
+        cap_before_reset,
+        level,
+    })
 }
 
 #[cfg(test)]
@@ -382,11 +566,50 @@ mod tests {
     }
 
     #[test]
+    fn status_summary_aggregates_without_session_details() {
+        let summary = demo_app().to_status_summary(2_000);
+
+        assert_eq!(summary.interval_ms, 2_000);
+        assert!(summary.generated_at_ms > 0);
+        assert!(summary.sessions_total > 0);
+        assert!(!summary.agents.is_empty());
+        assert!(summary
+            .agents
+            .iter()
+            .any(|agent| agent.agent_cli == "codex" && agent.sessions > 0));
+    }
+
+    #[test]
+    fn status_summary_json_omits_private_session_fields() {
+        let json =
+            serde_json::to_string(&demo_app().to_status_summary(2_000)).expect("status serializes");
+
+        for forbidden in [
+            "cwd",
+            "session_id",
+            "project_name",
+            "summary",
+            "current_task",
+            "chat_messages",
+            "tool_calls",
+            "children",
+            "config_root",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "status summary leaked `{forbidden}` in {json}"
+            );
+        }
+    }
+
+    #[test]
     fn readme_documents_json_snapshot_privacy_surface() {
         let readme = include_str!("../README.md");
         assert!(readme.contains("--json"));
+        assert!(readme.contains("--status-json"));
         assert!(readme.contains("JSON snapshot includes"));
         assert!(readme.contains("chat_messages"));
         assert!(readme.contains("summary"));
+        assert!(readme.contains("omits local paths"));
     }
 }

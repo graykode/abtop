@@ -162,8 +162,8 @@ pub(crate) fn draw_sessions_panel_active(
         let is_done = matches!(session.status, crate::model::SessionStatus::Done);
         let row_style = if selected {
             Style::default()
-                .bg(theme.selected_bg)
-                .fg(theme.selected_fg)
+                .bg(theme.div_line)
+                .fg(theme.main_fg)
                 .add_modifier(Modifier::BOLD)
         } else if is_done {
             Style::default().fg(theme.inactive_fg)
@@ -881,12 +881,23 @@ pub(crate) fn draw_sessions_panel_active(
             } else {
                 format!(" · effort: {}", session.effort)
             };
+            let avg_tokens = if session.turn_count > 0 {
+                format!(
+                    " · avg {}/t",
+                    fmt_tokens(session.total_tokens() / session.turn_count as u64)
+                )
+            } else {
+                String::new()
+            };
             footer_lines.push(Line::from(Span::styled(
                 format!(
-                    " {} · {} · {} turns{}",
+                    " {} · {} · {} turns · active {} · total {}{}{}",
                     session.version,
                     session.elapsed_display(),
                     session.turn_count,
+                    fmt_tokens(session.active_tokens()),
+                    fmt_tokens(session.total_tokens()),
+                    avg_tokens,
                     effort_part,
                 ),
                 Style::default().fg(theme.inactive_fg),

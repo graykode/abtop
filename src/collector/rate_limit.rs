@@ -126,5 +126,6 @@ fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
         seven_day_pct: file.seven_day.as_ref().map(|w| w.used_percentage),
         seven_day_resets_at: file.seven_day.as_ref().map(|w| w.resets_at),
         updated_at: file.updated_at,
+        ..Default::default()
     })
 }

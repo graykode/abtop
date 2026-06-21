@@ -1243,7 +1243,9 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                                     info.seven_day_resets_at = resets;
                                 }
                             }
-                            result.rate_limit = Some(info);
+                            if info.five_hour_pct.is_some() || info.seven_day_pct.is_some() {
+                                result.rate_limit = Some(info);
+                            }
                         }
                     }
                     Some("agent_message") => {
@@ -1844,6 +1846,21 @@ mod tests {
         let rl = result.rate_limit.expect("rate_limit should be Some");
         assert_eq!(rl.five_hour_pct, Some(9.0));
         assert_eq!(rl.seven_day_pct, Some(14.0));
+    }
+
+    #[test]
+    fn test_parse_codex_ignores_empty_rate_limits() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"output_tokens":1},"last_token_usage":{"input_tokens":1,"output_tokens":1}},"rate_limits":{"limit_id":"codex"}}}"#,
+            ],
+        );
+
+        let result = parse_codex_jsonl(file.path()).unwrap();
+        assert!(result.rate_limit.is_none());
     }
 
     #[test]
