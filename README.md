@@ -50,6 +50,7 @@ Pre-built binaries for all platforms are available on the [GitHub Releases](http
 abtop                    # Launch TUI
 abtop --once             # Print snapshot and exit
 abtop --json             # Print one JSON snapshot and exit (for scripts/tools)
+abtop --status-json      # Print compact status JSON without local paths/prompts
 abtop --setup            # Install rate limit collection hook
 abtop --theme dracula    # Launch with a specific theme
 ```
@@ -161,6 +162,9 @@ state the TUI renders.
 
 ```bash
 abtop --json    # one-shot JSON snapshot for scripts
+abtop --status-json
+# compact status summary for widgets/mobile clients; omits paths, prompts,
+# chat text, session ids, tool args, child commands, and project names
 ```
 
 For long-running consumers, build an `App`, refresh it with
@@ -178,6 +182,7 @@ let mut app = App::new_with_config_and_claude_dirs(
 );
 app.tick_no_summaries();
 let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
+let status_json = serde_json::to_string(&app.to_status_summary(2_000)).unwrap();
 ```
 
 `App` is not `Send` (it owns the collectors), so keep it on one thread and pass
@@ -188,7 +193,9 @@ is a reference consumer: a local-first web dashboard built on exactly this API.
 
 abtop reads local files and local process/open-file metadata only. No API keys, no auth. In the TUI and `--once` output, tool names and file paths are shown, but file contents and prompt text are never displayed. Session summaries are generated via `claude --print`, which makes its own API call — this is the only indirect network usage.
 
-The JSON snapshot includes richer local dashboard data, including `summary`, `chat_messages`, working directories, config roots, tool-call previews, child process commands, token counts, and port metadata. Chat text is bounded and redacted by the collectors, but it is still derived from local transcripts and may contain sensitive project context. Treat JSON snapshots as local/private data and avoid writing them to shared logs or exposing them on a network without your own access controls.
+The full JSON snapshot includes richer local dashboard data, including `summary`, `chat_messages`, working directories, config roots, tool-call previews, child process commands, token counts, and port metadata. Chat text is bounded and redacted by the collectors, but it is still derived from local transcripts and may contain sensitive project context. Treat full JSON snapshots as local/private data and avoid writing them to shared logs or exposing them on a network without your own access controls.
+
+For lower-risk integrations, `--status-json` emits only aggregate health/quota fields and intentionally omits local paths, prompts, chat text, session identifiers, tool arguments, child commands, and project names.
 
 ## Acknowledgements
 

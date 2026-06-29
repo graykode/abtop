@@ -542,6 +542,7 @@ pub fn populate_demo(app: &mut App) {
             seven_day_pct: Some(12.0),
             seven_day_resets_at: Some(now_secs() + 5 * 24 * 3600),
             updated_at: Some(now_secs() - 10),
+            ..Default::default()
         },
         RateLimitInfo {
             source: "codex".into(),
@@ -550,6 +551,7 @@ pub fn populate_demo(app: &mut App) {
             seven_day_pct: Some(14.0),
             seven_day_resets_at: Some(now_secs() + 6 * 24 * 3600),
             updated_at: Some(now_secs() - 5),
+            ..Default::default()
         },
     ];
 

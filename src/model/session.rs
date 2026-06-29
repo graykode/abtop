@@ -41,10 +41,18 @@ pub struct RateLimitInfo {
     pub five_hour_pct: Option<f64>,
     /// 5-hour window reset timestamp (epoch seconds)
     pub five_hour_resets_at: Option<u64>,
+    /// Observed 5-hour usage burn rate, in percentage points per hour.
+    pub five_hour_burn_pct_per_hour: Option<f64>,
+    /// Estimated seconds until the 5-hour window reaches 100% at current burn.
+    pub five_hour_eta_secs: Option<u64>,
     /// 7-day window usage percentage (0-100)
     pub seven_day_pct: Option<f64>,
     /// 7-day window reset timestamp (epoch seconds)
     pub seven_day_resets_at: Option<u64>,
+    /// Observed 7-day usage burn rate, in percentage points per hour.
+    pub seven_day_burn_pct_per_hour: Option<f64>,
+    /// Estimated seconds until the 7-day window reaches 100% at current burn.
+    pub seven_day_eta_secs: Option<u64>,
     /// When this data was last updated
     pub updated_at: Option<u64>,
 }
