@@ -26,6 +26,8 @@ pub struct OpenCodeCollector {
     sqlite3_available: Option<bool>,
     /// Cached DB rows from the last slow-tick query. Reused on fast ticks.
     cached_db_sessions: Vec<DbSession>,
+    /// Cached DB subagent rows from the last slow-tick query.
+    cached_db_subagents: Vec<DbSubAgent>,
     /// Whether the "sqlite3 missing" warning has been emitted (once).
     #[cfg(target_os = "windows")]
     warned_sqlite3_missing: bool,
@@ -36,13 +38,14 @@ impl OpenCodeCollector {
         let data_dir = std::env::var("XDG_DATA_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".local/share"));
-        let db_path = data_dir.join("opencode").join("opencode.db");
+        let db_path = resolve_db_path(&data_dir);
         #[cfg(target_os = "windows")]
         let db_path = windows_db_path(db_path);
         Self {
             db_path,
             sqlite3_available: None,
             cached_db_sessions: Vec::new(),
+            cached_db_subagents: Vec::new(),
             #[cfg(target_os = "windows")]
             warned_sqlite3_missing: false,
         }
@@ -58,9 +61,21 @@ impl OpenCodeCollector {
     }
 
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
+        // If the database path doesn't exist, try resolving it again in case it was created since startup
+        if !self.db_path.exists() {
+            let data_dir = std::env::var("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".local/share"));
+            let db_path = resolve_db_path(&data_dir);
+            #[cfg(target_os = "windows")]
+            let db_path = windows_db_path(db_path);
+            self.db_path = db_path;
+        }
+
         // Security: skip if db_path is a symlink (fail-closed)
         if is_symlink(&self.db_path) || !self.db_path.exists() {
             self.cached_db_sessions.clear();
+            self.cached_db_subagents.clear();
             return vec![];
         }
         if !self.check_sqlite3() {
@@ -78,6 +93,7 @@ impl OpenCodeCollector {
                 );
             }
             self.cached_db_sessions.clear();
+            self.cached_db_subagents.clear();
             return vec![];
         }
 
@@ -98,6 +114,9 @@ impl OpenCodeCollector {
         if shared.slow_tick {
             if let Some(rows) = self.query_sessions() {
                 self.cached_db_sessions = rows;
+            }
+            if let Some(sub_rows) = self.query_subagents() {
+                self.cached_db_subagents = sub_rows;
             }
         }
 
@@ -212,14 +231,35 @@ impl OpenCodeCollector {
                 current_tasks,
                 mem_mb,
                 version: ds.version.clone(),
-                git_branch: String::new(),
+                git_branch: get_git_branch(&ds.directory),
                 git_added: 0,
                 git_modified: 0,
                 token_history: vec![],
                 context_history: vec![],
                 compaction_count: 0,
                 context_window,
-                subagents: vec![],
+                subagents: {
+                    let mut subagents = Vec::new();
+                    for sub in &self.cached_db_subagents {
+                        if sub.parent_id == ds.id {
+                            let age_ms = now_ms.saturating_sub(sub.time_updated);
+                            let since_update_secs = age_ms / 1000;
+                            let status = if since_update_secs < 30 {
+                                "working".to_string()
+                            } else {
+                                "done".to_string()
+                            };
+                            let mut name = sub.title.clone();
+                            truncate_field(&mut name, 30);
+                            subagents.push(crate::model::SubAgent {
+                                name,
+                                status,
+                                tokens: sub.tokens,
+                            });
+                        }
+                    }
+                    subagents
+                },
                 mem_file_count: 0,
                 mem_line_count: 0,
                 children,
@@ -405,6 +445,37 @@ LIMIT {};"#,
 
         Some(sessions)
     }
+
+    fn query_subagents(&self) -> Option<Vec<DbSubAgent>> {
+        let sql = format!(
+            r#"
+SELECT 
+  id, parent_id, title,
+  (tokens_input + tokens_output + tokens_cache_read + tokens_cache_write) as tokens,
+  time_updated
+FROM session
+WHERE parent_id IS NOT NULL AND parent_id != ''
+LIMIT {};"#,
+            MAX_SESSIONS
+        );
+        let rows = self.run_query(&sql)?;
+        let mut subagents = Vec::new();
+        for row in rows {
+            let id = row["id"].as_str().unwrap_or("").to_string();
+            let parent_id = row["parent_id"].as_str().unwrap_or("").to_string();
+            let title = sanitize_db_title(row["title"].as_str().unwrap_or(""));
+            let tokens = row["tokens"].as_u64().unwrap_or(0);
+            let time_updated = row["time_updated"].as_u64().unwrap_or(0);
+            subagents.push(DbSubAgent {
+                id,
+                parent_id,
+                title,
+                tokens,
+                time_updated,
+            });
+        }
+        Some(subagents)
+    }
 }
 
 impl Default for OpenCodeCollector {
@@ -417,6 +488,50 @@ impl super::AgentCollector for OpenCodeCollector {
     fn collect(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)
     }
+}
+
+struct DbSubAgent {
+    id: String,
+    parent_id: String,
+    title: String,
+    tokens: u64,
+    time_updated: u64,
+}
+
+fn resolve_db_path(data_dir: &Path) -> PathBuf {
+    let base_dir = data_dir.join("opencode");
+    let default = base_dir.join("opencode.db");
+    if default.exists() {
+        return default;
+    }
+    if let Ok(entries) = fs::read_dir(&base_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().map_or(false, |ext| ext == "db") {
+                return path;
+            }
+        }
+    }
+    default
+}
+
+fn get_git_branch(cwd: &str) -> String {
+    let git_dir = Path::new(cwd).join(".git");
+    if !git_dir.exists() {
+        return String::new();
+    }
+    let head_file = git_dir.join("HEAD");
+    if let Ok(content) = fs::read_to_string(head_file) {
+        let content = content.trim();
+        if let Some(ref_path) = content.strip_prefix("ref: ") {
+            if let Some(branch_name) = ref_path.rsplit('/').next() {
+                return branch_name.to_string();
+            }
+        } else if content.len() >= 7 {
+            return content[..7].to_string();
+        }
+    }
+    String::new()
 }
 
 struct DbSession {
