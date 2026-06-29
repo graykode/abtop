@@ -26,6 +26,9 @@ pub struct OpenCodeCollector {
     sqlite3_available: Option<bool>,
     /// Cached DB rows from the last slow-tick query. Reused on fast ticks.
     cached_db_sessions: Vec<DbSession>,
+    /// Whether the "sqlite3 missing" warning has been emitted (once).
+    #[cfg(target_os = "windows")]
+    warned_sqlite3_missing: bool,
 }
 
 impl OpenCodeCollector {
@@ -33,10 +36,15 @@ impl OpenCodeCollector {
         let data_dir = std::env::var("XDG_DATA_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".local/share"));
+        let db_path = data_dir.join("opencode").join("opencode.db");
+        #[cfg(target_os = "windows")]
+        let db_path = windows_db_path(db_path);
         Self {
-            db_path: data_dir.join("opencode").join("opencode.db"),
+            db_path,
             sqlite3_available: None,
             cached_db_sessions: Vec::new(),
+            #[cfg(target_os = "windows")]
+            warned_sqlite3_missing: false,
         }
     }
 
@@ -51,7 +59,24 @@ impl OpenCodeCollector {
 
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         // Security: skip if db_path is a symlink (fail-closed)
-        if is_symlink(&self.db_path) || !self.db_path.exists() || !self.check_sqlite3() {
+        if is_symlink(&self.db_path) || !self.db_path.exists() {
+            self.cached_db_sessions.clear();
+            return vec![];
+        }
+        if !self.check_sqlite3() {
+            // The DB exists but we can't read it: on Windows sqlite3 is
+            // usually not preinstalled, so say why sessions are missing
+            // instead of failing silently.
+            #[cfg(target_os = "windows")]
+            if !self.warned_sqlite3_missing {
+                self.warned_sqlite3_missing = true;
+                eprintln!(
+                    "abtop: OpenCode database found at {} but the `sqlite3` CLI is not on PATH; \
+                     OpenCode sessions will not appear. Install it (e.g. `winget install SQLite.SQLite`) \
+                     and restart abtop.",
+                    self.db_path.display()
+                );
+            }
             self.cached_db_sessions.clear();
             return vec![];
         }
@@ -115,7 +140,10 @@ impl OpenCodeCollector {
             let project_name = if !ds.project_name.is_empty() {
                 ds.project_name.clone()
             } else {
-                ds.directory.rsplit('/').next().unwrap_or("?").to_string()
+                // last_path_segment also splits on `\` on Windows.
+                process::last_path_segment(&ds.directory)
+                    .unwrap_or("?")
+                    .to_string()
             };
 
             let current_tasks = if matches!(status, SessionStatus::Waiting) {
@@ -259,7 +287,7 @@ impl OpenCodeCollector {
                 continue;
             }
             if let Some(cwd) = get_process_cwd(pid) {
-                if cwd == session_dir {
+                if paths_equal(&cwd, session_dir) {
                     return Some(pid);
                 }
             }
@@ -431,8 +459,49 @@ fn truncate_field(s: &mut String, max_bytes: usize) {
     }
 }
 
+/// Compare a process cwd with a DB session directory.
+/// On Windows paths are case-insensitive and may mix `/` and `\`, so
+/// normalize before comparing; elsewhere keep the exact comparison.
+#[cfg(target_os = "windows")]
+fn paths_equal(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        s.replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn paths_equal(a: &str, b: &str) -> bool {
+    a == b
+}
+
+/// On Windows, OpenCode builds (e.g. installed via npm) have been observed to
+/// keep the XDG-style `~/.local/share/opencode` layout, so prefer the same
+/// path as unix; fall back to probing `%LOCALAPPDATA%` / `%APPDATA%` in case
+/// a build stores the DB there instead.
+#[cfg(target_os = "windows")]
+fn windows_db_path(default: PathBuf) -> PathBuf {
+    if default.exists() {
+        return default;
+    }
+    for var in ["LOCALAPPDATA", "APPDATA"] {
+        if let Ok(base) = std::env::var(var) {
+            if base.is_empty() {
+                continue;
+            }
+            let candidate = PathBuf::from(base).join("opencode").join("opencode.db");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    default
+}
+
 /// Get the current working directory of a process.
-/// Uses /proc on Linux, lsof on macOS/other Unix.
+/// Uses /proc on Linux, sysinfo (PEB) on Windows, lsof on macOS/other Unix.
 #[cfg(target_os = "linux")]
 fn get_process_cwd(pid: u32) -> Option<String> {
     std::fs::read_link(format!("/proc/{}/cwd", pid))
@@ -440,7 +509,25 @@ fn get_process_cwd(pid: u32) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn get_process_cwd(pid: u32) -> Option<String> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    // `lsof` does not exist on Windows; sysinfo reads the cwd from the
+    // process PEB. Refresh just this one PID — this runs only for the
+    // handful of opencode PIDs, once per tick.
+    let mut sys = System::new();
+    let pid = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        false,
+        ProcessRefreshKind::new().with_cwd(UpdateKind::Always),
+    );
+    sys.process(pid)
+        .and_then(|p| p.cwd())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
 fn get_process_cwd(pid: u32) -> Option<String> {
     // -a ANDs the selection terms; without it, lsof ORs `-p <pid>` with
     // `-d cwd` and returns cwd entries for unrelated processes too.

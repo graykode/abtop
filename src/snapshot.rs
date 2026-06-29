@@ -24,8 +24,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Snapshot {
     /// Unix-epoch milliseconds when this snapshot was built.
     pub generated_at_ms: u64,
-    /// Host vitals (CPU / mem / load1). `None` on non-Linux or before the
-    /// first valid sample.
+    /// Host vitals (CPU / mem / load1). `None` on unsupported platforms or
+    /// before the first valid sample.
     pub host: Option<HostMetrics>,
     /// Aggregate metrics across all sessions.
     pub aggregate: AgentAggregate,

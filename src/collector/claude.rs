@@ -2030,14 +2030,17 @@ mod tests {
     }
 
     fn write_session_file(path: &Path, pid: u32, session_id: &str, cwd: &Path) {
+        // Serialize via serde_json so Windows backslash paths are escaped
+        // correctly instead of producing invalid JSON.
         std::fs::write(
             path,
-            format!(
-                r#"{{"pid":{},"sessionId":"{}","cwd":"{}","startedAt":1774715116826}}"#,
-                pid,
-                session_id,
-                cwd.display()
-            ),
+            serde_json::json!({
+                "pid": pid,
+                "sessionId": session_id,
+                "cwd": cwd.to_str().unwrap(),
+                "startedAt": 1774715116826u64,
+            })
+            .to_string(),
         )
         .unwrap();
     }

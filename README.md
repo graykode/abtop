@@ -35,7 +35,7 @@ cargo install abtop
 
 ### Windows
 
-Native support — no WSL required. Uses `sysinfo` for process info and `netstat -ano` for listening ports.
+Native support — no WSL required. Uses `sysinfo` for process info and host CPU/MEM metrics, and `netstat -ano` for listening ports. Windows has no load average, so LOAD is reported as 0. OpenCode session discovery additionally requires the `sqlite3` CLI (`winget install SQLite.SQLite`); without it abtop prints a one-time warning to stderr.
 
 ```powershell
 powershell -c "irm https://github.com/graykode/abtop/releases/latest/download/abtop-installer.ps1 | iex"
@@ -86,7 +86,7 @@ tmux new -s work
 | Subagents         |     ✅      |    ❌     |    ❌    |
 | Memory Status     |     ✅      |    ❌     |    ❌    |
 
-OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` and requires `sqlite3` in `PATH`.
+OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
 
 ## Themes
 

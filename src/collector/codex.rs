@@ -1477,7 +1477,10 @@ mod tests {
     }
 
     fn set_modified(path: &Path, when: SystemTime) {
-        File::open(path).unwrap().set_modified(when).unwrap();
+        // Open with write access: on Windows, setting timestamps through a
+        // read-only handle fails with PermissionDenied.
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(when).unwrap();
     }
 
     #[cfg(windows)]
