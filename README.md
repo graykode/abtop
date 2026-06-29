@@ -59,9 +59,9 @@ abtop --theme dracula    # Launch with a specific theme
 
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 
-### tmux
+### Terminal Jump
 
-abtop works standalone, but running inside tmux unlocks session jumping — press `Enter` to switch directly to the pane running that agent.
+Press `Enter` to focus the terminal running the selected agent. abtop supports cmux, tmux, and iTerm2 on macOS.
 
 ```bash
 tmux new -s work
@@ -147,7 +147,7 @@ When `language` is unset, abtop auto-detects from `LANG` — any value starting 
 | Key                | Action                               |
 | ------------------ | ------------------------------------ |
 | `↑`/`↓` or `k`/`j` | Select session                       |
-| `Enter`            | Jump to session terminal (tmux only) |
+| `Enter`            | Jump to session terminal             |
 | `x`                | Kill selected session                |
 | `X`                | Kill all orphan ports                |
 | `t`                | Cycle theme                          |

@@ -113,7 +113,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("help.help", "Help");
     m.insert("help.press_key", " Press any key to close ");
     m.insert("help.select_session", "select session");
-    m.insert("help.jump_tmux", "jump to tmux pane (when in tmux)");
+    m.insert("help.jump_tmux", "jump to session terminal");
     m.insert("help.filter", "filter sessions");
     m.insert("help.clear_filter", "clear filter / close overlay");
     m.insert("help.kill_session", "kill selected session");
@@ -361,7 +361,7 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("help.help", "帮助");
     m.insert("help.press_key", " 按任意键关闭 ");
     m.insert("help.select_session", "选择会话");
-    m.insert("help.jump_tmux", "跳转到 tmux 面板");
+    m.insert("help.jump_tmux", "jump to session terminal");
     m.insert("help.filter", "过滤会话");
     m.insert("help.clear_filter", "清除过滤 / 关闭覆盖");
     m.insert("help.kill_session", "终止选中的会话");

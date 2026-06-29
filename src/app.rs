@@ -24,14 +24,15 @@ fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
 }
 
 /// Outcome of an Enter-key jump attempt. Distinct from `Option<String>` so
-/// callers (notably `--exit-on-jump`) can tell a real tmux jump apart from
-/// a no-op (outside tmux, or empty session list).
+/// callers (notably `--exit-on-jump`) can tell a real terminal jump apart from
+/// a no-op (unsupported terminal, or empty session list).
+#[derive(Debug, PartialEq, Eq)]
 pub enum JumpOutcome {
-    /// Actually switched to a tmux pane.
+    /// Actually switched to a terminal pane/tab/window.
     Jumped,
-    /// Tried to jump in tmux but no pane owns the session's PID.
+    /// Tried to jump through an applicable backend, but the focus command failed.
     Failed(String),
-    /// Not in tmux, or nothing selected — nothing happened.
+    /// Unsupported terminal, or nothing selected — nothing happened.
     NoOp,
 }
 
@@ -789,65 +790,16 @@ impl App {
         self.should_quit = true;
     }
 
-    /// Jump to the terminal running the selected session's Claude process.
-    /// In tmux: switch to the pane. Otherwise: no-op.
+    /// Jump to the terminal running the selected session's agent process.
+    /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2);
+    /// see [`crate::jump`]. No-op when nothing is selected or no backend
+    /// recognizes the process.
     pub fn jump_to_session(&mut self) -> JumpOutcome {
         if self.sessions.is_empty() {
             return JumpOutcome::NoOp;
         }
-        if std::env::var("TMUX").is_err() {
-            return JumpOutcome::NoOp;
-        }
         let target_pid = self.sessions[self.selected].pid;
-        match self.jump_via_tmux(target_pid) {
-            None => JumpOutcome::Jumped,
-            Some(msg) => JumpOutcome::Failed(msg),
-        }
-    }
-
-    fn jump_via_tmux(&self, target_pid: u32) -> Option<String> {
-        let output = std::process::Command::new("tmux")
-            .args([
-                "list-panes",
-                "-a",
-                "-F",
-                "#{pane_pid} #{session_name}:#{window_index}.#{pane_index}",
-            ])
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        for line in stdout.lines() {
-            let mut parts = line.splitn(2, ' ');
-            let pane_pid: u32 = match parts.next().and_then(|p| p.parse().ok()) {
-                Some(p) => p,
-                None => continue,
-            };
-            let pane_target = match parts.next() {
-                Some(t) => t,
-                None => continue,
-            };
-
-            if is_descendant_of(target_pid, pane_pid) {
-                // Switch tmux client to the target session (needed for cross-session jumps)
-                if let Some(session_name) = pane_target.split(':').next() {
-                    let _ = std::process::Command::new("tmux")
-                        .args(["switch-client", "-t", session_name])
-                        .status();
-                }
-                if let Some(window) = pane_target.split('.').next() {
-                    let _ = std::process::Command::new("tmux")
-                        .args(["select-window", "-t", window])
-                        .status();
-                }
-                let _ = std::process::Command::new("tmux")
-                    .args(["select-pane", "-t", pane_target])
-                    .status();
-                return None; // success
-            }
-        }
-
-        Some("pane not found".to_string())
+        crate::jump::run_jump(target_pid)
     }
 
     /// Get the display summary for a session: LLM summary > "..." if pending > raw prompt > "—"
@@ -1006,49 +958,6 @@ fn load_summary_cache() -> HashMap<String, String> {
         }
         Err(_) => HashMap::new(),
     }
-}
-
-/// Check if `target` PID is a descendant of `ancestor` PID by walking the process tree.
-fn is_descendant_of(target: u32, ancestor: u32) -> bool {
-    if target == ancestor {
-        return true;
-    }
-    // Build a pid->ppid map from ps
-    let output = match std::process::Command::new("ps")
-        .args(["-eo", "pid,ppid"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut ppid_map: HashMap<u32, u32> = HashMap::new();
-    for line in stdout.lines().skip(1) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            if let (Ok(pid), Ok(ppid)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                ppid_map.insert(pid, ppid);
-            }
-        }
-    }
-    // Walk up from target to see if we reach ancestor
-    let mut current = target;
-    let mut depth = 0;
-    while depth < 50 {
-        if let Some(&parent) = ppid_map.get(&current) {
-            if parent == ancestor {
-                return true;
-            }
-            if parent == 0 || parent == 1 || parent == current {
-                return false;
-            }
-            current = parent;
-            depth += 1;
-        } else {
-            return false;
-        }
-    }
-    false
 }
 
 fn save_summary_cache(summaries: &HashMap<String, String>) {

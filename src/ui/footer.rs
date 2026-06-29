@@ -50,7 +50,6 @@ pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         return;
     }
 
-    let has_tmux = std::env::var("TMUX").is_ok();
     let compact = area.width <= 80;
     let ultra_compact = area.width <= 70;
 
@@ -61,7 +60,7 @@ pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             Style::default().fg(theme.main_fg),
         ),
     ];
-    if has_tmux && !ultra_compact {
+    if !ultra_compact {
         spans.push(Span::styled("↵", Style::default().fg(theme.hi_fg)));
         spans.push(Span::styled(
             format!(" {} ", t("footer.jump")),

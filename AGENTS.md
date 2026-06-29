@@ -274,7 +274,7 @@ Tracks child processes that have open ports. When a parent session dies but the 
 | Key | Action |
 |-----|--------|
 | `↑`/`↓` or `k`/`j` | Select session in list |
-| `Enter` | Jump to session terminal (tmux only) |
+| `Enter` | Jump to session terminal (cmux / tmux / iTerm2) |
 | `x` | Kill selected session (SIGKILL) |
 | `X` | Kill all orphan ports |
 | `q` | Quit |
@@ -306,7 +306,7 @@ cargo build                    # Build
 cargo run                      # Run TUI
 cargo run -- --once            # Print snapshot and exit
 cargo run -- --setup           # Install StatusLine hook for rate limit collection
-cargo run -- --exit-on-jump    # Quit after Enter-jumping to a tmux pane (for popup overlays)
+cargo run -- --exit-on-jump    # Quit after Enter-jumping to a session terminal (for popup overlays)
 cargo test                     # Tests
 cargo clippy                   # Lint
 ```
@@ -351,13 +351,35 @@ cargo clippy                   # Lint
 - Remote/SSH monitoring
 - Notifications/alerts
 
-## tmux Integration
+## Terminal Jump (`Enter`)
 
-Session jump (`Enter`) only works when abtop runs inside tmux:
-1. On startup, detect if `$TMUX` is set. If not, disable Enter key.
-2. To map PID → tmux pane: `tmux list-panes -a -F '#{pane_pid} #{session_name}:#{window_index}.#{pane_index}'` then walk process tree to find which pane owns the agent PID.
-3. Jump: `tmux select-pane -t {target}`
-4. If mapping fails (PID not in any pane), show transient "pane not found" status message.
+`Enter` focuses the terminal running the selected session's agent process.
+The logic lives in `src/jump/` as a registry of `TerminalJumper` adapters
+(one file per backend). `jumpers()` is the single ordered source of truth;
+`resolve()` walks it and the first applicable adapter wins.
+
+Each adapter returns a three-way `JumpAttempt`:
+- `NotApplicable` — not this backend's terminal; try the next adapter.
+- `Jumped` — focused successfully; stop.
+- `Failed(msg)` — this backend owns the process but the focus command errored;
+  stop and surface `"<backend>: <msg>"` in the status line.
+
+Order (most specific first), mutually exclusive by controlling tty:
+
+1. **cmux** (`jump/cmux.rs`) — reads `CMUX_WORKSPACE_ID` (a UUID cmux exports
+   into every surface, inherited by the agent) from the process environment via
+   `ps eww`, then `cmux select-workspace --workspace <uuid>`.
+2. **tmux** (`jump/tmux.rs`) — only when abtop itself runs inside tmux (`$TMUX`).
+   Maps PID → pane via `tmux list-panes -a -F '#{pane_pid} #{session_name}:#{window_index}.#{pane_index}'`
+   + process-tree descent, then `switch-client` / `select-window` / `select-pane`.
+   PID in no pane → `NotApplicable` (lets another backend try).
+3. **iTerm2** (`jump/iterm2.rs`) — resolves the PID's controlling tty (`ps -o tty=`),
+   then AppleScript selects the session whose `tty` matches and brings its
+   window/app to the front. First call triggers a one-time macOS Automation
+   permission prompt; until granted, `osascript` exits non-zero → `Failed`.
+
+Parsing/registry logic is unit-tested in `jump/mod.rs`; the thin `ps`/`osascript`/
+`tmux` I/O wrappers are verified manually.
 
 ## Privacy
 
