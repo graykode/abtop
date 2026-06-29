@@ -3082,7 +3082,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     }
 
     #[test]
-    fn test_crate::collector::context_window_for_model() {
+    fn test_context_window_for_model() {
         // Base model with low token usage → 200K
         assert_eq!(crate::collector::context_window_for_model("claude-opus-4-6", "", 50_000), 200_000);
         // Explicit [1m] suffix in transcript model → 1M regardless of token count

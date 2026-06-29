@@ -112,9 +112,42 @@ pub trait AgentCollector {
 
 /// Process data fetched once per tick and shared across all collectors.
 /// Avoids duplicate ps/lsof calls.
+pub struct SharedProcessData {
+    pub process_info: HashMap<u32, process::ProcInfo>,
+    pub children_map: HashMap<u32, Vec<u32>>,
+    pub ports: HashMap<u32, Vec<u16>>,
+    /// True on slow poll ticks (every 5 ticks ≈ 10s). Collectors should
+    /// defer expensive discovery (e.g. /proc reads) to slow ticks.
+    pub slow_tick: bool,
+    /// PIDs of detected codex mcp-server processes. Populated by
+    /// `MultiCollector` after McpDetection runs; CodexCollector
+    /// excludes these so a single mcp-server PID isn't double-counted
+    /// in the sessions panel.
+    pub mcp_server_pids: HashSet<u32>,
+    /// Rollout file paths held open by an mcp-server process. The
+    /// CodexCollector "recently finished" pass skips these to avoid
+    /// PID=0 ghost rows for threads that the mcp-server is still
+    /// holding fds for.
+    pub mcp_owned_rollouts: HashSet<PathBuf>,
+    /// When false, the suppression sets above are empty so the
+    /// sessions panel restores upstream behavior. Driven by the user
+    /// toggle (Shift+M).
+    pub mcp_suppress: bool,
+    /// Cached Desktop app-server PID -> open rollout files. This is populated
+    /// by a background scanner so slow macOS lsof calls cannot block the TUI.
+    pub desktop_rollout_fd_map: HashMap<u32, Vec<PathBuf>>,
+}
+
 /// Context window size for this model (e.g. 200K, 1M).
-pub(crate) fn context_window_for_model(transcript_model: &str, configured_model: &str, max_context_tokens: u64) -> u64 {
-    if transcript_model.contains("[1m]") || configured_model.contains("[1m]") || max_context_tokens > 200_000 {
+pub(crate) fn context_window_for_model(
+    transcript_model: &str,
+    configured_model: &str,
+    max_context_tokens: u64,
+) -> u64 {
+    if transcript_model.contains("[1m]")
+        || configured_model.contains("[1m]")
+        || max_context_tokens > 200_000
+    {
         1_000_000
     } else {
         200_000
