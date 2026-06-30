@@ -128,7 +128,7 @@ impl OpenCodeCollector {
         let mut db_changed = false;
         if let Ok(meta) = std::fs::metadata(&self.db_path) {
             if let Ok(mtime) = meta.modified() {
-                if self.last_db_mtime.map_or(true, |last| mtime > last) {
+                if self.last_db_mtime.is_none_or(|last| mtime > last) {
                     self.last_db_mtime = Some(mtime);
                     db_changed = true;
                 }
@@ -137,7 +137,7 @@ impl OpenCodeCollector {
         let wal_path = self.db_path.with_extension("db-wal");
         if let Ok(meta) = std::fs::metadata(&wal_path) {
             if let Ok(mtime) = meta.modified() {
-                if self.last_wal_mtime.map_or(true, |last| mtime > last) {
+                if self.last_wal_mtime.is_none_or(|last| mtime > last) {
                     self.last_wal_mtime = Some(mtime);
                     db_changed = true;
                 }
@@ -185,9 +185,9 @@ impl OpenCodeCollector {
             // 1. If last message role is "user", model is thinking.
             // 2. If last message role is "assistant" but completed time is not set, model is thinking.
             // 3. Fallback to CPU usage check if a tool is executing but DB hasn't been committed yet.
-            let status = if ds.last_role == "user" {
-                SessionStatus::Thinking
-            } else if ds.last_role == "assistant" && ds.last_completed.is_none() {
+            let status = if ds.last_role == "user"
+                || (ds.last_role == "assistant" && ds.last_completed.is_none())
+            {
                 SessionStatus::Thinking
             } else {
                 let cpu_active = proc.is_some_and(|p| p.cpu_pct > 5.0);
@@ -571,6 +571,7 @@ LIMIT {};"#,
     }
 
     /// Query dialogue text messages and tool calls for active sessions.
+    #[allow(clippy::type_complexity)]
     fn query_parts(&self, session_ids: &[String]) -> Option<HashMap<String, (Vec<ChatMessage>, Vec<ToolCall>)>> {
         if session_ids.is_empty() {
             return Some(HashMap::new());
@@ -685,7 +686,7 @@ fn resolve_db_path(data_dir: &Path) -> PathBuf {
     if let Ok(entries) = fs::read_dir(&base_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "db") {
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "db") {
                 return path;
             }
         }
@@ -718,9 +719,8 @@ fn strip_jsonc_comments(content: &str) -> String {
     let mut in_block_comment = false;
     let mut in_string = false;
     let mut escaped = false;
-    let mut lines = content.lines().peekable();
     
-    while let Some(line) = lines.next() {
+    for line in content.lines() {
         let mut line_clean = String::new();
         let mut chars = line.chars().peekable();
         
