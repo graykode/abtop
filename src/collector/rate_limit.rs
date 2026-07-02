@@ -26,6 +26,8 @@ struct WindowInfo {
     used_percentage: f64,
     #[serde(default)]
     resets_at: u64,
+    #[serde(default)]
+    window_minutes: Option<u64>,
 }
 
 /// Read rate limit info from all known Claude config directories.
@@ -78,8 +80,16 @@ pub fn write_codex_cache(info: &RateLimitInfo) {
 
     let json = format!(
         r#"{{"source":"codex","five_hour":{},"seven_day":{},"updated_at":{}}}"#,
-        window_json(info.five_hour_pct, info.five_hour_resets_at),
-        window_json(info.seven_day_pct, info.seven_day_resets_at),
+        window_json(
+            info.five_hour_pct,
+            info.five_hour_resets_at,
+            info.five_hour_window_minutes
+        ),
+        window_json(
+            info.seven_day_pct,
+            info.seven_day_resets_at,
+            info.seven_day_window_minutes
+        ),
         info.updated_at
             .map(|v| v.to_string())
             .unwrap_or_else(|| "null".to_string()),
@@ -92,10 +102,22 @@ pub fn write_codex_cache(info: &RateLimitInfo) {
     }
 }
 
-fn window_json(pct: Option<f64>, resets_at: Option<u64>) -> String {
+fn window_json(pct: Option<f64>, resets_at: Option<u64>, window_minutes: Option<u64>) -> String {
     match (pct, resets_at) {
-        (Some(p), Some(r)) => format!(r#"{{"used_percentage":{},"resets_at":{}}}"#, p, r),
-        (Some(p), None) => format!(r#"{{"used_percentage":{},"resets_at":0}}"#, p),
+        (Some(p), Some(r)) => match window_minutes {
+            Some(m) => format!(
+                r#"{{"used_percentage":{},"resets_at":{},"window_minutes":{}}}"#,
+                p, r, m
+            ),
+            None => format!(r#"{{"used_percentage":{},"resets_at":{}}}"#, p, r),
+        },
+        (Some(p), None) => match window_minutes {
+            Some(m) => format!(
+                r#"{{"used_percentage":{},"resets_at":0,"window_minutes":{}}}"#,
+                p, m
+            ),
+            None => format!(r#"{{"used_percentage":{},"resets_at":0}}"#, p),
+        },
         _ => "null".to_string(),
     }
 }
@@ -123,8 +145,18 @@ fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
         source,
         five_hour_pct: file.five_hour.as_ref().map(|w| w.used_percentage),
         five_hour_resets_at: file.five_hour.as_ref().map(|w| w.resets_at),
+        five_hour_window_minutes: file
+            .five_hour
+            .as_ref()
+            .and_then(|w| w.window_minutes)
+            .or(file.five_hour.as_ref().map(|_| 300)),
         seven_day_pct: file.seven_day.as_ref().map(|w| w.used_percentage),
         seven_day_resets_at: file.seven_day.as_ref().map(|w| w.resets_at),
+        seven_day_window_minutes: file
+            .seven_day
+            .as_ref()
+            .and_then(|w| w.window_minutes)
+            .or(file.seven_day.as_ref().map(|_| 10_080)),
         updated_at: file.updated_at,
     })
 }

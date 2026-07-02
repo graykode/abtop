@@ -1060,8 +1060,10 @@ mod tests {
             source: source.to_string(),
             five_hour_pct: Some(pct),
             five_hour_resets_at: None,
+            five_hour_window_minutes: Some(300),
             seven_day_pct: None,
             seven_day_resets_at: None,
+            seven_day_window_minutes: None,
             updated_at: None,
         }
     }

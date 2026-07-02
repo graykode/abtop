@@ -1213,9 +1213,9 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                         if let Some(cw) = info["model_context_window"].as_u64() {
                             result.context_window = cw;
                         }
-                        // Rate limits: assign to 5h/7d slots based on window_minutes.
+                        // Rate limits: assign to short/long slots based on window_minutes.
                         // Plus plans: primary=5h(300min), secondary=7d(10080min).
-                        // Free plans: primary=7d(10080min), secondary=null.
+                        // Free plans: primary can be a longer window, such as 30d(43200min).
                         let rl = &payload["rate_limits"];
                         if rl.is_object() && is_account_level_codex_rate_limit(rl) {
                             let event_secs = val["timestamp"]
@@ -1238,9 +1238,11 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                                 if mins <= 300 {
                                     info.five_hour_pct = pct;
                                     info.five_hour_resets_at = resets;
+                                    info.five_hour_window_minutes = Some(mins);
                                 } else {
                                     info.seven_day_pct = pct;
                                     info.seven_day_resets_at = resets;
+                                    info.seven_day_window_minutes = Some(mins);
                                 }
                             }
                             result.rate_limit = Some(info);
@@ -1846,7 +1848,26 @@ mod tests {
         let result = parse_codex_jsonl(file.path()).unwrap();
         let rl = result.rate_limit.expect("rate_limit should be Some");
         assert_eq!(rl.five_hour_pct, Some(9.0));
+        assert_eq!(rl.five_hour_window_minutes, Some(300));
         assert_eq!(rl.seven_day_pct, Some(14.0));
+        assert_eq!(rl.seven_day_window_minutes, Some(10_080));
+    }
+
+    #[test]
+    fn test_parse_codex_free_rate_limit_uses_thirty_day_window() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-06-17T15:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"output_tokens":1},"last_token_usage":{"input_tokens":1,"output_tokens":1}},"rate_limits":{"limit_id":"codex","primary":{"used_percent":48.0,"window_minutes":43200,"resets_at":1780000000},"secondary":null,"plan_type":"free"}}}"#,
+            ],
+        );
+        let result = parse_codex_jsonl(file.path()).unwrap();
+        let rl = result.rate_limit.expect("rate_limit should be Some");
+        assert_eq!(rl.five_hour_pct, None);
+        assert_eq!(rl.seven_day_pct, Some(48.0));
+        assert_eq!(rl.seven_day_window_minutes, Some(43_200));
     }
 
     #[test]
@@ -1865,6 +1886,7 @@ mod tests {
         let rl = result.rate_limit.expect("account rate_limit should remain");
         assert_eq!(rl.five_hour_pct, Some(25.0));
         assert_eq!(rl.seven_day_pct, Some(4.0));
+        assert_eq!(rl.seven_day_window_minutes, Some(10_080));
     }
 
     #[test]
