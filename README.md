@@ -55,9 +55,11 @@ abtop --once             # Print snapshot and exit
 abtop --json             # Print one JSON snapshot and exit (for scripts/tools)
 abtop --setup            # Install rate limit collection hook
 abtop --theme dracula    # Launch with a specific theme
+abtop --mouse            # Enable mouse click/scroll navigation
 ```
 
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
+Mouse capture is off by default so terminal drag selection and copy keep working. Launch with `--mouse` if you prefer click targets and wheel navigation.
 
 ### Terminal Jump
 

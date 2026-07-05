@@ -142,6 +142,7 @@ pub fn run() -> io::Result<()> {
 
     let demo_mode = std::env::args().any(|a| a == "--demo");
     let exit_on_jump = std::env::args().any(|a| a == "--exit-on-jump");
+    let mouse_capture = should_enable_mouse_capture(std::env::args());
 
     // --json flag: print a machine-readable JSON snapshot and exit.
     // Single tick, no summary subprocesses. Useful for scripting and as a
@@ -190,7 +191,9 @@ pub fn run() -> io::Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
-    stdout().execute(EnableMouseCapture)?;
+    if mouse_capture {
+        stdout().execute(EnableMouseCapture)?;
+    }
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let app_result = run_app(
@@ -204,12 +207,24 @@ pub fn run() -> io::Result<()> {
     );
 
     // Always attempt both cleanup steps regardless of app result
-    let r1 = stdout().execute(DisableMouseCapture).map(|_| ());
+    let r1 = if mouse_capture {
+        stdout().execute(DisableMouseCapture).map(|_| ())
+    } else {
+        Ok(())
+    };
     let r2 = disable_raw_mode();
     let r3 = stdout().execute(LeaveAlternateScreen).map(|_| ());
 
     // Return app error first, then cleanup errors
     app_result.and(r1).and(r2).and(r3)
+}
+
+fn should_enable_mouse_capture<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().any(|a| a.as_ref() == "--mouse")
 }
 
 fn run_app(
@@ -548,5 +563,16 @@ fn fmt_tok(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         format!("{}", n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mouse_capture_is_opt_in() {
+        assert!(!should_enable_mouse_capture(["abtop"]));
+        assert!(should_enable_mouse_capture(["abtop", "--mouse"]));
     }
 }
