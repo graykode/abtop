@@ -743,9 +743,11 @@ impl CodexCollector {
     /// Map codex PIDs to their open rollout-*.jsonl files.
     ///
     /// On Linux, scans /proc/{pid}/fd symlinks directly (no process spawn).
-    /// On Windows, scans ~/.codex/sessions/YYYY/MM/DD/ for recently modified
-    /// JSONL files and assigns them to discovered PIDs, since Windows has no
-    /// equivalent of lsof for enumerating open file descriptors.
+    /// On Windows, scans ~/.codex/sessions recursively for rollout JSONL files
+    /// and assigns them to discovered PIDs, since Windows has no equivalent of
+    /// lsof for enumerating open file descriptors. Resume can reopen sessions
+    /// created on previous dates, so limiting the scan to today's directory
+    /// misses valid active sessions.
     /// Falls back to lsof on macOS/other platforms.
     fn map_pid_to_jsonl(pids: &[u32], sessions_dir: &Path) -> HashMap<u32, PathBuf> {
         // sessions_dir is consumed only by the windows arm below.
@@ -777,28 +779,11 @@ impl CodexCollector {
         #[cfg(target_os = "windows")]
         {
             // Windows has no lsof or /proc/{pid}/fd to map PIDs to open files.
-            // Instead, scan today's ~/.codex/sessions/YYYY/MM/DD/ directory for
-            // rollout-*.jsonl files, then assign them to discovered codex PIDs.
-            // Prefer recently modified files, but fall back to any today's file
-            // since Codex may be idle (waiting for input) and not actively writing.
-            let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-
-            if let Some(today_dir) = Self::today_session_dir(sessions_dir) {
-                if let Ok(entries) = fs::read_dir(&today_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
-                            continue;
-                        }
-                        if let Ok(meta) = fs::metadata(&path) {
-                            if let Ok(modified) = meta.modified() {
-                                candidates.push((path, modified));
-                            }
-                        }
-                    }
-                }
-            }
+            // Instead, scan the full ~/.codex/sessions tree for rollout-*.jsonl
+            // files, then assign the most recently modified files to discovered
+            // codex PIDs. A resumed Codex session keeps its original dated
+            // directory, so yesterday's rollout can be the active one today.
+            let mut candidates = Self::windows_rollout_candidates(sessions_dir);
 
             // Sort by modification time descending (most recent first)
             candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
@@ -839,6 +824,52 @@ impl CodexCollector {
                 }
             }
             map
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_rollout_candidates(sessions_dir: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
+        let mut candidates = Vec::new();
+        Self::collect_windows_rollout_candidates(sessions_dir, &mut candidates);
+        candidates
+    }
+
+    #[cfg(target_os = "windows")]
+    fn collect_windows_rollout_candidates(
+        dir: &Path,
+        candidates: &mut Vec<(PathBuf, std::time::SystemTime)>,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            // Avoid following junctions/symlinks outside ~/.codex/sessions.
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            let path = entry.path();
+            if file_type.is_dir() {
+                Self::collect_windows_rollout_candidates(&path, candidates);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                continue;
+            }
+            if let Ok(meta) = fs::metadata(&path) {
+                if let Ok(modified) = meta.modified() {
+                    candidates.push((path, modified));
+                }
+            }
         }
     }
 }
@@ -1520,6 +1551,29 @@ mod tests {
         );
 
         assert_eq!(pids, vec![(30, false)]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn map_pid_to_jsonl_windows_scans_previous_day_rollouts() {
+        let sessions = tempfile::tempdir().unwrap();
+        let today = sessions
+            .path()
+            .join(chrono::Local::now().format("%Y/%m/%d").to_string());
+        let older = sessions.path().join("2026").join("05").join("20");
+        fs::create_dir_all(&today).unwrap();
+        fs::create_dir_all(&older).unwrap();
+
+        let today_rollout = today.join("rollout-today.jsonl");
+        let older_rollout = older.join("rollout-resumed.jsonl");
+        write_jsonl(&today_rollout, &[SESSION_META]);
+        write_jsonl(&older_rollout, &[SESSION_META]);
+        set_modified(&today_rollout, SystemTime::now() - Duration::from_secs(60));
+        set_modified(&older_rollout, SystemTime::now());
+
+        let mapped = CodexCollector::map_pid_to_jsonl(&[4242], sessions.path());
+
+        assert_eq!(mapped.get(&4242), Some(&older_rollout));
     }
 
     #[test]
