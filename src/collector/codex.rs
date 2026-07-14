@@ -355,6 +355,42 @@ impl CodexCollector {
         }
     }
 
+    /// Recursively collect every `rollout-*.jsonl` file under `sessions_dir`
+    /// (across all dated `YYYY/MM/DD/` subdirectories) together with its
+    /// modification time. Windows-only fallback used by `map_pid_to_jsonl`:
+    /// a Codex CLI session resumed on a later date keeps writing the rollout
+    /// file created on the *original* date, so scanning only today's directory
+    /// misses active resumed sessions (#153).
+    #[cfg(target_os = "windows")]
+    fn collect_all_rollouts_with_mtime(
+        dir: &Path,
+        out: &mut Vec<(PathBuf, std::time::SystemTime)>,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                Self::collect_all_rollouts_with_mtime(&entry.path(), out);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                continue;
+            }
+            if let Ok(modified) = fs::metadata(&path).and_then(|m| m.modified()) {
+                out.push((path, modified));
+            }
+        }
+    }
+
     fn is_active_desktop_rollout(path: &Path, active_mtime_secs: u64) -> bool {
         let Ok(meta) = fs::metadata(path) else {
             return false;
@@ -777,28 +813,19 @@ impl CodexCollector {
         #[cfg(target_os = "windows")]
         {
             // Windows has no lsof or /proc/{pid}/fd to map PIDs to open files.
-            // Instead, scan today's ~/.codex/sessions/YYYY/MM/DD/ directory for
-            // rollout-*.jsonl files, then assign them to discovered codex PIDs.
-            // Prefer recently modified files, but fall back to any today's file
-            // since Codex may be idle (waiting for input) and not actively writing.
+            // Instead, scan ~/.codex/sessions/ for rollout-*.jsonl files, then
+            // assign them to discovered codex PIDs. Prefer recently modified
+            // files, but fall back to any file since Codex may be idle (waiting
+            // for input) and not actively writing.
+            //
+            // The scan is RECURSIVE across all dated `YYYY/MM/DD/` subdirectories:
+            // a Codex CLI session resumed on a later date keeps writing the rollout
+            // file created on the *original* date, so scanning only today's
+            // directory would miss active resumed sessions (#153). The existing
+            // sort-by-mtime-desc + assign-most-recent-to-first-PID strategy stays
+            // the same.
             let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-
-            if let Some(today_dir) = Self::today_session_dir(sessions_dir) {
-                if let Ok(entries) = fs::read_dir(&today_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
-                            continue;
-                        }
-                        if let Ok(meta) = fs::metadata(&path) {
-                            if let Ok(modified) = meta.modified() {
-                                candidates.push((path, modified));
-                            }
-                        }
-                    }
-                }
-            }
+            Self::collect_all_rollouts_with_mtime(sessions_dir, &mut candidates);
 
             // Sort by modification time descending (most recent first)
             candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
@@ -1668,6 +1695,44 @@ mod tests {
         assert_eq!(rollouts.len(), 2);
         assert!(rollouts.contains(&active));
         assert!(rollouts.contains(&older_active));
+    }
+
+    /// Regression for #153: on Windows, a Codex CLI session resumed on a later
+    /// date keeps writing the rollout file created on the *original* date, so
+    /// the PID→jsonl fallback must scan ALL dated `YYYY/MM/DD/` subdirectories
+    /// under `~/.codex/sessions`, not just today's. This is Windows-only (the
+    /// Windows branch of `map_pid_to_jsonl` + the recursive collector it calls);
+    /// on Linux/macOS the PID→file mapping uses /proc or lsof instead.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_map_pid_to_jsonl_finds_resumed_session_under_previous_date_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        // Build two dated dirs: "today" and a previous date, each with a rollout.
+        let today = sessions
+            .join(chrono::Local::now().format("%Y").to_string())
+            .join(chrono::Local::now().format("%m").to_string())
+            .join(chrono::Local::now().format("%d").to_string());
+        let prev = sessions.join("2025").join("01").join("02");
+        fs::create_dir_all(&today).unwrap();
+        fs::create_dir_all(&prev).unwrap();
+
+        let today_rollout = today.join("rollout-today.jsonl");
+        let prev_rollout = prev.join("rollout-resumed.jsonl");
+        write_jsonl(&today_rollout, &[DESKTOP_SESSION_META]);
+        write_jsonl(&prev_rollout, &[DESKTOP_SESSION_META]);
+        // The resumed (previous-date) session is the more-recently-modified one,
+        // so it should be assigned to the first discovered PID.
+        set_modified(&today_rollout, SystemTime::now() - Duration::from_secs(60 * 60));
+        set_modified(&prev_rollout, SystemTime::now());
+
+        let map = CodexCollector::map_pid_to_jsonl(&[7, 8], &sessions);
+
+        // Both rollouts across both date dirs are visible to the Windows fallback.
+        assert_eq!(map.len(), 2);
+        // Most-recently-modified (the resumed previous-date session) → first PID.
+        assert_eq!(map.get(&7), Some(&prev_rollout));
+        assert_eq!(map.get(&8), Some(&today_rollout));
     }
 
     #[test]
