@@ -536,13 +536,28 @@ impl ClaudeCollector {
             return None;
         }
 
+        // Derive the project directory from the transcript path (handles worktree sessions),
+        // falling back to the encoded cwd.
+        let project_dir = transcript_path
+            .as_ref()
+            .and_then(|tp| tp.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| config.projects_dir.join(encode_cwd_path(&sf.cwd)));
+
+        // Collect subagents before deriving the parent status so asynchronous
+        // Agent work keeps the parent active after its tool_result has returned.
+        let subagents_dir = project_dir.join(&sf.session_id).join("subagents");
+        let subagents = Self::collect_subagents(&subagents_dir);
+        let has_working_subagent = subagents.iter().any(|agent| agent.status == "working");
+
         // Status is best-effort. Signals we trust:
         //   1. Active descendant CPU → tool is running.
         //   2. current_task non-empty → latest assistant turn left a
         //      tool_use unanswered. Catches I/O-bound tools (Read, Edit)
         //      whose descendants stay under 5% CPU, so the CPU heuristic
         //      alone would flicker to Waiting while the tool runs.
-        //   3. last_user_ts_ms > 0 → trailing transcript line is a real
+        //   3. A working subagent → an async Agent call is still running even
+        //      though its tool_result has already returned to the parent.
+        //   4. last_user_ts_ms > 0 → trailing transcript line is a real
         //      user prompt with no assistant reply yet, so the model is
         //      generating. tool_result wrappers are skipped at the
         //      parser level so this only fires for actual prompts.
@@ -562,7 +577,7 @@ impl ClaudeCollector {
             // between CPU samples, so has_active_descendant alone misses them.
             let pending_tool = !cached.current_task.is_empty();
             let model_generating = cached.last_user_ts_ms > 0;
-            if has_active_descendant || pending_tool {
+            if has_active_descendant || pending_tool || has_working_subagent {
                 SessionStatus::Executing
             } else if model_generating {
                 SessionStatus::Thinking
@@ -615,17 +630,6 @@ impl ClaudeCollector {
 
         // Git stats: populated by MultiCollector on slow ticks
         let (git_added, git_modified) = (0, 0);
-
-        // Derive the project directory from the transcript path (handles worktree sessions),
-        // falling back to the encoded cwd.
-        let project_dir = transcript_path
-            .as_ref()
-            .and_then(|tp| tp.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| config.projects_dir.join(encode_cwd_path(&sf.cwd)));
-
-        // Subagent discovery
-        let subagents_dir = project_dir.join(&sf.session_id).join("subagents");
-        let subagents = Self::collect_subagents(&subagents_dir);
 
         // Memory status
         let memory_dir = project_dir.join("memory");
@@ -3566,6 +3570,79 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             sessions[0].status,
             SessionStatus::Executing,
             "pending tool_use must read as Executing even with idle descendants",
+        );
+    }
+
+    #[test]
+    fn test_load_session_working_async_subagent_is_executing() {
+        // Regression for #156: an async Agent tool returns immediately, so the
+        // parent has no pending tool while its subagent keeps working. The
+        // working subagent must keep the parent Executing instead of Waiting.
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 9104;
+        let sid = "async-subagent";
+        let session_path = sessions_dir.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, sid, &cwd);
+
+        let project_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let transcript = project_dir.join(format!("{}.jsonl", sid));
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"research this"}}
+{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Agent","id":"agent-tool-1","input":{"prompt":"research"}}]}}
+{"type":"user","timestamp":"2026-03-28T15:00:06Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-tool-1","content":"Async agent launched successfully.\nagentId: child-1\nrunning in background"}]}}
+{"type":"assistant","timestamp":"2026-03-28T15:00:07Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Waiting for the research result."}]}}
+"#,
+        )
+        .unwrap();
+
+        let subagents_dir = project_dir.join(sid).join("subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+        std::fs::write(
+            subagents_dir.join("agent-child-1.meta.json"),
+            r#"{"agentType":"general-purpose","description":"research"}"#,
+        )
+        .unwrap();
+        let subagent_transcript = subagents_dir.join("agent-child-1.jsonl");
+        std::fs::write(
+            &subagent_transcript,
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:06Z","message":{"role":"user","content":"research"}}
+"#,
+        )
+        .unwrap();
+        set_mtime(&subagent_transcript, 0);
+
+        let config = ConfigDir::new(profile.clone());
+        let process_info = make_proc_info(pid, "claude");
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config.clone()];
+
+        let session_paths = vec![(session_path, config)];
+        let ctx = build_discovery_context(&session_paths, &process_info, 0);
+        let sessions = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].subagents.len(), 1);
+        assert_eq!(sessions[0].subagents[0].status, "working");
+        assert_eq!(
+            sessions[0].status,
+            SessionStatus::Executing,
+            "a working async subagent must keep its parent Executing",
         );
     }
 
