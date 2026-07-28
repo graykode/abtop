@@ -869,6 +869,12 @@ impl CodexCollector {
             })
         });
 
+        // Deterministic ordering: process_info is a HashMap, so without this
+        // the PID list — and thus the mtime-position pairing in the Windows
+        // fallback — would vary run to run (review point 2: ownership).
+        // This is a stopgap; real fd ownership is the root fix.
+        pids.sort_unstable_by_key(|(pid, _)| *pid);
+
         pids
     }
 

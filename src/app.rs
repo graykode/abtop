@@ -719,8 +719,12 @@ impl App {
         // Check if we have a pending confirmation for this exact session
         if let Some((idx, ts)) = self.kill_confirm.take() {
             if idx == self.selected && ts.elapsed().as_secs() < 2 {
-                // Confirmed — verify PID still runs a killable agent before killing
+                // Confirmed — verify PID still runs a killable agent before killing.
+                // Note (review point 2): this guard only verifies the PID is a known
+                // agent process, not that it owns the displayed session. Real
+                // ownership is the root fix; this is the platform stopgap.
                 let pid = session.pid;
+                #[cfg(not(target_os = "windows"))]
                 let verified = std::process::Command::new("ps")
                     .args(["-p", &pid.to_string(), "-o", "command="])
                     .output()
@@ -730,12 +734,22 @@ impl App {
                         is_killable_agent_command(&cmd)
                     })
                     .unwrap_or(false);
+                #[cfg(target_os = "windows")]
+                let verified = verify_killable_agent_windows(pid);
                 if !verified {
                     self.set_status(format!("PID {} is no longer a known agent process", pid));
                     return;
                 }
+                #[cfg(not(target_os = "windows"))]
                 let _ = std::process::Command::new("kill")
                     .args(["-9", &pid.to_string()])
+                    .output();
+                // Windows has no `kill`; use taskkill /F /PID. taskkill is the
+                // standard Windows process-termination tool (review point 2:
+                // the previous `kill -9` silently failed on Windows).
+                #[cfg(target_os = "windows")]
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
                     .output();
                 self.tick();
                 return;
@@ -1007,6 +1021,19 @@ fn is_supported_agent_command(cmd: &str) -> bool {
 fn is_killable_agent_command(cmd: &str) -> bool {
     is_supported_agent_command(cmd)
         && !(crate::collector::process::cmd_has_binary(cmd, "codex") && cmd.contains(" app-server"))
+}
+
+/// Windows equivalent of the `ps -p <pid> -o command=` guard: look up the
+/// PID's command line via sysinfo (the dependency already used by
+/// `process::get_process_info` on Windows) and run the same killable-agent
+/// check. Stops the kill path from silently failing on Windows where `ps`
+/// does not exist (review point 2 stopgap).
+#[cfg(target_os = "windows")]
+fn verify_killable_agent_windows(pid: u32) -> bool {
+    let info = crate::collector::process::get_process_info();
+    info.get(&pid)
+        .map(|p| is_killable_agent_command(&p.command))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
