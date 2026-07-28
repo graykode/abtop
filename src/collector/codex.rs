@@ -30,6 +30,10 @@ pub struct CodexCollector {
     /// Latest rate limit info parsed from Codex JSONL token_count events.
     pub last_rate_limit: Option<RateLimitInfo>,
     desktop_recent_scanner: DesktopRecentRolloutScanner,
+    /// Background scanner for the Windows-only full-archive rollout discovery.
+    /// See `WindowsRolloutScanner` docs (review point 1: availability).
+    #[cfg(target_os = "windows")]
+    windows_rollout_scanner: WindowsRolloutScanner,
 }
 
 #[derive(Clone, Copy)]
@@ -53,6 +57,91 @@ struct DesktopRecentRolloutScanner {
 }
 
 const DESKTOP_RECENT_ROLLOUT_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Background scanner for the Windows-only full-archive rollout discovery.
+///
+/// On Windows there is no `lsof` or `/proc/{pid}/fd` to map a Codex PID to the
+/// rollout file it has open, so `map_pid_to_jsonl` falls back to scanning every
+/// `rollout-*.jsonl` under the sessions dir (across all `YYYY/MM/DD/` subdirs).
+/// That recursive walk is too expensive to run on every 2-second TUI tick
+/// (review point 1: blocks the UI on large / synced / network-backed profiles).
+///
+/// This scanner mirrors `DesktopRecentRolloutScanner`: a background thread
+/// performs the walk on a slow interval, results flow back via an mpsc channel,
+/// and `collect_sessions` consumes a cached snapshot instead of re-walking each
+/// tick.
+#[cfg(target_os = "windows")]
+struct WindowsRolloutScanResult {
+    rollouts: Vec<(PathBuf, std::time::SystemTime)>,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsRolloutScanner {
+    cached: Vec<(PathBuf, std::time::SystemTime)>,
+    in_flight: bool,
+    last_started: Option<Instant>,
+    tx: Sender<WindowsRolloutScanResult>,
+    rx: Receiver<WindowsRolloutScanResult>,
+}
+
+#[cfg(target_os = "windows")]
+const WINDOWS_ROLLOUT_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+#[cfg(target_os = "windows")]
+impl WindowsRolloutScanner {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            cached: Vec::new(),
+            in_flight: false,
+            last_started: None,
+            tx,
+            rx,
+        }
+    }
+
+    /// Return the cached rollout snapshot, starting a background rescan on a
+    /// slow interval. The first tick after launch (or after `last_started` is
+    /// `None`) triggers a scan; subsequent ticks within the interval return the
+    /// previous snapshot without blocking.
+    fn update(&mut self, sessions_dir: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
+        self.poll_completed();
+        if self.should_start(sessions_dir) {
+            self.start(sessions_dir.to_path_buf());
+        }
+        self.cached.clone()
+    }
+
+    fn poll_completed(&mut self) {
+        while let Ok(result) = self.rx.try_recv() {
+            self.cached = result.rollouts;
+            self.in_flight = false;
+        }
+    }
+
+    fn should_start(&self, sessions_dir: &Path) -> bool {
+        if self.in_flight || !sessions_dir.exists() {
+            return false;
+        }
+        self.last_started.is_none_or(|started| {
+            started.elapsed() >= WINDOWS_ROLLOUT_RESCAN_INTERVAL
+        })
+    }
+
+    fn start(&mut self, sessions_dir: PathBuf) {
+        self.in_flight = true;
+        self.last_started = Some(Instant::now());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let mut rollouts: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+            // Depth bound + YYYY/MM/DD numeric-dir validation guard against
+            // pathological / network-backed profiles (review point 1).
+            const MAX_DEPTH: u8 = 4;
+            CodexCollector::collect_all_rollouts_with_mtime(sessions_dir.as_path(), &mut rollouts, 0, MAX_DEPTH);
+            let _ = tx.send(WindowsRolloutScanResult { rollouts });
+        });
+    }
+}
 
 impl DesktopRecentRolloutScanner {
     fn new() -> Self {
@@ -112,6 +201,8 @@ impl CodexCollector {
             sessions_dir: home.join(".codex").join("sessions"),
             last_rate_limit: None,
             desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+            #[cfg(target_os = "windows")]
+            windows_rollout_scanner: WindowsRolloutScanner::new(),
         }
     }
 
@@ -130,7 +221,13 @@ impl CodexCollector {
         let codex_pids =
             Self::find_codex_pids_from_shared(&shared.process_info, &shared.mcp_server_pids);
         let just_pids: Vec<u32> = codex_pids.iter().map(|(p, _)| *p).collect();
-        let pid_to_jsonl = Self::map_pid_to_jsonl(&just_pids, &self.sessions_dir);
+        // Windows: consume the background scanner's cached snapshot instead of
+        // re-walking the archive every tick (review point 1: availability).
+        #[cfg(target_os = "windows")]
+        let cached_rollouts = self.windows_rollout_scanner.update(&self.sessions_dir);
+        #[cfg(not(target_os = "windows"))]
+        let cached_rollouts: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+        let pid_to_jsonl = Self::map_pid_to_jsonl(&just_pids, &self.sessions_dir, Some(&cached_rollouts));
         let pid_is_exec: HashMap<u32, bool> = codex_pids.into_iter().collect();
 
         let mut sessions = Vec::new();
@@ -352,6 +449,64 @@ impl CodexCollector {
             Some(dir)
         } else {
             None
+        }
+    }
+
+    /// Recursively collect every `rollout-*.jsonl` file under `sessions_dir`
+    /// (across all dated `YYYY/MM/DD/` subdirectories) together with its
+    /// modification time. Windows-only fallback used by `map_pid_to_jsonl`:
+    /// a Codex CLI session resumed on a later date keeps writing the rollout
+    /// file created on the *original* date, so scanning only today's directory
+    /// misses active resumed sessions (#153).
+    ///
+    /// `depth`/`max_depth` bound the recursion (review point 1: availability —
+    /// guards against pathological or network-backed profiles with deep
+    /// nesting). Only subdirectories whose name is a pure numeric component
+    /// (`YYYY`, `MM`, `DD`) are descended into, so an unrelated nested tree is
+    /// not walked.
+    #[cfg(target_os = "windows")]
+    fn collect_all_rollouts_with_mtime(
+        dir: &Path,
+        out: &mut Vec<(PathBuf, std::time::SystemTime)>,
+        depth: u8,
+        max_depth: u8,
+    ) {
+        if depth > max_depth {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                let name = entry.file_name();
+                let name_str = name.to_str().unwrap_or("");
+                // Only descend into numeric-named dirs (YYYY/MM/DD shape);
+                // skip unrelated nested trees to bound the walk.
+                if name_str.chars().all(|c| c.is_ascii_digit()) && !name_str.is_empty() {
+                    Self::collect_all_rollouts_with_mtime(
+                        &entry.path(),
+                        out,
+                        depth + 1,
+                        max_depth,
+                    );
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                continue;
+            }
+            if let Ok(modified) = fs::metadata(&path).and_then(|m| m.modified()) {
+                out.push((path, modified));
+            }
         }
     }
 
@@ -714,6 +869,12 @@ impl CodexCollector {
             })
         });
 
+        // Deterministic ordering: process_info is a HashMap, so without this
+        // the PID list — and thus the mtime-position pairing in the Windows
+        // fallback — would vary run to run (review point 2: ownership).
+        // This is a stopgap; real fd ownership is the root fix.
+        pids.sort_unstable_by_key(|(pid, _)| *pid);
+
         pids
     }
 
@@ -747,10 +908,14 @@ impl CodexCollector {
     /// JSONL files and assigns them to discovered PIDs, since Windows has no
     /// equivalent of lsof for enumerating open file descriptors.
     /// Falls back to lsof on macOS/other platforms.
-    fn map_pid_to_jsonl(pids: &[u32], sessions_dir: &Path) -> HashMap<u32, PathBuf> {
+    fn map_pid_to_jsonl(
+        pids: &[u32],
+        sessions_dir: &Path,
+        cached_rollouts: Option<&[(PathBuf, std::time::SystemTime)]>,
+    ) -> HashMap<u32, PathBuf> {
         // sessions_dir is consumed only by the windows arm below.
         #[cfg(not(target_os = "windows"))]
-        let _ = sessions_dir;
+        let _ = (sessions_dir, cached_rollouts);
 
         let mut map = HashMap::new();
         if pids.is_empty() {
@@ -777,28 +942,31 @@ impl CodexCollector {
         #[cfg(target_os = "windows")]
         {
             // Windows has no lsof or /proc/{pid}/fd to map PIDs to open files.
-            // Instead, scan today's ~/.codex/sessions/YYYY/MM/DD/ directory for
-            // rollout-*.jsonl files, then assign them to discovered codex PIDs.
-            // Prefer recently modified files, but fall back to any today's file
-            // since Codex may be idle (waiting for input) and not actively writing.
-            let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-
-            if let Some(today_dir) = Self::today_session_dir(sessions_dir) {
-                if let Ok(entries) = fs::read_dir(&today_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
-                            continue;
-                        }
-                        if let Ok(meta) = fs::metadata(&path) {
-                            if let Ok(modified) = meta.modified() {
-                                candidates.push((path, modified));
-                            }
-                        }
-                    }
+            // Instead, scan ~/.codex/sessions/ for rollout-*.jsonl files, then
+            // assign them to discovered codex PIDs. Prefer recently modified
+            // files, but fall back to any file since Codex may be idle (waiting
+            // for input) and not actively writing.
+            //
+            // The scan is RECURSIVE across all dated `YYYY/MM/DD/` subdirectories:
+            // a Codex CLI session resumed on a later date keeps writing the rollout
+            // file created on the *original* date, so scanning only today's
+            // directory would miss active resumed sessions (#153). The existing
+            // sort-by-mtime-desc + assign-most-recent-to-first-PID strategy stays
+            // the same.
+            //
+            // Review point 1 (availability): the recursive walk is not run here
+            // on the TUI thread. `collect_sessions` passes a cached snapshot
+            // produced by the background `WindowsRolloutScanner`. When no cache
+            // is supplied (e.g. tests), fall back to a synchronous walk so the
+            // function remains usable in isolation.
+            let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = match cached_rollouts {
+                Some(c) if !c.is_empty() => c.to_vec(),
+                _ => {
+                    let mut out: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+                    Self::collect_all_rollouts_with_mtime(sessions_dir, &mut out, 0, 4);
+                    out
                 }
-            }
+            };
 
             // Sort by modification time descending (most recent first)
             candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
@@ -1670,6 +1838,46 @@ mod tests {
         assert!(rollouts.contains(&older_active));
     }
 
+    /// Regression for #153: on Windows, a Codex CLI session resumed on a later
+    /// date keeps writing the rollout file created on the *original* date, so
+    /// the PID→jsonl fallback must scan ALL dated `YYYY/MM/DD/` subdirectories
+    /// under `~/.codex/sessions`, not just today's. This is Windows-only (the
+    /// Windows branch of `map_pid_to_jsonl` + the recursive collector it calls);
+    /// on Linux/macOS the PID→file mapping uses /proc or lsof instead.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_map_pid_to_jsonl_finds_resumed_session_under_previous_date_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        // Build two dated dirs: "today" and a previous date, each with a rollout.
+        let today = sessions
+            .join(chrono::Local::now().format("%Y").to_string())
+            .join(chrono::Local::now().format("%m").to_string())
+            .join(chrono::Local::now().format("%d").to_string());
+        let prev = sessions.join("2025").join("01").join("02");
+        fs::create_dir_all(&today).unwrap();
+        fs::create_dir_all(&prev).unwrap();
+
+        let today_rollout = today.join("rollout-today.jsonl");
+        let prev_rollout = prev.join("rollout-resumed.jsonl");
+        write_jsonl(&today_rollout, &[DESKTOP_SESSION_META]);
+        write_jsonl(&prev_rollout, &[DESKTOP_SESSION_META]);
+        // The resumed (previous-date) session is the more-recently-modified one,
+        // so it should be assigned to the first discovered PID.
+        set_modified(&today_rollout, SystemTime::now() - Duration::from_secs(60 * 60));
+        set_modified(&prev_rollout, SystemTime::now());
+
+        // No cached snapshot supplied → exercises the synchronous fallback walk
+        // (same code path the background scanner runs off-thread).
+        let map = CodexCollector::map_pid_to_jsonl(&[7, 8], &sessions, None);
+
+        // Both rollouts across both date dirs are visible to the Windows fallback.
+        assert_eq!(map.len(), 2);
+        // Most-recently-modified (the resumed previous-date session) → first PID.
+        assert_eq!(map.get(&7), Some(&prev_rollout));
+        assert_eq!(map.get(&8), Some(&today_rollout));
+    }
+
     #[test]
     fn desktop_pid_by_rollout_path_uses_active_fd_cache_only_for_ownership() {
         let temp = tempfile::tempdir().unwrap();
@@ -1759,6 +1967,8 @@ mod tests {
             sessions_dir: sessions.path().to_path_buf(),
             last_rate_limit: None,
             desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+            #[cfg(target_os = "windows")]
+            windows_rollout_scanner: WindowsRolloutScanner::new(),
         };
         let mut shared = super::super::SharedProcessData {
             process_info: HashMap::new(),
