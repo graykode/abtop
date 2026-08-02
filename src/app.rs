@@ -917,7 +917,7 @@ impl App {
     }
 
     /// Jump to the terminal running the selected session's agent process.
-    /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2);
+    /// Delegates to the terminal-jumper registry (Herdr / cmux / tmux / iTerm2);
     /// see [`crate::jump`]. The cached process incarnation and provider command
     /// are revalidated from fresh OS state immediately before resolving the
     /// terminal, so PID reuse cannot redirect the action. No-op when nothing is

@@ -350,10 +350,12 @@ navigation.
 ### Terminal Jump
 
 Press `Enter` to focus the terminal running an actionable selected agent. abtop supports
-cmux and tmux where available, plus iTerm2 on macOS. Unsupported environments do
-nothing. iTerm2 can request macOS Automation permission on first use. Before jumping,
-abtop freshly revalidates the provider process and its exact process incarnation;
-`Unknown`, `Done`, and otherwise non-actionable rows cannot be targeted.
+Herdr 0.7.0 or newer, cmux, tmux, and iTerm2 on macOS. When abtop runs inside
+Herdr, it can jump to agents in any pane, tab, or workspace in the same Herdr
+session; no additional setup is required. Unsupported environments do nothing. iTerm2
+can request macOS Automation permission on first use. Before jumping, abtop freshly
+revalidates the provider process and its exact process incarnation; `Unknown`, `Done`,
+and otherwise non-actionable rows cannot be targeted.
 
 ```bash
 tmux new -s work
@@ -362,6 +364,9 @@ tmux new -s work
 # pane 2: claude (project B)
 # → Enter on a session in abtop jumps to its pane
 ```
+
+The same flow works inside Herdr: run abtop in one pane, run agents elsewhere
+in the same session, then press `Enter` on the selected abtop row.
 
 ## Supported Agents
 

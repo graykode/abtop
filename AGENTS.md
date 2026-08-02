@@ -660,7 +660,7 @@ Tracks child processes that have open ports. When a parent session dies but the 
 | Key | Action |
 | --- | ------ |
 | `↑`/`↓`, `k`/`j` | Select the previous or next visible session |
-| `Enter` | Jump to an actionable terminal after fresh process validation |
+| `Enter` | Jump to an actionable Herdr / cmux / tmux / iTerm2 terminal after fresh process validation |
 | `/` | Enter filter mode; `Backspace` edits, `Enter` keeps, `Esc` clears |
 | `x` twice within two seconds | Kill the same freshly revalidated session/process incarnation |
 | `X` | Freshly rescan and kill validated orphan-port owners |
@@ -782,24 +782,30 @@ Each adapter returns a three-way `JumpAttempt`:
 - `Failed(msg)` — this backend owns the process but the focus command errored;
   stop and surface `"<backend>: <msg>"` in the status line.
 
-Order (most specific first), mutually exclusive by controlling tty:
+Order (most specific first):
 
-1. **cmux** (`jump/cmux.rs`) — reads `CMUX_WORKSPACE_ID` plus optional panel,
+1. **Herdr** (`jump/herdr.rs`) — when abtop runs inside Herdr, validates the
+   selected agent PID against Herdr's pane process inventory and calls
+   `herdr agent focus`. The inherited pane ID is the fast path; `agent list`
+   recovers the current ID after a cross-workspace move. Only the same Herdr
+   session is searched.
+2. **cmux** (`jump/cmux.rs`) — reads `CMUX_WORKSPACE_ID` plus optional panel,
    bundled-CLI, and socket variables from the target process via `ps eww`; clears
    unrelated inherited `CMUX_*` values, restores the target socket context, and runs
    `cmux workspace select <uuid>`. On macOS, a broken cmux socket attempts a bounded
    AppleScript workspace/terminal focus fallback before reporting failure.
-2. **tmux** (`jump/tmux.rs`) — only when abtop itself runs inside tmux (`$TMUX`).
+3. **tmux** (`jump/tmux.rs`) — only when abtop itself runs inside tmux (`$TMUX`).
    Maps PID → pane via `tmux list-panes -a -F '#{pane_pid} #{session_name}:#{window_index}.#{pane_index}'`
    + process-tree descent, then `switch-client` / `select-window` / `select-pane`.
    PID in no pane → `NotApplicable` (lets another backend try).
-3. **iTerm2** (`jump/iterm2.rs`) — resolves the PID's controlling tty (`ps -o tty=`),
+4. **iTerm2** (`jump/iterm2.rs`) — resolves the PID's controlling tty (`ps -o tty=`),
    then AppleScript selects the session whose `tty` matches and brings its
    window/app to the front. First call triggers a one-time macOS Automation
    permission prompt; until granted, `osascript` exits non-zero → `Failed`.
 
-Parsing, registry, cmux command planning, socket failure, and AppleScript fallback logic
-are unit-tested; the thin live `ps`/`osascript`/`tmux` I/O wrappers are verified manually.
+Herdr parsing and process matching, registry behavior, cmux command planning, socket
+failure, and AppleScript fallback logic are unit-tested; the thin live CLI and platform
+I/O wrappers are verified manually.
 
 ## Privacy
 
