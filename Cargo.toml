@@ -1,6 +1,6 @@
 [package]
 name = "abtop"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.88"
 description = "AI agent monitor for your terminal"
@@ -11,7 +11,7 @@ keywords = ["tui", "monitor", "claude", "ai", "agent"]
 categories = ["command-line-utilities"]
 readme = "README.md"
 authors = ["Tae Hwan Jung <nlkey2022@gmail.com>"]
-exclude = ["assets/*", "assets/**/*"]
+exclude = ["assets/*", "assets/**/*", ".omo", ".omo/**/*"]
 
 [dependencies]
 ratatui = "0.29"
@@ -22,14 +22,18 @@ dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
 unicode-width = "0.2"
+toml = "1.1.4"
+getrandom = { version = "0.3", features = ["std"] }
+sha2 = "0.10"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 proc_pidinfo = "0.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 sysinfo = "0.32"
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # The profile that 'dist' will build with

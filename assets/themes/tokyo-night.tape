@@ -1,4 +1,4 @@
-Output assets/themes/tokyo-night.gif
+Output assets/themes/tokyo-night.preview.gif
 
 Set Shell "bash"
 Set FontSize 24
@@ -8,7 +8,7 @@ Set Padding 10
 Set Framerate 1
 
 Hide
-Type "./target/release/abtop --demo --theme tokyo-night"
+Type "unset NO_COLOR; ./target/release/abtop --demo --theme tokyo-night"
 Enter
 Sleep 3s
 Show

@@ -27,16 +27,14 @@ impl Default for PanelVisibility {
 
 pub struct AppConfig {
     pub theme: String,
-    /// Agent CLI names to exclude from the TUI (e.g. ["codex"] to hide Codex).
+    /// Agent CLI names to exclude from the TUI: claude, codex, opencode, grok,
+    /// or kimi (matched case-insensitively).
     /// Matched case-insensitively against each collector's agent_cli identifier.
     pub hidden_agents: Vec<String>,
     /// Additional Claude config directories to scan for sessions.
     /// Useful for multi-profile setups that use separate CLAUDE_CONFIG_DIR roots.
     pub claude_config_dirs: Vec<PathBuf>,
     pub panels: PanelVisibility,
-    /// UI language override. Empty string means auto-detect from `LANG`.
-    /// Recognized values: "en", "zh" (anything starting with "zh" maps to Simplified Chinese).
-    pub language: String,
 }
 
 impl Default for AppConfig {
@@ -46,7 +44,6 @@ impl Default for AppConfig {
             hidden_agents: Vec::new(),
             claude_config_dirs: Vec::new(),
             panels: PanelVisibility::default(),
-            language: String::new(),
         }
     }
 }
@@ -96,7 +93,6 @@ fn parse_config_body(content: &str) -> AppConfig {
             let val = val.trim_matches('"').trim_matches('\'');
             match key {
                 "theme" => config.theme = val.to_string(),
-                "language" => config.language = val.to_string(),
                 "show_context" => config.panels.context = parse_bool(val).unwrap_or(true),
                 "show_quota" => config.panels.quota = parse_bool(val).unwrap_or(true),
                 "show_tokens" => config.panels.tokens = parse_bool(val).unwrap_or(true),
@@ -316,12 +312,15 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_language_replaces_existing() {
-        let before = "theme = \"btop\"\nlanguage = \"en\"\n";
-        let updates: Vec<(&str, String)> = vec![("language", "\"zh\"".to_string())];
-        let after = rewrite_kv_lines(before, &updates);
+    fn legacy_language_key_is_ignored_and_preserved_by_other_updates() {
+        let cfg = parse_config_body("theme = \"btop\"\nlanguage = \"zh\"\n");
+        assert_eq!(cfg.theme, "btop");
+
+        let after = rewrite_kv_lines(
+            "theme = \"btop\"\nlanguage = \"zh\"\n",
+            &theme_update("nord"),
+        );
+        assert!(after.contains("theme = \"nord\""));
         assert!(after.contains("language = \"zh\""));
-        assert!(!after.contains("language = \"en\""));
-        assert!(after.contains("theme = \"btop\""));
     }
 }

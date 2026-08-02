@@ -357,10 +357,7 @@ pub(crate) fn kill_rollout_scan_child(pid: u32) {
     kill_pid(pid);
 }
 
-#[cfg(any(
-    test,
-    all(not(target_os = "linux"), not(target_os = "windows"))
-))]
+#[cfg(any(test, all(not(target_os = "linux"), not(target_os = "windows"))))]
 pub(crate) fn parse_lsof_rollout_output(stdout: &str) -> HashMap<u32, Vec<PathBuf>> {
     let mut map: HashMap<u32, Vec<PathBuf>> = HashMap::new();
     let mut current_pid: Option<u32> = None;

@@ -23,14 +23,10 @@ pub(crate) fn draw_ports_panel_active(
     // Collect (port, project_name, session_id_short)
     let mut all_ports: Vec<(u16, String, String)> = Vec::new();
     for session in &app.sessions {
-        let sid_short = if session.session_id.len() >= 8 {
-            &session.session_id[..8]
-        } else {
-            &session.session_id
-        };
+        let sid_short: String = session.session_id.chars().take(8).collect();
         for child in &session.children {
             if let Some(port) = child.port {
-                all_ports.push((port, session.project_name.clone(), sid_short.to_string()));
+                all_ports.push((port, session.project_name.clone(), sid_short.clone()));
             }
         }
     }

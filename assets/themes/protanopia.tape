@@ -1,4 +1,4 @@
-Output assets/themes/protanopia.png
+Output assets/themes/protanopia.preview.gif
 
 Set Shell "bash"
 Set FontSize 24
@@ -8,7 +8,7 @@ Set Padding 10
 Set Framerate 1
 
 Hide
-Type "./target/release/abtop --demo --theme protanopia"
+Type "unset NO_COLOR; ./target/release/abtop --demo --theme protanopia"
 Enter
 Sleep 3s
 Show

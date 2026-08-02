@@ -1,7 +1,8 @@
 use super::process::{self, ProcInfo};
 use crate::model::{
     AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, SessionFile,
-    SessionStatus, SubAgent, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
+    SessionStatus, StatusAuthority, StatusEvidence, StatusObservation, StatusReason, SubAgent,
+    MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -46,6 +47,394 @@ struct ProcessOpenPaths {
     paths: Vec<PathBuf>,
 }
 
+/// Claude Code's native per-session status, written to `sessions/{pid}.json`.
+/// Keep this list exact: unknown values must fall back to transcript/process
+/// lifecycle signals instead of silently acquiring new semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeNativeStatus {
+    Busy,
+    Shell,
+    Idle,
+    Waiting,
+}
+
+/// `procStart` has `ps -o lstart=` shape and second precision, but carries no
+/// timezone. Claude installations have emitted both UTC-looking and local
+/// values, so preserve every plausible epoch and disambiguate it against the
+/// numeric `startedAt` plus the live OS timestamp.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ClaudeRecordedProcessStart {
+    #[default]
+    Missing,
+    Parsed {
+        utc_ms: u64,
+        local_ms: Option<u64>,
+        alternate_local_ms: Option<u64>,
+    },
+    Invalid,
+}
+
+const PROCESS_START_TOLERANCE_MS: u64 = 2_000;
+const REGISTRY_PROCESS_START_MAX_SKEW_MS: u64 = 5 * 60 * 1_000;
+
+fn parse_claude_process_start(value: Option<&Value>) -> ClaudeRecordedProcessStart {
+    use chrono::{Local, LocalResult, NaiveDateTime, TimeZone, Utc};
+
+    let Some(value) = value else {
+        return ClaudeRecordedProcessStart::Missing;
+    };
+    let Some(raw) = value.as_str().filter(|raw| !raw.trim().is_empty()) else {
+        return ClaudeRecordedProcessStart::Invalid;
+    };
+    let Ok(naive) = NaiveDateTime::parse_from_str(raw.trim(), "%a %b %e %H:%M:%S %Y") else {
+        return ClaudeRecordedProcessStart::Invalid;
+    };
+
+    let as_local_ms = |timestamp: chrono::DateTime<Local>| {
+        let millis = timestamp.timestamp_millis();
+        u64::try_from(millis).ok()
+    };
+    let Ok(utc_ms) = u64::try_from(Utc.from_utc_datetime(&naive).timestamp_millis()) else {
+        return ClaudeRecordedProcessStart::Invalid;
+    };
+    let (local_ms, alternate_local_ms) = match Local.from_local_datetime(&naive) {
+        LocalResult::Single(timestamp) => (as_local_ms(timestamp), None),
+        LocalResult::Ambiguous(first, second) => (as_local_ms(first), as_local_ms(second)),
+        LocalResult::None => (None, None),
+    };
+    ClaudeRecordedProcessStart::Parsed {
+        utc_ms,
+        local_ms,
+        alternate_local_ms,
+    }
+}
+
+/// Verify that a registry row still belongs to this exact OS process rather
+/// than a later Claude process that reused the PID. A present `procStart` is
+/// authoritative and fails closed when it cannot be parsed or compared. Old
+/// Claude versions without `procStart` can only be trusted when the exact live
+/// OS start is available and predates the registry row. PID-only compatibility
+/// would let a later Claude process inherit a stale legacy registry file.
+fn claude_process_incarnation_matches(
+    recorded: ClaudeRecordedProcessStart,
+    registry_started_at_ms: u64,
+    live_started_at_ms: Option<u64>,
+) -> bool {
+    match recorded {
+        ClaudeRecordedProcessStart::Parsed {
+            utc_ms,
+            local_ms,
+            alternate_local_ms,
+        } => live_started_at_ms.is_some_and(|live_ms| {
+            [Some(utc_ms), local_ms, alternate_local_ms]
+                .into_iter()
+                .flatten()
+                .any(|candidate_ms| {
+                    candidate_ms.abs_diff(live_ms) <= PROCESS_START_TOLERANCE_MS
+                        && registry_started_at_ms > 0
+                        && candidate_ms.abs_diff(registry_started_at_ms)
+                            <= REGISTRY_PROCESS_START_MAX_SKEW_MS
+                })
+        }),
+        ClaudeRecordedProcessStart::Invalid => false,
+        ClaudeRecordedProcessStart::Missing => live_started_at_ms.is_some_and(|live_ms| {
+            live_ms > 0
+                && registry_started_at_ms > 0
+                && live_ms <= registry_started_at_ms.saturating_add(PROCESS_START_TOLERANCE_MS)
+        }),
+    }
+}
+
+fn claude_action_process_observation_is_exact(
+    expected_incarnation: &str,
+    current_incarnation: Option<&str>,
+    tokens: &[String],
+) -> bool {
+    current_incarnation == Some(expected_incarnation)
+        && process::tokens_have_binary(tokens, "claude")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeLifecycleArbitration {
+    Native(ClaudeNativeStatus),
+    Transcript,
+    Conflict,
+}
+
+fn native_status_compatible_with_transcript(
+    native_status: ClaudeNativeStatus,
+    transcript_status: SessionStatus,
+) -> bool {
+    match native_status {
+        ClaudeNativeStatus::Waiting => transcript_status == SessionStatus::Waiting,
+        ClaudeNativeStatus::Idle => transcript_status == SessionStatus::Idle,
+        ClaudeNativeStatus::Busy => matches!(
+            transcript_status,
+            SessionStatus::Thinking | SessionStatus::Executing
+        ),
+        ClaudeNativeStatus::Shell => transcript_status == SessionStatus::Executing,
+    }
+}
+
+fn durable_claude_transcript_status(
+    lifecycle: ClaudeTranscriptLifecycle,
+    pending_decision: bool,
+) -> Option<SessionStatus> {
+    match lifecycle {
+        ClaudeTranscriptLifecycle::ModelOpen => Some(SessionStatus::Thinking),
+        ClaudeTranscriptLifecycle::ToolOpen if pending_decision => Some(SessionStatus::Waiting),
+        ClaudeTranscriptLifecycle::ToolOpen => Some(SessionStatus::Executing),
+        ClaudeTranscriptLifecycle::Terminal => Some(SessionStatus::Idle),
+        ClaudeTranscriptLifecycle::Unknown => None,
+    }
+}
+
+/// Claude's native registry and append-only transcript are separate writes and
+/// either can lag. Comparable timestamps select the newer exact lifecycle for
+/// every native state. If the states conflict but cannot be ordered, neither
+/// source is safe enough and the caller must report Unknown.
+fn arbitrate_claude_native_status(
+    native_status: Option<ClaudeNativeStatus>,
+    native_transition_at_ms: u64,
+    transcript_status: Option<SessionStatus>,
+    transcript_lifecycle_observed: bool,
+    transcript_lifecycle_at_ms: u64,
+    now_ms: u64,
+) -> ClaudeLifecycleArbitration {
+    let Some(native_status) = native_status else {
+        return ClaudeLifecycleArbitration::Transcript;
+    };
+    let native_timestamp_valid = native_transition_at_ms > 0 && native_transition_at_ms <= now_ms;
+    let transcript_timestamp_valid =
+        transcript_lifecycle_at_ms > 0 && transcript_lifecycle_at_ms <= now_ms;
+    let Some(transcript_status) = transcript_status else {
+        if !transcript_lifecycle_observed {
+            return ClaudeLifecycleArbitration::Native(native_status);
+        }
+        return if native_timestamp_valid
+            && transcript_timestamp_valid
+            && native_transition_at_ms > transcript_lifecycle_at_ms
+        {
+            ClaudeLifecycleArbitration::Native(native_status)
+        } else {
+            ClaudeLifecycleArbitration::Conflict
+        };
+    };
+
+    if native_timestamp_valid && transcript_timestamp_valid {
+        if transcript_lifecycle_at_ms > native_transition_at_ms {
+            ClaudeLifecycleArbitration::Transcript
+        } else if native_transition_at_ms > transcript_lifecycle_at_ms
+            || native_status_compatible_with_transcript(native_status, transcript_status)
+        {
+            ClaudeLifecycleArbitration::Native(native_status)
+        } else {
+            ClaudeLifecycleArbitration::Conflict
+        }
+    } else if native_status_compatible_with_transcript(native_status, transcript_status) {
+        ClaudeLifecycleArbitration::Native(native_status)
+    } else {
+        ClaudeLifecycleArbitration::Conflict
+    }
+}
+
+#[derive(Debug, Default)]
+struct ClaudeRegistryState {
+    status: Option<ClaudeNativeStatus>,
+    status_failure: Option<StatusReason>,
+    process_start: ClaudeRecordedProcessStart,
+    /// Generic provider metadata. It is parsed and bounded, but deliberately
+    /// not displayed because it is undocumented and may contain private text.
+    #[allow(dead_code)]
+    waiting_for: Option<String>,
+    /// Valid, non-future status transition time, used only as a duration
+    /// fallback. A native state never expires merely because this is old.
+    transition_at_ms: u64,
+}
+
+impl ClaudeRegistryState {
+    fn parse(value: &Value) -> Self {
+        const MAX_SANE_EPOCH_MS: u64 = 4_000_000_000_000_000;
+
+        let raw_status = value.get("status");
+        let status = raw_status
+            .and_then(Value::as_str)
+            .and_then(|status| match status {
+                "busy" => Some(ClaudeNativeStatus::Busy),
+                "shell" => Some(ClaudeNativeStatus::Shell),
+                "idle" => Some(ClaudeNativeStatus::Idle),
+                "waiting" => Some(ClaudeNativeStatus::Waiting),
+                _ => None,
+            });
+        let status_failure = match raw_status {
+            Some(Value::String(_)) if status.is_some() => None,
+            Some(Value::String(_)) if status.is_none() => Some(StatusReason::ProtocolUnknown),
+            Some(_) => Some(StatusReason::ProtocolMalformed),
+            None => None,
+        };
+
+        let process_start = parse_claude_process_start(value.get("procStart"));
+
+        let waiting_for = value
+            .get("waitingFor")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.trim().is_empty())
+            .map(|reason| truncate(reason.trim(), 256));
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let sane_timestamp = |field: &str| {
+            value
+                .get(field)
+                .and_then(Value::as_u64)
+                .filter(|timestamp| *timestamp <= MAX_SANE_EPOCH_MS && *timestamp <= now_ms)
+        };
+        let transition_at_ms = sane_timestamp("statusUpdatedAt")
+            .or_else(|| sane_timestamp("updatedAt"))
+            .unwrap_or(0);
+
+        Self {
+            status,
+            status_failure,
+            process_start,
+            waiting_for,
+            transition_at_ms,
+        }
+    }
+}
+
+fn classify_claude_status(
+    native_status: Option<ClaudeNativeStatus>,
+    pending_decision: bool,
+    pending_tool: bool,
+    has_active_descendant: bool,
+    has_working_subagent: bool,
+    model_generating: bool,
+    transcript_terminal: bool,
+) -> SessionStatus {
+    let executing = pending_tool || has_active_descendant || has_working_subagent;
+
+    match native_status {
+        // A native interaction is authoritative and takes precedence over
+        // concurrent tools or background work: the user can unblock it now.
+        Some(ClaudeNativeStatus::Waiting) => SessionStatus::Waiting,
+        // `shell` means Claude has returned to its prompt while a shell task
+        // remains active. The session is still doing work.
+        Some(ClaudeNativeStatus::Shell) => SessionStatus::Executing,
+        // Native idle closes stale parent transcript/process heuristics, but
+        // Claude can return the parent prompt while an asynchronous subagent
+        // continues in its own exact transcript lifecycle.
+        Some(ClaudeNativeStatus::Idle) if has_working_subagent => SessionStatus::Executing,
+        Some(ClaudeNativeStatus::Idle) => SessionStatus::Idle,
+        // Busy is always active. Prefer Executing when we can identify the
+        // active work; otherwise Claude is generating a model response.
+        Some(ClaudeNativeStatus::Busy) => {
+            if executing {
+                SessionStatus::Executing
+            } else {
+                SessionStatus::Thinking
+            }
+        }
+        None => {
+            if pending_decision {
+                SessionStatus::Waiting
+            } else if executing {
+                SessionStatus::Executing
+            } else if model_generating {
+                SessionStatus::Thinking
+            } else if transcript_terminal {
+                SessionStatus::Idle
+            } else {
+                SessionStatus::Unknown
+            }
+        }
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claude_status_evidence(
+    status: SessionStatus,
+    native_status: Option<ClaudeNativeStatus>,
+    pending_decision_reason: Option<StatusReason>,
+    pending_tool: bool,
+    has_active_descendant: bool,
+    has_working_subagent: bool,
+    model_generating: bool,
+    transcript_terminal: bool,
+    native_status_failure: Option<StatusReason>,
+    source_since_ms: u64,
+) -> StatusEvidence {
+    let (authority, reason) = match native_status {
+        Some(ClaudeNativeStatus::Waiting) => (
+            StatusAuthority::Provider,
+            StatusReason::ProviderWaitingUserInput,
+        ),
+        Some(ClaudeNativeStatus::Shell) => {
+            (StatusAuthority::Provider, StatusReason::ProviderExecuting)
+        }
+        Some(ClaudeNativeStatus::Idle) if has_working_subagent => {
+            (StatusAuthority::Provider, StatusReason::ProviderExecuting)
+        }
+        Some(ClaudeNativeStatus::Idle) => (StatusAuthority::Provider, StatusReason::ProviderIdle),
+        Some(ClaudeNativeStatus::Busy) if pending_tool || has_working_subagent => {
+            (StatusAuthority::Provider, StatusReason::ProviderExecuting)
+        }
+        Some(ClaudeNativeStatus::Busy) if has_active_descendant => (
+            StatusAuthority::Heuristic,
+            StatusReason::BackgroundTerminalActive,
+        ),
+        Some(ClaudeNativeStatus::Busy) => {
+            (StatusAuthority::Provider, StatusReason::ProviderThinking)
+        }
+        None => {
+            if let Some(reason) = pending_decision_reason {
+                (StatusAuthority::Provider, reason)
+            } else if pending_tool || has_working_subagent {
+                (StatusAuthority::Provider, StatusReason::ProviderExecuting)
+            } else if has_active_descendant {
+                (
+                    StatusAuthority::Heuristic,
+                    StatusReason::BackgroundTerminalActive,
+                )
+            } else if model_generating {
+                (StatusAuthority::Provider, StatusReason::ProviderThinking)
+            } else if transcript_terminal {
+                (StatusAuthority::Provider, StatusReason::ProviderIdle)
+            } else {
+                (
+                    StatusAuthority::Unavailable,
+                    native_status_failure.unwrap_or(StatusReason::Unavailable),
+                )
+            }
+        }
+    };
+
+    let observed_at_ms = unix_now_ms();
+    let mut evidence = StatusEvidence::default();
+    evidence.observe(StatusObservation::new(
+        status,
+        authority,
+        reason,
+        observed_at_ms,
+        0,
+    ));
+    if source_since_ms > 0 && source_since_ms <= observed_at_ms {
+        evidence.status_since_ms = source_since_ms;
+    }
+    evidence
+}
+
 pub struct ClaudeCollector {
     /// All known config directories to scan for sessions.
     config_dirs: Vec<ConfigDir>,
@@ -54,6 +443,14 @@ pub struct ClaudeCollector {
     /// Cached transcript parse results keyed by session_id.
     /// On each tick, only new bytes since `new_offset` are parsed.
     transcript_cache: HashMap<String, TranscriptResult>,
+}
+
+#[derive(Default)]
+struct ClaudeSubagentCollection {
+    agents: Vec<SubAgent>,
+    /// At least one reachable child descriptor could not be enumerated or
+    /// parsed, so quiescence cannot be proven.
+    incomplete: bool,
 }
 
 impl ClaudeCollector {
@@ -304,8 +701,84 @@ impl ClaudeCollector {
         ctx: &DiscoveryContext,
     ) -> Option<AgentSession> {
         let content = fs::read_to_string(path).ok()?;
-        let mut sf: SessionFile = serde_json::from_str(&content).ok()?;
+        let session_value: Value = serde_json::from_str(&content).ok()?;
+        let registry_state = ClaudeRegistryState::parse(&session_value);
+        let mut sf: SessionFile = serde_json::from_value(session_value).ok()?;
         sf.sanitize();
+        // Retain the exact incarnation observed before the registry/process
+        // ownership checks below. If this process exits at any later point,
+        // action-time validation compares against this old identity and fails
+        // closed instead of anchoring to a reused PID.
+        let action_process_incarnation_candidate = process::get_process_incarnation(sf.pid);
+        let action_process_tokens = process::get_process_tokens(sf.pid);
+
+        // `build_discovery_context` verifies Claude's recorded `procStart`
+        // against the live OS process before a row can acquire an actionable
+        // PID. A mismatch means a stale registry file survived PID reuse.
+        if !ctx
+            .session_incarnation_valid
+            .get(path)
+            .copied()
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        let proc = process_info.get(&sf.pid)?;
+        if !process::cmd_has_binary(&proc.command, "claude") {
+            return None;
+        }
+        // Re-check the current file value after the discovery pass. This
+        // closes the narrow race where a registry file is replaced between
+        // context construction and loading.
+        if registry_state.process_start != ClaudeRecordedProcessStart::Missing
+            && !claude_process_incarnation_matches(
+                registry_state.process_start,
+                sf.started_at,
+                process::get_process_started_at_ms(sf.pid),
+            )
+        {
+            return None;
+        }
+        let action_live_started_at_ms = process::get_process_started_at_ms(sf.pid);
+        let action_binding_confirmed = match registry_state.process_start {
+            ClaudeRecordedProcessStart::Parsed { .. } => claude_process_incarnation_matches(
+                registry_state.process_start,
+                sf.started_at,
+                action_live_started_at_ms,
+            ),
+            // Compatibility rows without `procStart` remain visible when the
+            // OS start time is unavailable, but that is not enough ownership
+            // proof for a destructive or terminal-focus action.
+            ClaudeRecordedProcessStart::Missing => {
+                action_live_started_at_ms.is_some()
+                    && claude_process_incarnation_matches(
+                        registry_state.process_start,
+                        sf.started_at,
+                        action_live_started_at_ms,
+                    )
+            }
+            ClaudeRecordedProcessStart::Invalid => false,
+        };
+        let action_process_incarnation_after = process::get_process_incarnation(sf.pid);
+        let exact_process_observation = action_process_incarnation_candidate
+            .as_deref()
+            .zip(action_process_tokens.as_deref())
+            .is_some_and(|(before, tokens)| {
+                claude_action_process_observation_is_exact(
+                    before,
+                    action_process_incarnation_after.as_deref(),
+                    tokens,
+                )
+            });
+        let action_process_incarnation = (action_binding_confirmed && exact_process_observation)
+            .then_some(action_process_incarnation_candidate)
+            .flatten();
+        // Skip sessions whose PID is a descendant of abtop itself — those are
+        // the `claude --print` summary children spawned by `generate_summary`.
+        if process::is_descendant_of(sf.pid, ctx.self_pid, process_info) {
+            return None;
+        }
 
         // Resolve the project dir that actually holds this session's
         // transcripts. For worktree sessions the on-disk dir does not match
@@ -339,27 +812,11 @@ impl ClaudeCollector {
             }
         }
 
-        let proc_cmd = process_info.get(&sf.pid).map(|p| p.command.as_str());
-        let pid_alive = proc_cmd
-            .map(|c| process::cmd_has_binary(c, "claude"))
-            .unwrap_or(false);
-
-        // Skip sessions whose PID is a descendant of abtop itself —
-        // those are the `claude --print` summary children spawned by
-        // `generate_summary` in app.rs. User-launched non-interactive
-        // sessions (`claude --print` in another shell) are NOT filtered.
-        // Only checked while the process is alive (ppid visible); dead
-        // sessions are cleaned up when the session file disappears.
-        if process::is_descendant_of(sf.pid, ctx.self_pid, process_info) {
-            return None;
-        }
-
         let project_name = process::last_path_segment(&sf.cwd)
             .unwrap_or("?")
             .to_string();
 
-        let proc = process_info.get(&sf.pid);
-        let mem_mb = proc.map(|p| p.rss_kb / 1024).unwrap_or(0);
+        let mem_mb = proc.rss_kb / 1024;
 
         // Use the already-resolved project_dir so a post-/clear sid lookup
         // lands in the same (possibly worktree) directory as the original.
@@ -385,19 +842,33 @@ impl ClaudeCollector {
                 cached.as_ref().map(|c| c.new_offset).unwrap_or(0)
             };
 
-            let (initial_context_tokens, initial_cache_read) = if from_offset > 0 {
+            let (
+                initial_context_tokens,
+                initial_cache_read,
+                initial_lifecycle,
+                initial_lifecycle_at_ms,
+            ) = if from_offset > 0 {
                 cached
                     .as_ref()
-                    .map(|c| (c.last_context_tokens, c.prev_cache_read))
-                    .unwrap_or((0, 0))
+                    .map(|c| {
+                        (
+                            c.last_context_tokens,
+                            c.prev_cache_read,
+                            c.lifecycle,
+                            c.lifecycle_at_ms,
+                        )
+                    })
+                    .unwrap_or((0, 0, ClaudeTranscriptLifecycle::Unknown, 0))
             } else {
-                (0, 0)
+                (0, 0, ClaudeTranscriptLifecycle::Unknown, 0)
             };
             let delta = parse_transcript_with_previous(
                 tp,
                 from_offset,
                 initial_context_tokens,
                 initial_cache_read,
+                initial_lifecycle,
+                initial_lifecycle_at_ms,
             );
 
             if let Some(mut prev) = cached {
@@ -458,6 +929,10 @@ impl ClaudeCollector {
                         prev.last_assistant_ts_ms = delta.last_assistant_ts_ms;
                         prev.last_user_ts_ms = delta.last_user_ts_ms;
                     }
+                    if delta.saw_lifecycle_record {
+                        prev.lifecycle = delta.lifecycle;
+                        prev.lifecycle_at_ms = delta.lifecycle_at_ms;
+                    }
                     if prev.initial_prompt.is_empty() && !delta.initial_prompt.is_empty() {
                         prev.initial_prompt = delta.initial_prompt;
                     }
@@ -505,6 +980,9 @@ impl ClaudeCollector {
             last_assistant_ts_ms: 0,
             last_user_ts_ms: 0,
             saw_turn: false,
+            saw_lifecycle_record: false,
+            lifecycle: ClaudeTranscriptLifecycle::Unknown,
+            lifecycle_at_ms: 0,
             file_accesses: Vec::new(),
         };
         let cached = self
@@ -532,10 +1010,6 @@ impl ClaudeCollector {
         let tool_calls = cached.tool_calls.clone();
         let file_accesses = cached.file_accesses.clone();
 
-        if !pid_alive {
-            return None;
-        }
-
         // Derive the project directory from the transcript path (handles worktree sessions),
         // falling back to the encoded cwd.
         let project_dir = transcript_path
@@ -546,62 +1020,140 @@ impl ClaudeCollector {
         // Collect subagents before deriving the parent status so asynchronous
         // Agent work keeps the parent active after its tool_result has returned.
         let subagents_dir = project_dir.join(&sf.session_id).join("subagents");
-        let subagents = Self::collect_subagents(&subagents_dir);
+        let subagent_collection = Self::collect_subagents(&subagents_dir);
+        let subagents = subagent_collection.agents;
         let has_working_subagent = subagents.iter().any(|agent| agent.status == "working");
+        let has_unknown_subagent = subagent_collection.incomplete
+            || subagents.iter().any(|agent| agent.status == "unknown");
 
-        // Status is best-effort. Signals we trust:
-        //   1. Active descendant CPU → tool is running.
-        //   2. current_task non-empty → latest assistant turn left a
-        //      tool_use unanswered. Catches I/O-bound tools (Read, Edit)
-        //      whose descendants stay under 5% CPU, so the CPU heuristic
-        //      alone would flicker to Waiting while the tool runs.
-        //   3. A working subagent → an async Agent call is still running even
-        //      though its tool_result has already returned to the parent.
-        //   4. last_user_ts_ms > 0 → trailing transcript line is a real
-        //      user prompt with no assistant reply yet, so the model is
-        //      generating. tool_result wrappers are skipped at the
-        //      parser level so this only fires for actual prompts.
-        //
-        // We drop the mtime freshness gate intentionally: Claude Code
-        // writes the assistant turn atomically when it lands, so during
-        // a long streamed reply the file isn't touched and mtime would
-        // go stale. Without the gate the status now matches the live
-        // "Think" row in the timeline (both keyed off last_user_ts_ms),
-        // and an idle session can't get stuck Thinking because the
-        // tool_result skip means last_user only flips on real prompts.
-        let status = {
-            let has_active_descendant =
-                process::has_active_descendant(sf.pid, children_map, process_info, 5.0);
-            // Non-empty current_task = latest assistant turn left a tool_use
-            // unanswered. Catches fast tools (`Bash rm ...`) that finish
-            // between CPU samples, so has_active_descendant alone misses them.
-            let pending_tool = !cached.current_task.is_empty();
-            let model_generating = cached.last_user_ts_ms > 0;
-            if has_active_descendant || pending_tool || has_working_subagent {
-                SessionStatus::Executing
-            } else if model_generating {
-                SessionStatus::Thinking
-            } else {
-                SessionStatus::Waiting
+        // `current_task` is a cached display label. It is only an exact open
+        // tool while the durable transcript lifecycle remains `ToolOpen`; a
+        // subsequent user/tool_result record changes that lifecycle even when
+        // either record omitted a timestamp.
+        let pending_tool = !cached.current_task.is_empty()
+            && cached.lifecycle == ClaudeTranscriptLifecycle::ToolOpen;
+        let decision_tool = cached
+            .current_task
+            .split_once(' ')
+            .map_or(cached.current_task.as_str(), |(tool, _)| tool);
+        let pending_decision_reason = if pending_tool {
+            match decision_tool {
+                "ExitPlanMode" => Some(StatusReason::ProviderWaitingApproval),
+                "AskUserQuestion" => Some(StatusReason::ProviderWaitingUserInput),
+                _ => None,
             }
+        } else {
+            None
+        };
+        let pending_decision = pending_decision_reason.is_some();
+        let has_active_descendant =
+            process::has_active_descendant(sf.pid, children_map, process_info, 5.0);
+        let model_generating = cached.last_user_ts_ms > 0;
+        let arbitration = arbitrate_claude_native_status(
+            registry_state.status,
+            registry_state.transition_at_ms,
+            durable_claude_transcript_status(cached.lifecycle, pending_decision),
+            cached.saw_lifecycle_record,
+            cached.lifecycle_at_ms,
+            unix_now_ms(),
+        );
+        let effective_native_status = match arbitration {
+            ClaudeLifecycleArbitration::Native(status) => Some(status),
+            ClaudeLifecycleArbitration::Transcript | ClaudeLifecycleArbitration::Conflict => None,
+        };
+        let mut status = if arbitration == ClaudeLifecycleArbitration::Conflict {
+            SessionStatus::Unknown
+        } else {
+            classify_claude_status(
+                effective_native_status,
+                pending_decision,
+                pending_tool,
+                has_active_descendant,
+                has_working_subagent,
+                model_generating,
+                cached.lifecycle == ClaudeTranscriptLifecycle::Terminal,
+            )
+        };
+        let unknown_subagent_blocks_idle = has_unknown_subagent && status == SessionStatus::Idle;
+        if unknown_subagent_blocks_idle {
+            status = SessionStatus::Unknown;
+        }
+        let awaiting_input = matches!(status, SessionStatus::Waiting);
+        let evidence_since_ms = if matches!(arbitration, ClaudeLifecycleArbitration::Native(_)) {
+            registry_state.transition_at_ms
+        } else if pending_tool
+            || model_generating
+            || cached.lifecycle == ClaudeTranscriptLifecycle::Terminal
+        {
+            cached.lifecycle_at_ms
+        } else {
+            0
+        };
+        let status_evidence = if arbitration == ClaudeLifecycleArbitration::Conflict
+            || unknown_subagent_blocks_idle
+        {
+            let observed_at_ms = unix_now_ms();
+            let mut evidence = StatusEvidence::default();
+            evidence.observe(StatusObservation::new(
+                SessionStatus::Unknown,
+                StatusAuthority::Unavailable,
+                StatusReason::ProtocolUnknown,
+                observed_at_ms,
+                0,
+            ));
+            evidence
+        } else {
+            claude_status_evidence(
+                status,
+                effective_native_status,
+                pending_decision_reason,
+                pending_tool,
+                has_active_descendant,
+                has_working_subagent,
+                model_generating,
+                cached.lifecycle == ClaudeTranscriptLifecycle::Terminal,
+                registry_state.status_failure,
+                evidence_since_ms,
+            )
         };
 
         let configured_model = read_configured_model(&sf.cwd);
-        let context_window = crate::collector::context_window_for_model(&model, &configured_model, max_context_tokens);
+        let context_window = crate::collector::context_window_for_model(
+            &model,
+            &configured_model,
+            max_context_tokens,
+        );
         let context_percent = if context_window > 0 {
             (last_context_tokens as f64 / context_window as f64) * 100.0
         } else {
             0.0
         };
 
-        let current_tasks = if !current_task.is_empty() {
-            vec![current_task]
-        } else if !pid_alive {
-            vec!["finished".to_string()]
-        } else if matches!(status, SessionStatus::Waiting) {
-            vec!["waiting for input".to_string()]
+        let current_tasks = match &status {
+            SessionStatus::Waiting => vec!["waiting for user input".to_string()],
+            SessionStatus::Executing if pending_tool => vec![current_task],
+            SessionStatus::Executing => vec!["executing".to_string()],
+            SessionStatus::Thinking => vec!["thinking".to_string()],
+            SessionStatus::Idle => vec!["idle".to_string()],
+            SessionStatus::Unknown => vec!["unknown".to_string()],
+            SessionStatus::RateLimited => vec!["rate limited".to_string()],
+            SessionStatus::Error => vec!["error".to_string()],
+            SessionStatus::Done => vec!["finished".to_string()],
+        };
+
+        let pending_since_ms = if matches!(status, SessionStatus::Executing) && pending_tool {
+            cached.last_assistant_ts_ms
         } else {
-            vec!["thinking...".to_string()]
+            0
+        };
+        let thinking_since_ms = if matches!(status, SessionStatus::Thinking) {
+            if cached.last_user_ts_ms > 0 {
+                cached.last_user_ts_ms
+            } else {
+                registry_state.transition_at_ms
+            }
+        } else {
+            0
         };
 
         let mut children = Vec::new();
@@ -643,11 +1195,13 @@ impl ClaudeCollector {
         Some(AgentSession {
             agent_cli: "claude",
             pid: sf.pid,
+            action_process_incarnation,
             session_id: sf.session_id,
             cwd: sf.cwd,
             project_name,
             started_at: sf.started_at,
             status,
+            status_evidence,
             model,
             effort,
             context_percent,
@@ -674,49 +1228,74 @@ impl ClaudeCollector {
             first_assistant_text,
             chat_messages,
             tool_calls,
-            pending_since_ms: cached.last_assistant_ts_ms,
-            thinking_since_ms: cached.last_user_ts_ms,
+            pending_since_ms,
+            awaiting_input,
+            thinking_since_ms,
             file_accesses,
             config_root: super::abbrev_path(&config.base_dir()),
         })
     }
 
-    fn collect_subagents(subagents_dir: &Path) -> Vec<SubAgent> {
-        let mut subagents = Vec::new();
+    fn collect_subagents(subagents_dir: &Path) -> ClaudeSubagentCollection {
+        let mut collection = ClaudeSubagentCollection::default();
 
         let entries = match fs::read_dir(subagents_dir) {
             Ok(e) => e,
-            Err(_) => return subagents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return collection,
+            Err(_) => {
+                collection.incomplete = true;
+                return collection;
+            }
         };
 
         // Collect meta files and their corresponding jsonl files
         let mut meta_files: Vec<PathBuf> = Vec::new();
-        for entry in entries.flatten() {
-            if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    collection.incomplete = true;
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let is_meta = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".meta.json"));
+            if !is_meta {
                 continue;
             }
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".meta.json") {
-                    meta_files.push(path);
-                }
+            if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
+                collection.incomplete = true;
+                continue;
             }
+            meta_files.push(path);
         }
 
         for meta_path in meta_files {
             let meta_name = match meta_path.file_name().and_then(|n| n.to_str()) {
                 Some(n) => n.to_string(),
-                None => continue,
+                None => {
+                    collection.incomplete = true;
+                    continue;
+                }
             };
 
             // Parse meta JSON
             let meta_content = match fs::read_to_string(&meta_path) {
                 Ok(c) => c,
-                Err(_) => continue,
+                Err(_) => {
+                    collection.incomplete = true;
+                    continue;
+                }
             };
             let meta_val: Value = match serde_json::from_str(&meta_content) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => {
+                    collection.incomplete = true;
+                    continue;
+                }
             };
 
             let description = meta_val
@@ -730,46 +1309,40 @@ impl ClaudeCollector {
             let jsonl_path = meta_path.with_file_name(&jsonl_name);
 
             let mut tokens = 0u64;
-            let mut last_activity = std::time::UNIX_EPOCH;
+            let mut lifecycle = ClaudeTranscriptLifecycle::Unknown;
 
-            if jsonl_path.exists() {
-                // Get file mtime for status
-                if let Ok(metadata) = fs::metadata(&jsonl_path) {
-                    if let Ok(mtime) = metadata.modified() {
-                        last_activity = mtime;
-                    }
-                }
-
-                // Parse jsonl for token totals
+            if jsonl_path.exists() && !is_symlink(&jsonl_path) {
+                // The transcript is already scanned for token totals, so fold
+                // its exact final lifecycle at the same time. File age is not
+                // a lifecycle signal: a fresh `end_turn` is complete, while an
+                // old unresolved tool/model turn is still active.
                 let transcript = parse_transcript(&jsonl_path, 0);
                 tokens = transcript.total_input
                     + transcript.total_output
                     + transcript.total_cache_read
                     + transcript.total_cache_create;
+                lifecycle = transcript.lifecycle;
             }
 
-            let status = {
-                let since = std::time::SystemTime::now()
-                    .duration_since(last_activity)
-                    .unwrap_or_default();
-                if since.as_secs() < 30 {
-                    "working".to_string()
-                } else {
-                    "done".to_string()
+            let status = match lifecycle {
+                ClaudeTranscriptLifecycle::ModelOpen | ClaudeTranscriptLifecycle::ToolOpen => {
+                    "working"
                 }
+                ClaudeTranscriptLifecycle::Terminal => "done",
+                ClaudeTranscriptLifecycle::Unknown => "unknown",
             };
 
             // Use description as name, shorten if needed
             let name = truncate(&description, 30);
 
-            subagents.push(SubAgent {
+            collection.agents.push(SubAgent {
                 name,
-                status,
+                status: status.to_string(),
                 tokens,
             });
         }
 
-        subagents
+        collection
     }
 
     fn collect_memory_status(memory_dir: &Path) -> (u32, u32) {
@@ -1034,6 +1607,10 @@ struct DiscoveryContext {
     /// abtop's own PID, threaded through so `load_session` can self-filter
     /// without growing an extra arg. Set by `build_discovery_context`.
     self_pid: u32,
+    /// Per-registry-file process-incarnation result. This is path-scoped
+    /// because custom Claude roots can contain different stale rows for the
+    /// same numeric PID.
+    session_incarnation_valid: HashMap<PathBuf, bool>,
 }
 
 fn build_discovery_context(
@@ -1041,20 +1618,36 @@ fn build_discovery_context(
     process_info: &HashMap<u32, ProcInfo>,
     self_pid: u32,
 ) -> DiscoveryContext {
+    build_discovery_context_with_start_lookup(
+        session_paths,
+        process_info,
+        self_pid,
+        process::get_process_started_at_ms,
+    )
+}
+
+fn build_discovery_context_with_start_lookup(
+    session_paths: &[(PathBuf, ConfigDir)],
+    process_info: &HashMap<u32, ProcInfo>,
+    self_pid: u32,
+    mut live_start_for_pid: impl FnMut(u32) -> Option<u64>,
+) -> DiscoveryContext {
     let mut claimed_sids_by_pid: HashMap<u32, String> = HashMap::new();
     let mut pids_per_cwd: HashMap<String, usize> = HashMap::new();
+    let mut session_incarnation_valid: HashMap<PathBuf, bool> = HashMap::new();
     let mut seen_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for (path, _) in session_paths {
         let Ok(content) = fs::read_to_string(path) else {
             continue;
         };
-        let Ok(mut sf) = serde_json::from_str::<SessionFile>(&content) else {
+        let Ok(value) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        let registry_state = ClaudeRegistryState::parse(&value);
+        let Ok(mut sf) = serde_json::from_value::<SessionFile>(value) else {
             continue;
         };
         sf.sanitize();
-        if !seen_pids.insert(sf.pid) {
-            continue;
-        }
         // Only count PIDs that are alive AND actually claude AND not
         // descended from abtop itself. Stale `sessions/{PID}.json` files
         // (crashed sessions) and abtop's own `claude --print` summary
@@ -1070,6 +1663,19 @@ fn build_discovery_context(
         if process::is_descendant_of(sf.pid, self_pid, process_info) {
             continue;
         }
+        // Always resolve the exact OS process start. Legacy rows without a
+        // provider `procStart` are not exempt: if the OS observation is
+        // unavailable, PID ownership cannot be established safely.
+        let live_started_at_ms = live_start_for_pid(sf.pid);
+        let incarnation_valid = claude_process_incarnation_matches(
+            registry_state.process_start,
+            sf.started_at,
+            live_started_at_ms,
+        );
+        session_incarnation_valid.insert(path.clone(), incarnation_valid);
+        if !incarnation_valid || !seen_pids.insert(sf.pid) {
+            continue;
+        }
         *pids_per_cwd.entry(sf.cwd.clone()).or_insert(0) += 1;
         claimed_sids_by_pid.insert(sf.pid, sf.session_id);
     }
@@ -1077,6 +1683,7 @@ fn build_discovery_context(
         claimed_sids_by_pid,
         pids_per_cwd,
         self_pid,
+        session_incarnation_valid,
     }
 }
 
@@ -1240,7 +1847,8 @@ struct TranscriptResult {
     chat_messages: Vec<ChatMessage>,
     /// Tool call timeline extracted from transcript.
     tool_calls: Vec<crate::model::ToolCall>,
-    /// Timestamp of the last assistant turn (epoch ms), used to compute tool duration.
+    /// Timestamp of the unresolved assistant tool turn (epoch ms). A non-empty
+    /// `current_task` is only live while this marker remains nonzero.
     last_assistant_ts_ms: u64,
     /// Timestamp (epoch ms) of the most recent `user` line that has not been
     /// followed by an assistant turn. Zero when the latest entry was an
@@ -1251,8 +1859,27 @@ struct TranscriptResult {
     /// must not overwrite cached state - otherwise a no-new-data tick
     /// would clear the live pending/thinking markers.
     saw_turn: bool,
+    /// This parse observed a record (or malformed tail) that can change the
+    /// current lifecycle. Unlike `saw_turn`, this remains true for explicit
+    /// Unknown so incremental parsing does not retain stale terminal state.
+    saw_lifecycle_record: bool,
+    /// Exact lifecycle of the newest durable transcript turn. This is used
+    /// for subagents, which do not have their own native session registry.
+    lifecycle: ClaudeTranscriptLifecycle,
+    /// Provider timestamp of the durable record that established `lifecycle`.
+    /// Zero means the sources cannot be ordered safely.
+    lifecycle_at_ms: u64,
     /// File access audit log extracted from tool_use entries.
     file_accesses: Vec<FileAccess>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ClaudeTranscriptLifecycle {
+    #[default]
+    Unknown,
+    ModelOpen,
+    ToolOpen,
+    Terminal,
 }
 
 /// Check if a path is a symlink without following it.
@@ -1290,7 +1917,14 @@ fn file_identity(path: &Path) -> (u64, u64) {
 }
 
 fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
-    parse_transcript_with_previous(path, from_offset, 0, 0)
+    parse_transcript_with_previous(
+        path,
+        from_offset,
+        0,
+        0,
+        ClaudeTranscriptLifecycle::Unknown,
+        0,
+    )
 }
 
 fn parse_transcript_with_previous(
@@ -1298,6 +1932,8 @@ fn parse_transcript_with_previous(
     from_offset: u64,
     initial_context_tokens: u64,
     initial_cache_read: u64,
+    initial_lifecycle: ClaudeTranscriptLifecycle,
+    initial_lifecycle_at_ms: u64,
 ) -> TranscriptResult {
     let identity = file_identity(path);
     let mut result = TranscriptResult {
@@ -1326,6 +1962,9 @@ fn parse_transcript_with_previous(
         last_assistant_ts_ms: 0,
         last_user_ts_ms: 0,
         saw_turn: false,
+        saw_lifecycle_record: false,
+        lifecycle: initial_lifecycle,
+        lifecycle_at_ms: initial_lifecycle_at_ms,
         file_accesses: Vec::new(),
     };
 
@@ -1346,6 +1985,10 @@ fn parse_transcript_with_previous(
     } else {
         from_offset
     };
+    if effective_offset == 0 {
+        result.lifecycle = ClaudeTranscriptLifecycle::Unknown;
+        result.lifecycle_at_ms = 0;
+    }
     let from_offset = effective_offset;
     let mut prev_context_tokens = if from_offset > 0 {
         initial_context_tokens
@@ -1388,6 +2031,9 @@ fn parse_transcript_with_previous(
                 // Cap hit without a newline — malformed/hostile line. Skip
                 // to end of file; we'll re-evaluate when file_identity changes.
                 if line_buf.len() > MAX_LINE_BYTES && !line_buf.ends_with('\n') {
+                    result.lifecycle = ClaudeTranscriptLifecycle::Unknown;
+                    result.lifecycle_at_ms = 0;
+                    result.saw_lifecycle_record = true;
                     bytes_read = file_len;
                     break;
                 }
@@ -1405,6 +2051,13 @@ fn parse_transcript_with_previous(
                 let val = match serde_json::from_str::<Value>(line) {
                     Ok(v) => v,
                     Err(_) => {
+                        // The newest durable/partial record is not a lifecycle
+                        // signal we can interpret. Subagents must become
+                        // Unknown rather than inheriting an older terminal or
+                        // active state from file age.
+                        result.lifecycle = ClaudeTranscriptLifecycle::Unknown;
+                        result.lifecycle_at_ms = 0;
+                        result.saw_lifecycle_record = true;
                         if has_newline {
                             // Complete line but invalid JSON — skip it
                             bytes_read += n as u64;
@@ -1428,6 +2081,9 @@ fn parse_transcript_with_previous(
 
                     match val.get("type").and_then(|t| t.as_str()) {
                         Some("assistant") => {
+                            result.lifecycle = ClaudeTranscriptLifecycle::Unknown;
+                            result.lifecycle_at_ms = entry_ts_ms;
+                            result.saw_lifecycle_record = true;
                             result.turn_count += 1;
                             // Clear previous task on each new turn so stale tasks
                             // don't persist when latest turn has no tool_use
@@ -1585,30 +2241,60 @@ fn parse_transcript_with_previous(
                                 if entry_ts_ms > 0 && has_tool_use {
                                     result.last_assistant_ts_ms = entry_ts_ms;
                                 }
+                                result.lifecycle =
+                                    match msg.get("stop_reason").and_then(Value::as_str) {
+                                        Some("tool_use") => ClaudeTranscriptLifecycle::ToolOpen,
+                                        Some("end_turn") => ClaudeTranscriptLifecycle::Terminal,
+                                        Some(_) => ClaudeTranscriptLifecycle::Unknown,
+                                        None if has_tool_use => ClaudeTranscriptLifecycle::ToolOpen,
+                                        // A JSON assistant record without a stop reason may
+                                        // be a streaming/partial record. Even when it follows
+                                        // an exact open model turn, it is not proof that the
+                                        // model reached a quiescent terminal state.
+                                        None => ClaudeTranscriptLifecycle::Unknown,
+                                    };
+                                result.lifecycle_at_ms = entry_ts_ms;
                                 // Any assistant turn closes the prior "thinking" window.
                                 result.last_user_ts_ms = 0;
                                 result.saw_turn = true;
                             }
                         }
                         Some("user") => {
-                            // Compute tool call duration: time from assistant turn to this user turn
-                            if entry_ts_ms > 0 && result.last_assistant_ts_ms > 0 {
-                                let duration =
-                                    entry_ts_ms.saturating_sub(result.last_assistant_ts_ms);
-                                // Distribute duration across tool calls from that assistant turn
-                                // (approximation: divide equally among pending zero-duration calls)
-                                let pending: Vec<usize> = result
-                                    .tool_calls
-                                    .iter()
-                                    .enumerate()
-                                    .rev()
-                                    .take_while(|(_, tc)| tc.duration_ms == 0)
-                                    .map(|(i, _)| i)
-                                    .collect();
-                                if !pending.is_empty() {
-                                    let per_call = duration / pending.len() as u64;
-                                    for idx in pending {
-                                        result.tool_calls[idx].duration_ms = per_call;
+                            // User-role records have two independent meanings:
+                            // whether they are real prompts, and whether they
+                            // carry lifecycle evidence. Tool-result wrappers
+                            // are synthetic prompts but still close an open
+                            // tool lifecycle. Pure local/meta command records
+                            // do neither, so they must not compete with the
+                            // native registry during status arbitration.
+                            let tool_result = is_tool_result_user_msg(&val);
+                            let synthetic = is_synthetic_user_msg(&val);
+                            if !synthetic || tool_result {
+                                result.saw_lifecycle_record = true;
+                            }
+                            // Any following user record closes the preceding
+                            // tool turn, including a tool_result without a
+                            // usable timestamp. The timestamp is optional for
+                            // duration accounting, not for lifecycle closure.
+                            if result.last_assistant_ts_ms > 0 {
+                                if entry_ts_ms > 0 {
+                                    let duration =
+                                        entry_ts_ms.saturating_sub(result.last_assistant_ts_ms);
+                                    // Distribute duration across tool calls from that assistant turn
+                                    // (approximation: divide equally among pending zero-duration calls)
+                                    let pending: Vec<usize> = result
+                                        .tool_calls
+                                        .iter()
+                                        .enumerate()
+                                        .rev()
+                                        .take_while(|(_, tc)| tc.duration_ms == 0)
+                                        .map(|(i, _)| i)
+                                        .collect();
+                                    if !pending.is_empty() {
+                                        let per_call = duration / pending.len() as u64;
+                                        for idx in pending {
+                                            result.tool_calls[idx].duration_ms = per_call;
+                                        }
                                     }
                                 }
                                 result.last_assistant_ts_ms = 0;
@@ -1626,7 +2312,17 @@ fn parse_transcript_with_previous(
                             // the session in Thinking forever (e.g. /plugin
                             // update flushes 3 user-role lines and no
                             // assistant reply ever arrives to clear them).
-                            let synthetic = is_synthetic_user_msg(&val);
+                            if !synthetic {
+                                result.lifecycle = ClaudeTranscriptLifecycle::ModelOpen;
+                                result.lifecycle_at_ms = entry_ts_ms;
+                            } else if tool_result {
+                                // A tool result closes the preceding tool call, but the
+                                // provider normally resumes model generation afterwards.
+                                // Without a native status or a later explicit end_turn,
+                                // quiescence is unproven and must fail closed.
+                                result.lifecycle = ClaudeTranscriptLifecycle::Unknown;
+                                result.lifecycle_at_ms = entry_ts_ms;
+                            }
                             if entry_ts_ms > 0 && !synthetic {
                                 result.last_user_ts_ms = entry_ts_ms;
                             }
@@ -1698,17 +2394,18 @@ fn parse_transcript_with_previous(
 ///    invoke the model, so treating them as a prompt would leave
 ///    `last_user_ts_ms` stuck and pin the session in Thinking forever.
 fn is_synthetic_user_msg(entry: &Value) -> bool {
-    if entry.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if entry
+        .get("isMeta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return true;
     }
-    let Some(message) = entry.get("message") else { return false };
+    let Some(message) = entry.get("message") else {
+        return false;
+    };
     match message.get("content") {
-        Some(Value::Array(arr)) => {
-            !arr.is_empty()
-                && arr.iter().all(|block| {
-                    block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                })
-        }
+        Some(Value::Array(_)) => is_tool_result_user_msg(entry),
         Some(Value::String(s)) => {
             let t = s.trim_start();
             t.starts_with("<local-command-stdout>")
@@ -1721,6 +2418,19 @@ fn is_synthetic_user_msg(entry: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_tool_result_user_msg(entry: &Value) -> bool {
+    entry
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            !blocks.is_empty()
+                && blocks
+                    .iter()
+                    .all(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        })
 }
 
 fn push_chat_message(messages: &mut Vec<ChatMessage>, role: ChatRole, text: String) {
@@ -2026,6 +2736,541 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Most collector unit tests use synthetic PIDs. Inject a plausible exact
+    /// process start so they exercise session parsing without weakening the
+    /// production lookup. Tests covering unavailable/reused incarnations call
+    /// `super::build_discovery_context` or the injected helper explicitly.
+    fn build_discovery_context(
+        session_paths: &[(PathBuf, ConfigDir)],
+        process_info: &HashMap<u32, ProcInfo>,
+        self_pid: u32,
+    ) -> DiscoveryContext {
+        let recorded_starts: HashMap<u32, u64> = session_paths
+            .iter()
+            .filter_map(|(path, _)| {
+                let value: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+                let session: SessionFile = serde_json::from_value(value.clone()).ok()?;
+                let state = ClaudeRegistryState::parse(&value);
+                let live_start = match state.process_start {
+                    ClaudeRecordedProcessStart::Parsed { utc_ms, .. } => utc_ms,
+                    ClaudeRecordedProcessStart::Missing => session.started_at.saturating_sub(1),
+                    ClaudeRecordedProcessStart::Invalid => session.started_at.saturating_sub(1),
+                };
+                Some((session.pid, live_start.max(1)))
+            })
+            .collect();
+        super::build_discovery_context_with_start_lookup(
+            session_paths,
+            process_info,
+            self_pid,
+            |pid| recorded_starts.get(&pid).copied(),
+        )
+    }
+
+    #[test]
+    fn test_registry_state_parses_only_valid_native_values() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let old_transition = now_ms.saturating_sub(86_400_000);
+        let long_reason = "x".repeat(400);
+        let state = ClaudeRegistryState::parse(&serde_json::json!({
+            "status": "waiting",
+            "waitingFor": long_reason,
+            "updatedAt": now_ms,
+            "statusUpdatedAt": old_transition,
+        }));
+
+        assert_eq!(state.status, Some(ClaudeNativeStatus::Waiting));
+        assert_eq!(state.status_failure, None);
+        assert_eq!(state.transition_at_ms, old_transition);
+        assert_eq!(state.waiting_for.as_ref().unwrap().chars().count(), 256);
+
+        let future = now_ms.saturating_add(60_000);
+        let fallback = ClaudeRegistryState::parse(&serde_json::json!({
+            "status": "Busy",
+            "waitingFor": 42,
+            "updatedAt": old_transition,
+            "statusUpdatedAt": future,
+        }));
+        assert_eq!(fallback.status, None, "native status matching is exact");
+        assert_eq!(fallback.status_failure, Some(StatusReason::ProtocolUnknown));
+        assert_eq!(fallback.waiting_for, None);
+        assert_eq!(fallback.transition_at_ms, old_transition);
+
+        let malformed = ClaudeRegistryState::parse(&serde_json::json!({
+            "status": ["idle"],
+            "updatedAt": -1,
+            "statusUpdatedAt": "now",
+        }));
+        assert_eq!(malformed.status, None);
+        assert_eq!(
+            malformed.status_failure,
+            Some(StatusReason::ProtocolMalformed)
+        );
+        assert_eq!(malformed.transition_at_ms, 0);
+    }
+
+    #[test]
+    fn test_proc_start_verifies_exact_process_incarnation() {
+        let parsed = parse_claude_process_start(Some(&Value::String(
+            "Sat Aug  1 17:22:17 2026".to_string(),
+        )));
+        let recorded_ms = match parsed {
+            ClaudeRecordedProcessStart::Parsed { utc_ms, .. } => utc_ms,
+            other => panic!("expected parsed procStart, got {other:?}"),
+        };
+        assert_eq!(recorded_ms, 1_785_604_937_000);
+
+        assert!(claude_process_incarnation_matches(
+            parsed,
+            recorded_ms.saturating_add(1_000),
+            Some(recorded_ms.saturating_add(1_500)),
+        ));
+        assert!(
+            !claude_process_incarnation_matches(
+                parsed,
+                recorded_ms.saturating_add(1_000),
+                Some(recorded_ms.saturating_add(PROCESS_START_TOLERANCE_MS + 1)),
+            ),
+            "a later same-binary process must not inherit a stale registry row",
+        );
+        assert!(
+            !claude_process_incarnation_matches(parsed, recorded_ms.saturating_add(1_000), None,),
+            "a present procStart must fail closed when the OS start is unavailable",
+        );
+    }
+
+    #[test]
+    fn test_action_binding_rejects_pid_reuse_around_exact_argv() {
+        let direct = vec!["/usr/local/bin/claude".to_string()];
+        let wrapped = vec![
+            "/usr/local/bin/node".to_string(),
+            "/opt/bin/claude".to_string(),
+        ];
+
+        assert!(claude_action_process_observation_is_exact(
+            "process-a",
+            Some("process-a"),
+            &direct,
+        ));
+        assert!(claude_action_process_observation_is_exact(
+            "process-a",
+            Some("process-a"),
+            &wrapped,
+        ));
+        assert!(!claude_action_process_observation_is_exact(
+            "process-a",
+            Some("process-b"),
+            &direct,
+        ));
+        assert!(!claude_action_process_observation_is_exact(
+            "process-a",
+            Some("process-a"),
+            &["/usr/local/bin/codex".to_string()],
+        ));
+    }
+
+    #[test]
+    fn test_proc_start_malformed_fails_closed_and_legacy_ordering_is_bounded() {
+        for malformed in [
+            Value::String("not a process start".to_string()),
+            Value::Null,
+        ] {
+            let recorded = parse_claude_process_start(Some(&malformed));
+            assert_eq!(recorded, ClaudeRecordedProcessStart::Invalid);
+            assert!(!claude_process_incarnation_matches(
+                recorded,
+                10_000,
+                Some(9_000),
+            ));
+        }
+
+        assert!(claude_process_incarnation_matches(
+            ClaudeRecordedProcessStart::Missing,
+            10_000,
+            Some(9_000),
+        ));
+        assert!(!claude_process_incarnation_matches(
+            ClaudeRecordedProcessStart::Missing,
+            10_000,
+            Some(10_000 + PROCESS_START_TOLERANCE_MS + 1),
+        ));
+        assert!(
+            !claude_process_incarnation_matches(ClaudeRecordedProcessStart::Missing, 10_000, None,),
+            "legacy rows must fail closed when the exact OS start is unavailable"
+        );
+    }
+
+    #[test]
+    fn test_discovery_rejects_proc_start_when_live_incarnation_cannot_be_verified() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects_dir = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = u32::MAX - 17;
+        let sid = "unverifiable-proc-start";
+        let session_path = sessions_dir.join(format!("{pid}.json"));
+        std::fs::write(
+            &session_path,
+            serde_json::json!({
+                "pid": pid,
+                "sessionId": sid,
+                "cwd": cwd,
+                "startedAt": 1_785_604_938_015u64,
+                "procStart": "Sat Aug  1 17:22:17 2026",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let config = ConfigDir::new(profile);
+        let session_paths = vec![(session_path, config.clone())];
+        let process_info = make_proc_info(pid, "claude");
+        let ctx = super::build_discovery_context(&session_paths, &process_info, 0);
+        assert_eq!(
+            ctx.session_incarnation_valid.values().copied().next(),
+            Some(false)
+        );
+
+        let mut collector = ClaudeCollector::new();
+        let loaded = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn test_claude_status_precedence_matrix() {
+        let classify = |native, decision, tool, child, subagent, model| {
+            classify_claude_status(native, decision, tool, child, subagent, model, false)
+        };
+
+        assert_eq!(
+            classify(
+                Some(ClaudeNativeStatus::Waiting),
+                true,
+                true,
+                true,
+                true,
+                true
+            ),
+            SessionStatus::Waiting,
+            "native waiting must win over concurrent work",
+        );
+        assert_eq!(
+            classify(
+                Some(ClaudeNativeStatus::Shell),
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            SessionStatus::Executing,
+        );
+        assert_eq!(
+            classify(
+                Some(ClaudeNativeStatus::Idle),
+                true,
+                true,
+                true,
+                false,
+                true
+            ),
+            SessionStatus::Idle,
+            "native idle must close stale fallback signals",
+        );
+        assert_eq!(
+            classify(
+                Some(ClaudeNativeStatus::Idle),
+                false,
+                false,
+                false,
+                true,
+                false
+            ),
+            SessionStatus::Executing,
+            "an exact asynchronous subagent remains active at the parent prompt",
+        );
+        assert_eq!(
+            classify(
+                Some(ClaudeNativeStatus::Busy),
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            SessionStatus::Thinking,
+        );
+        for (tool, child, subagent) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert_eq!(
+                classify(
+                    Some(ClaudeNativeStatus::Busy),
+                    false,
+                    tool,
+                    child,
+                    subagent,
+                    false
+                ),
+                SessionStatus::Executing,
+            );
+        }
+
+        assert_eq!(
+            classify(None, true, true, true, true, true),
+            SessionStatus::Waiting,
+            "an exact fallback decision must win over ordinary work",
+        );
+        assert_eq!(
+            classify(None, false, true, false, false, false),
+            SessionStatus::Executing,
+        );
+        assert_eq!(
+            classify(None, false, false, false, false, true),
+            SessionStatus::Thinking,
+        );
+        assert_eq!(
+            classify(None, false, false, false, false, false),
+            SessionStatus::Unknown,
+            "missing native and transcript lifecycle evidence must fail closed",
+        );
+        assert_eq!(
+            classify_claude_status(None, false, false, false, false, false, true),
+            SessionStatus::Idle,
+            "an exact terminal transcript is sufficient provider idle evidence",
+        );
+    }
+
+    #[test]
+    fn newer_transcript_lifecycle_supersedes_every_stale_native_state() {
+        let now_ms = 1_000;
+
+        let arbitration = arbitrate_claude_native_status(
+            Some(ClaudeNativeStatus::Idle),
+            100,
+            Some(SessionStatus::Waiting),
+            true,
+            200,
+            now_ms,
+        );
+        assert_eq!(arbitration, ClaudeLifecycleArbitration::Transcript);
+        assert_eq!(
+            classify_claude_status(None, true, true, false, false, false, false),
+            SessionStatus::Waiting,
+            "a newer durable question must not be hidden by stale native idle",
+        );
+
+        for native in [
+            ClaudeNativeStatus::Waiting,
+            ClaudeNativeStatus::Busy,
+            ClaudeNativeStatus::Shell,
+        ] {
+            assert_eq!(
+                arbitrate_claude_native_status(
+                    Some(native),
+                    300,
+                    Some(SessionStatus::Idle),
+                    true,
+                    400,
+                    now_ms,
+                ),
+                ClaudeLifecycleArbitration::Transcript,
+                "native={native:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn unorderable_conflicting_claude_lifecycles_are_unknown() {
+        for transcript_at_ms in [0, 1_001] {
+            assert_eq!(
+                arbitrate_claude_native_status(
+                    Some(ClaudeNativeStatus::Waiting),
+                    100,
+                    Some(SessionStatus::Idle),
+                    true,
+                    transcript_at_ms,
+                    1_000,
+                ),
+                ClaudeLifecycleArbitration::Conflict,
+                "timestamp={transcript_at_ms}",
+            );
+        }
+        assert_eq!(
+            arbitrate_claude_native_status(
+                Some(ClaudeNativeStatus::Waiting),
+                0,
+                Some(SessionStatus::Waiting),
+                true,
+                0,
+                1_000,
+            ),
+            ClaudeLifecycleArbitration::Native(ClaudeNativeStatus::Waiting),
+            "compatible unorderable states do not conflict",
+        );
+        assert_eq!(
+            arbitrate_claude_native_status(
+                Some(ClaudeNativeStatus::Waiting),
+                100,
+                None,
+                false,
+                200,
+                1_000,
+            ),
+            ClaudeLifecycleArbitration::Native(ClaudeNativeStatus::Waiting),
+            "an unknown transcript lifecycle is not competing evidence",
+        );
+        assert_eq!(
+            arbitrate_claude_native_status(
+                Some(ClaudeNativeStatus::Waiting),
+                200,
+                Some(SessionStatus::Idle),
+                true,
+                100,
+                1_000,
+            ),
+            ClaudeLifecycleArbitration::Native(ClaudeNativeStatus::Waiting),
+            "the newer exact native state wins",
+        );
+        assert_eq!(
+            arbitrate_claude_native_status(
+                Some(ClaudeNativeStatus::Idle),
+                100,
+                None,
+                true,
+                200,
+                1_000,
+            ),
+            ClaudeLifecycleArbitration::Conflict,
+            "a newer explicit Unknown transcript record must not inherit native idle",
+        );
+        assert_eq!(
+            arbitrate_claude_native_status(
+                Some(ClaudeNativeStatus::Busy),
+                100,
+                Some(SessionStatus::Idle),
+                true,
+                100,
+                1_000,
+            ),
+            ClaudeLifecycleArbitration::Conflict,
+            "equal timestamps do not order conflicting states",
+        );
+    }
+
+    #[test]
+    fn test_claude_status_evidence_distinguishes_provider_and_fallback_sources() {
+        let native_wait = claude_status_evidence(
+            SessionStatus::Waiting,
+            Some(ClaudeNativeStatus::Waiting),
+            None,
+            false,
+            true,
+            true,
+            false,
+            false,
+            None,
+            123,
+        );
+        assert_eq!(native_wait.authority, StatusAuthority::Provider);
+        assert_eq!(native_wait.reason, StatusReason::ProviderWaitingUserInput);
+        assert_eq!(native_wait.status_since_ms, 123);
+
+        let plan_approval = claude_status_evidence(
+            SessionStatus::Waiting,
+            None,
+            Some(StatusReason::ProviderWaitingApproval),
+            true,
+            true,
+            false,
+            false,
+            false,
+            None,
+            456,
+        );
+        assert_eq!(plan_approval.authority, StatusAuthority::Provider);
+        assert_eq!(plan_approval.reason, StatusReason::ProviderWaitingApproval);
+
+        let process_child = claude_status_evidence(
+            SessionStatus::Executing,
+            None,
+            None,
+            false,
+            true,
+            false,
+            false,
+            false,
+            None,
+            0,
+        );
+        assert_eq!(process_child.authority, StatusAuthority::Heuristic);
+        assert_eq!(process_child.reason, StatusReason::BackgroundTerminalActive);
+
+        let exact_subagent = claude_status_evidence(
+            SessionStatus::Executing,
+            None,
+            None,
+            false,
+            false,
+            true,
+            false,
+            false,
+            None,
+            0,
+        );
+        assert_eq!(exact_subagent.authority, StatusAuthority::Provider);
+        assert_eq!(exact_subagent.reason, StatusReason::ProviderExecuting);
+
+        let terminal = claude_status_evidence(
+            SessionStatus::Idle,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            0,
+        );
+        assert_eq!(terminal.authority, StatusAuthority::Provider);
+        assert_eq!(terminal.reason, StatusReason::ProviderIdle);
+
+        let unavailable_lifecycle = claude_status_evidence(
+            SessionStatus::Unknown,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            0,
+        );
+        assert_eq!(
+            unavailable_lifecycle.authority,
+            StatusAuthority::Unavailable
+        );
+        assert_eq!(unavailable_lifecycle.reason, StatusReason::Unavailable);
+    }
+
     fn write_lines(file: &mut tempfile::NamedTempFile, lines: &[&str]) {
         for line in lines {
             writeln!(file, "{}", line).unwrap();
@@ -2057,7 +3302,7 @@ mod tests {
             &transcript,
             format!(
                 r#"{{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{{"role":"user","content":"{}"}}}}
-{{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":12,"output_tokens":6,"cache_read_input_tokens":3,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"done"}}]}}}}
+{{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{{"input_tokens":12,"output_tokens":6,"cache_read_input_tokens":3,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"done"}}]}}}}
 "#,
                 prompt
             ),
@@ -2147,6 +3392,62 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_transcript_pure_local_user_records_are_not_lifecycle_evidence() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>\n<command-args>update foo</command-args>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated foo</local-command-stdout>"}}"#,
+            ],
+        );
+
+        let result = parse_transcript(file.path(), 0);
+
+        assert!(result.saw_turn);
+        assert!(
+            !result.saw_lifecycle_record,
+            "pure local/meta records must not compete with native lifecycle evidence",
+        );
+        assert_eq!(result.lifecycle, ClaudeTranscriptLifecycle::Unknown);
+        assert_eq!(result.lifecycle_at_ms, 0);
+    }
+
+    #[test]
+    fn test_parse_transcript_pure_local_delta_preserves_terminal_lifecycle() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#,
+            ],
+        );
+        let previous_offset = std::fs::metadata(file.path()).unwrap().len();
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated</local-command-stdout>"}}"#,
+            ],
+        );
+        let terminal_at_ms = 1_774_710_000_000;
+
+        let result = parse_transcript_with_previous(
+            file.path(),
+            previous_offset,
+            0,
+            0,
+            ClaudeTranscriptLifecycle::Terminal,
+            terminal_at_ms,
+        );
+
+        assert!(!result.saw_lifecycle_record);
+        assert_eq!(result.lifecycle, ClaudeTranscriptLifecycle::Terminal);
+        assert_eq!(result.lifecycle_at_ms, terminal_at_ms);
+    }
+
+    #[test]
     fn test_parse_transcript_tool_result_does_not_open_thinking_window() {
         // Regression: status used to flicker Think ↔ Wait during tool
         // loops because tool_result lines come back as `user`-role
@@ -2169,6 +3470,10 @@ mod tests {
         let result = parse_transcript(file.path(), 0);
 
         assert!(result.saw_turn);
+        assert!(
+            result.saw_lifecycle_record,
+            "a tool_result must remain exact lifecycle evidence",
+        );
         // After the tool_result line, last_user_ts_ms must STILL be 0
         // — the assistant turn at 15:00:01 cleared it, and the
         // tool_result wrapper at 15:00:02 must not re-open the window.
@@ -2176,6 +3481,36 @@ mod tests {
             result.last_user_ts_ms, 0,
             "tool_result user-role line must not reopen the thinking window",
         );
+        assert_eq!(
+            result.last_assistant_ts_ms, 0,
+            "tool_result must close the exact pending-tool marker",
+        );
+        assert_eq!(
+            result.current_task, "Bash ls",
+            "the cached display label may remain after the tool is closed",
+        );
+        assert_eq!(
+            result.lifecycle,
+            ClaudeTranscriptLifecycle::Unknown,
+            "tool_result closes execution but does not prove the resumed model turn is quiescent",
+        );
+    }
+
+    #[test]
+    fn test_parse_transcript_assistant_without_stop_reason_is_not_terminal() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"partial"}]}}"#,
+            ],
+        );
+
+        let result = parse_transcript(file.path(), 0);
+
+        assert_eq!(result.last_user_ts_ms, 0);
+        assert_eq!(result.lifecycle, ClaudeTranscriptLifecycle::Unknown);
     }
 
     #[test]
@@ -2216,6 +3551,10 @@ mod tests {
         let result = parse_transcript(file.path(), 0);
 
         assert!(result.saw_turn);
+        assert!(
+            result.saw_lifecycle_record,
+            "a real prompt must remain exact lifecycle evidence",
+        );
         assert!(result.last_user_ts_ms > 0);
         assert_eq!(result.last_assistant_ts_ms, 0);
     }
@@ -2276,15 +3615,18 @@ mod tests {
         // forever (Think generating reply). All three line shapes must be
         // treated as synthetic.
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            // Real prompt + assistant reply to seed a clean Wait state.
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"hello"}]}}"#,
-            // The three user-role lines `/plugin update` writes:
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>\n<command-args>update foo</command-args>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated foo</local-command-stdout>"}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                // Real prompt + assistant reply to seed a clean Wait state.
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"hello"}]}}"#,
+                // The three user-role lines `/plugin update` writes:
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>\n<command-args>update foo</command-args>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated foo</local-command-stdout>"}}"#,
+            ],
+        );
 
         let result = parse_transcript(file.path(), 0);
 
@@ -2302,11 +3644,14 @@ mod tests {
         // `!ls` and friends serialize as <bash-input>/<bash-stdout> user-role
         // lines with no assistant reply. Same failure mode as /plugin.
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-stdout>a\nb</bash-stdout><bash-stderr></bash-stderr>"}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-stdout>a\nb</bash-stdout><bash-stderr></bash-stderr>"}}"#,
+            ],
+        );
 
         let result = parse_transcript(file.path(), 0);
 
@@ -3088,7 +4433,10 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     #[test]
     fn test_context_window_for_model() {
         // Base model with low token usage → 200K
-        assert_eq!(crate::collector::context_window_for_model("claude-opus-4-6", "", 50_000), 200_000);
+        assert_eq!(
+            crate::collector::context_window_for_model("claude-opus-4-6", "", 50_000),
+            200_000
+        );
         // Explicit [1m] suffix in transcript model → 1M regardless of token count
         assert_eq!(
             crate::collector::context_window_for_model("claude-opus-4-6[1m]", "", 0),
@@ -3103,7 +4451,10 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             crate::collector::context_window_for_model("claude-sonnet-4-6", "", 100_000),
             200_000
         );
-        assert_eq!(crate::collector::context_window_for_model("unknown-model", "", 0), 200_000);
+        assert_eq!(
+            crate::collector::context_window_for_model("unknown-model", "", 0),
+            200_000
+        );
         // Token usage exceeds 200K → must be 1M window
         assert_eq!(
             crate::collector::context_window_for_model("claude-opus-4-6", "", 250_000),
@@ -3406,14 +4757,14 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     }
 
     #[test]
-    fn test_load_session_stale_transcript_is_waiting_even_when_cpu_busy() {
+    fn test_load_session_terminal_turn_is_idle_even_when_main_cpu_is_busy() {
         // Regression: lifetime `%cpu` from ps doesn't tell us whether the
         // agent is doing work *right now* — long-running sessions can
         // average over 1% even when fully idle. Status must drive off
         // recent transcript activity, not lifetime CPU. Here the
         // transcript timestamps are months stale and there is no active
         // descendant; even with cpu_pct=42 the session must read as
-        // Waiting.
+        // Idle.
         let temp = tempfile::tempdir().unwrap();
         let profile = temp.path().join(".claude");
         let sessions_dir = profile.join("sessions");
@@ -3455,8 +4806,57 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
         assert_eq!(sessions.len(), 1);
         assert_eq!(
             sessions[0].status,
-            SessionStatus::Waiting,
-            "stale transcript + idle descendants must be Waiting regardless of lifetime cpu_pct",
+            SessionStatus::Idle,
+            "a terminal turn with idle descendants must be Idle regardless of lifetime cpu_pct",
+        );
+        assert_eq!(sessions[0].current_tasks, ["idle"]);
+        assert_eq!(sessions[0].pending_since_ms, 0);
+        assert_eq!(sessions[0].thinking_since_ms, 0);
+    }
+
+    #[test]
+    fn test_load_session_streaming_assistant_without_stop_reason_is_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 19_102;
+        let sid = "streaming-assistant";
+        let session_path = sessions_dir.join(format!("{pid}.json"));
+        write_session_file(&session_path, pid, sid, &cwd);
+        let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(
+            transcript_dir.join(format!("{sid}.jsonl")),
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"go"}}
+{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"partial"}]}}
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigDir::new(profile);
+        let process_info = make_proc_info(pid, "claude");
+        let session_paths = vec![(session_path, config.clone())];
+        let ctx = build_discovery_context(&session_paths, &process_info, 0);
+        let mut collector = ClaudeCollector::new();
+        let sessions = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+
+        assert_eq!(sessions[0].status, SessionStatus::Unknown);
+        assert_eq!(sessions[0].current_tasks, ["unknown"]);
+        assert_eq!(
+            sessions[0].status_evidence.authority,
+            StatusAuthority::Unavailable,
         );
     }
 
@@ -3570,6 +4970,705 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             sessions[0].status,
             SessionStatus::Executing,
             "pending tool_use must read as Executing even with idle descendants",
+        );
+        assert!(
+            !sessions[0].awaiting_input,
+            "a normal pending tool (Bash) must NOT be flagged as awaiting_input",
+        );
+    }
+
+    #[test]
+    fn test_load_session_incremental_tool_result_closes_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 9110;
+        let sid = "incremental-tool-result";
+        let session_path = sessions_dir.join(format!("{pid}.json"));
+        write_session_file(&session_path, pid, sid, &cwd);
+        let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join(format!("{sid}.jsonl"));
+        std::fs::write(
+            &transcript_path,
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Bash","id":"t1","input":{"command":"sleep 1"}}]}}
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigDir::new(profile.clone());
+        let process_info = make_proc_info(pid, "claude");
+        let session_paths = vec![(session_path, config.clone())];
+        let ctx = build_discovery_context(&session_paths, &process_info, 0);
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config];
+
+        let first = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+        assert_eq!(first[0].status, SessionStatus::Executing);
+        assert!(first[0].pending_since_ms > 0);
+
+        let mut transcript = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript_path)
+            .unwrap();
+        writeln!(
+            transcript,
+            r#"{{"type":"user","timestamp":"2026-03-28T15:00:06Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t1","content":"done"}}]}}}}"#,
+        )
+        .unwrap();
+        transcript.flush().unwrap();
+
+        let second = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+        assert_eq!(second[0].status, SessionStatus::Unknown);
+        assert_eq!(second[0].current_tasks, ["unknown"]);
+        assert_eq!(second[0].pending_since_ms, 0);
+        assert_eq!(second[0].thinking_since_ms, 0);
+        assert_eq!(
+            second[0].status_evidence.authority,
+            StatusAuthority::Unavailable,
+        );
+    }
+
+    #[test]
+    fn incremental_partial_tail_invalidates_cached_terminal_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 19_110;
+        let sid = "incremental-partial-tail";
+        let session_path = sessions_dir.join(format!("{pid}.json"));
+        write_session_file(&session_path, pid, sid, &cwd);
+        let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join(format!("{sid}.jsonl"));
+        std::fs::write(
+            &transcript_path,
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"done"}]}}
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigDir::new(profile);
+        let process_info = make_proc_info(pid, "claude");
+        let session_paths = vec![(session_path, config)];
+        let ctx = build_discovery_context(&session_paths, &process_info, 0);
+        let mut collector = ClaudeCollector::new();
+        let first = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+        assert_eq!(first[0].status, SessionStatus::Idle);
+
+        let mut transcript = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript_path)
+            .unwrap();
+        write!(transcript, r#"{{"type":"assistant""#).unwrap();
+        transcript.flush().unwrap();
+
+        let second = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+        assert_eq!(second[0].status, SessionStatus::Unknown);
+        assert_eq!(
+            second[0].status_evidence.authority,
+            StatusAuthority::Unavailable
+        );
+    }
+
+    #[test]
+    fn native_idle_remains_provider_idle_with_synthetic_only_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 19_111;
+        let sid = "native-idle-synthetic-only";
+        let session_path = sessions_dir.join(format!("{pid}.json"));
+        std::fs::write(
+            &session_path,
+            serde_json::json!({
+                "pid": pid,
+                "sessionId": sid,
+                "cwd": cwd.to_str().unwrap(),
+                "startedAt": 1_774_715_116_826u64,
+                "status": "idle",
+                // Deliberately older than the synthetic transcript records.
+                // Before the regression fix those records became competing
+                // explicit-Unknown evidence and hid this native idle state.
+                "statusUpdatedAt": 1u64,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(
+            transcript_dir.join(format!("{sid}.jsonl")),
+            concat!(
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}
+"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>"}}
+"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated</local-command-stdout>"}}
+"#,
+            ),
+        )
+        .unwrap();
+
+        let config = ConfigDir::new(profile);
+        let process_info = make_proc_info(pid, "claude");
+        let session_paths = vec![(session_path, config)];
+        let ctx = build_discovery_context(&session_paths, &process_info, 0);
+        let mut collector = ClaudeCollector::new();
+        let sessions = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Idle);
+        assert_eq!(
+            sessions[0].status_evidence.authority,
+            StatusAuthority::Provider
+        );
+        assert_eq!(
+            sessions[0].status_evidence.reason,
+            StatusReason::ProviderIdle
+        );
+    }
+
+    #[test]
+    fn test_load_session_native_idle_overrides_stale_active_signals() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 9111;
+        let child_pid = 9112;
+        let sid = "native-idle";
+        let session_path = sessions_dir.join(format!("{pid}.json"));
+        std::fs::write(
+            &session_path,
+            serde_json::json!({
+                "pid": pid,
+                "sessionId": sid,
+                "cwd": cwd.to_str().unwrap(),
+                "startedAt": 1774715116826u64,
+                "status": "idle",
+                "statusUpdatedAt": 1_774_715_200_000u64,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(
+            transcript_dir.join(format!("{sid}.jsonl")),
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Bash","id":"t1","input":{"command":"old"}}]}}
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigDir::new(profile.clone());
+        let mut process_info = make_proc_info(pid, "claude");
+        process_info.insert(
+            child_pid,
+            ProcInfo {
+                pid: child_pid,
+                ppid: pid,
+                rss_kb: 1024,
+                cpu_pct: 100.0,
+                command: "old-child".to_string(),
+            },
+        );
+        let children_map = HashMap::from([(pid, vec![child_pid])]);
+        let session_paths = vec![(session_path, config.clone())];
+        let ctx = build_discovery_context(&session_paths, &process_info, 0);
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config];
+        let sessions = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &children_map,
+            &HashMap::new(),
+            &ctx,
+        );
+
+        assert_eq!(sessions[0].status, SessionStatus::Idle);
+        assert_eq!(sessions[0].current_tasks, ["idle"]);
+        assert_eq!(sessions[0].pending_since_ms, 0);
+        assert!(!sessions[0].awaiting_input);
+        assert_eq!(
+            sessions[0].status_evidence.authority,
+            StatusAuthority::Provider
+        );
+        assert_eq!(
+            sessions[0].status_evidence.reason,
+            StatusReason::ProviderIdle
+        );
+    }
+
+    #[test]
+    fn test_load_session_tool_name_matching_is_exact() {
+        // A trailing, unanswered ExitPlanMode / AskUserQuestion tool_use means the
+        // agent is blocked on MY decision (plan approval / question) — not idle,
+        // and distinct from ordinary tool execution. awaiting_input must flag it.
+        for (tool, expected) in [
+            ("ExitPlanMode", true),
+            ("AskUserQuestion", true),
+            ("ExitPlanModeFoo", false),
+            ("AskUserQuestionnaire", false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let profile = temp.path().join(".claude");
+            let sessions_dir = profile.join("sessions");
+            let projects = profile.join("projects");
+            let cwd = temp.path().join("repo");
+            std::fs::create_dir_all(&sessions_dir).unwrap();
+            std::fs::create_dir_all(&projects).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+
+            let pid = 9104;
+            let sid = "pending-decision";
+            let session_path = sessions_dir.join(format!("{}.json", pid));
+            write_session_file(&session_path, pid, sid, &cwd);
+
+            // Trailing assistant decision tool_use with no following tool_result.
+            let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+            std::fs::create_dir_all(&transcript_dir).unwrap();
+            let transcript = transcript_dir.join(format!("{}.jsonl", sid));
+            std::fs::write(
+                &transcript,
+                format!(
+                    r#"{{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{{"role":"user","content":"go"}}}}
+{{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"tool_use","name":"{}","id":"t1","input":{{}}}}]}}}}
+"#,
+                    tool
+                ),
+            )
+            .unwrap();
+
+            let config = ConfigDir::new(profile.clone());
+            let process_info = make_proc_info(pid, "claude");
+            let mut collector = ClaudeCollector::new();
+            collector.config_dirs = vec![config.clone()];
+
+            let session_paths = vec![(session_path, config)];
+            let ctx = build_discovery_context(&session_paths, &process_info, 0);
+            let sessions = collector.load_session_paths(
+                &session_paths,
+                &process_info,
+                &HashMap::new(),
+                &HashMap::new(),
+                &ctx,
+            );
+
+            let expected_status = if expected {
+                SessionStatus::Waiting
+            } else {
+                SessionStatus::Executing
+            };
+            assert_eq!(sessions.len(), 1, "{tool}");
+            assert_eq!(sessions[0].status, expected_status, "{tool}");
+            assert_eq!(sessions[0].awaiting_input, expected, "{tool}");
+            assert_eq!(
+                sessions[0].status_evidence.authority,
+                StatusAuthority::Provider,
+                "{tool}"
+            );
+            let expected_reason = match tool {
+                "ExitPlanMode" => StatusReason::ProviderWaitingApproval,
+                "AskUserQuestion" => StatusReason::ProviderWaitingUserInput,
+                _ => StatusReason::ProviderExecuting,
+            };
+            assert_eq!(
+                sessions[0].status_evidence.reason, expected_reason,
+                "{tool}"
+            );
+            if expected {
+                assert_eq!(sessions[0].current_tasks, ["waiting for user input"]);
+                assert_eq!(sessions[0].pending_since_ms, 0);
+            } else {
+                assert!(sessions[0].pending_since_ms > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_load_session_claude_waiting_status_is_awaiting_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 9105;
+        let sid = "claude-waiting";
+        // Session file carries Claude's own status:"waiting".
+        let session_path = sessions_dir.join(format!("{}.json", pid));
+        std::fs::write(
+            &session_path,
+            format!(
+                r#"{{"pid":{},"sessionId":"{}","cwd":"{}","startedAt":1774715116826,"status":"waiting","statusUpdatedAt":1774715200000}}"#,
+                pid,
+                sid,
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        // Transcript ends at a normal assistant end_turn — no pending/decision tool.
+        let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript = transcript_dir.join(format!("{}.jsonl", sid));
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}
+{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"done"}]}}
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigDir::new(profile.clone());
+        let process_info = make_proc_info(pid, "claude");
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config.clone()];
+
+        let session_paths = vec![(session_path, config)];
+        let ctx = build_discovery_context(&session_paths, &process_info, 0);
+        let sessions = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert!(
+            sessions[0].action_process_incarnation.is_none(),
+            "a synthetic PID without an exact live incarnation must not authorize actions"
+        );
+        assert_eq!(sessions[0].status, SessionStatus::Waiting);
+        assert!(
+            sessions[0].awaiting_input,
+            "Claude status:\"waiting\" must set awaiting_input even at a normal end_turn",
+        );
+        assert_eq!(sessions[0].current_tasks, ["waiting for user input"]);
+        assert_eq!(sessions[0].pending_since_ms, 0);
+        assert_eq!(sessions[0].thinking_since_ms, 0);
+        assert_eq!(
+            sessions[0].status_evidence.authority,
+            StatusAuthority::Provider
+        );
+        assert_eq!(
+            sessions[0].status_evidence.reason,
+            StatusReason::ProviderWaitingUserInput
+        );
+    }
+
+    #[test]
+    fn test_load_session_native_nonwaiting_statuses_and_fallback() {
+        for (native, expected_status, expected_task, authority, reason) in [
+            (
+                None,
+                SessionStatus::Unknown,
+                "unknown",
+                StatusAuthority::Unavailable,
+                StatusReason::Unavailable,
+            ),
+            (
+                Some("busy"),
+                SessionStatus::Thinking,
+                "thinking",
+                StatusAuthority::Provider,
+                StatusReason::ProviderThinking,
+            ),
+            (
+                Some("shell"),
+                SessionStatus::Executing,
+                "executing",
+                StatusAuthority::Provider,
+                StatusReason::ProviderExecuting,
+            ),
+            (
+                Some("idle"),
+                SessionStatus::Idle,
+                "idle",
+                StatusAuthority::Provider,
+                StatusReason::ProviderIdle,
+            ),
+            (
+                Some("unexpected"),
+                SessionStatus::Unknown,
+                "unknown",
+                StatusAuthority::Unavailable,
+                StatusReason::ProtocolUnknown,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let profile = temp.path().join(".claude");
+            let sessions_dir = profile.join("sessions");
+            let projects = profile.join("projects");
+            let cwd = temp.path().join("repo");
+            std::fs::create_dir_all(&sessions_dir).unwrap();
+            std::fs::create_dir_all(&projects).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+
+            let pid = 9106;
+            let sid = "nonwaiting-status";
+            let session_path = sessions_dir.join(format!("{}.json", pid));
+            let status_field = native.map_or(String::new(), |value| {
+                format!(r#","status":"{value}","statusUpdatedAt":1774715200000"#)
+            });
+            std::fs::write(
+                &session_path,
+                format!(
+                    r#"{{"pid":{pid},"sessionId":"{sid}","cwd":"{}","startedAt":1774715116826{status_field}}}"#,
+                    cwd.display()
+                ),
+            )
+            .unwrap();
+
+            let transcript_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+            std::fs::create_dir_all(&transcript_dir).unwrap();
+            std::fs::write(
+                transcript_dir.join(format!("{sid}.jsonl")),
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"done"}]}}
+"#,
+            )
+            .unwrap();
+
+            let config = ConfigDir::new(profile.clone());
+            let process_info = make_proc_info(pid, "claude");
+            let mut collector = ClaudeCollector::new();
+            collector.config_dirs = vec![config.clone()];
+            let session_paths = vec![(session_path, config)];
+            let ctx = build_discovery_context(&session_paths, &process_info, 0);
+            let sessions = collector.load_session_paths(
+                &session_paths,
+                &process_info,
+                &HashMap::new(),
+                &HashMap::new(),
+                &ctx,
+            );
+
+            assert_eq!(sessions.len(), 1, "{native:?}");
+            assert_eq!(sessions[0].status, expected_status, "{native:?}");
+            assert_eq!(sessions[0].current_tasks, [expected_task], "{native:?}");
+            assert!(!sessions[0].awaiting_input, "{native:?}");
+            assert_eq!(sessions[0].pending_since_ms, 0, "{native:?}");
+            assert_eq!(
+                sessions[0].status_evidence.authority, authority,
+                "{native:?}"
+            );
+            assert_eq!(sessions[0].status_evidence.reason, reason, "{native:?}");
+        }
+    }
+
+    fn load_parent_with_subagent(
+        subagent_transcript: &str,
+        subagent_mtime_offset_secs: i64,
+        native_status: Option<&str>,
+    ) -> AgentSession {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 19_104;
+        let sid = "subagent-lifecycle";
+        let session_path = sessions_dir.join(format!("{pid}.json"));
+        if let Some(native_status) = native_status {
+            std::fs::write(
+                &session_path,
+                serde_json::json!({
+                    "pid": pid,
+                    "sessionId": sid,
+                    "cwd": cwd,
+                    "startedAt": 1_774_715_116_826u64,
+                    "status": native_status,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        } else {
+            write_session_file(&session_path, pid, sid, &cwd);
+        }
+
+        let project_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join(format!("{sid}.jsonl")),
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"parent idle"}]}}
+"#,
+        )
+        .unwrap();
+
+        let subagents_dir = project_dir.join(sid).join("subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+        std::fs::write(
+            subagents_dir.join("agent-child.meta.json"),
+            r#"{"agentType":"general-purpose","description":"child"}"#,
+        )
+        .unwrap();
+        let child_path = subagents_dir.join("agent-child.jsonl");
+        std::fs::write(&child_path, subagent_transcript).unwrap();
+        set_mtime(&child_path, subagent_mtime_offset_secs);
+
+        let config = ConfigDir::new(profile);
+        let session_paths = vec![(session_path, config.clone())];
+        let process_info = make_proc_info(pid, "claude");
+        let ctx = build_discovery_context(&session_paths, &process_info, 0);
+        let mut collector = ClaudeCollector::new();
+        collector
+            .load_session_paths(
+                &session_paths,
+                &process_info,
+                &HashMap::new(),
+                &HashMap::new(),
+                &ctx,
+            )
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_old_exact_open_subagent_keeps_parent_executing() {
+        let session = load_parent_with_subagent(
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:06Z","message":{"model":"claude-sonnet-4-6","stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Bash","id":"t1","input":{"command":"sleep 999"}}]}}
+"#,
+            -3_600,
+            None,
+        );
+
+        assert_eq!(session.subagents[0].status, "working");
+        assert_eq!(session.status, SessionStatus::Executing);
+        assert_eq!(session.status_evidence.authority, StatusAuthority::Provider);
+        assert_eq!(
+            session.status_evidence.reason,
+            StatusReason::ProviderExecuting
+        );
+    }
+
+    #[test]
+    fn test_fresh_completed_subagent_does_not_force_parent_execution() {
+        let session = load_parent_with_subagent(
+            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:06Z","message":{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"done"}]}}
+"#,
+            0,
+            None,
+        );
+
+        assert_eq!(session.subagents[0].status, "done");
+        assert_eq!(session.status, SessionStatus::Idle);
+        assert_eq!(session.status_evidence.authority, StatusAuthority::Provider);
+        assert_eq!(session.status_evidence.reason, StatusReason::ProviderIdle);
+    }
+
+    #[test]
+    fn test_partial_subagent_tail_prevents_false_parent_idle() {
+        let session = load_parent_with_subagent(
+            concat!(
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:06Z","message":{"role":"user","content":"work"}}
+"#,
+                r#"{"type":"assistant""#,
+            ),
+            0,
+            None,
+        );
+
+        assert_eq!(session.subagents[0].status, "unknown");
+        assert_eq!(session.status, SessionStatus::Unknown);
+        assert_eq!(
+            session.status_evidence.authority,
+            StatusAuthority::Unavailable
+        );
+        assert_eq!(
+            session.status_evidence.reason,
+            StatusReason::ProtocolUnknown
+        );
+    }
+
+    #[test]
+    fn malformed_subagent_metadata_marks_collection_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("agent-child.meta.json"), "{broken").unwrap();
+
+        let collection = ClaudeCollector::collect_subagents(temp.path());
+
+        assert!(collection.agents.is_empty());
+        assert!(collection.incomplete);
+    }
+
+    #[test]
+    fn test_native_idle_parent_preserves_exact_async_subagent_execution() {
+        let session = load_parent_with_subagent(
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:06Z","message":{"role":"user","content":"work"}}
+"#,
+            -3_600,
+            Some("idle"),
+        );
+
+        assert_eq!(session.subagents[0].status, "working");
+        assert_eq!(session.status, SessionStatus::Executing);
+        assert_eq!(session.status_evidence.authority, StatusAuthority::Provider);
+        assert_eq!(
+            session.status_evidence.reason,
+            StatusReason::ProviderExecuting
         );
     }
 

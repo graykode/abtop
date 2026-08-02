@@ -1,5 +1,7 @@
 pub mod claude;
 pub mod codex;
+pub mod grok;
+pub mod kimi;
 pub mod mcp;
 pub mod opencode;
 pub mod process;
@@ -7,6 +9,8 @@ pub mod rate_limit;
 
 pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
+pub use grok::GrokCollector;
+pub use kimi::KimiCollector;
 pub use mcp::McpServer;
 pub use opencode::OpenCodeCollector;
 pub use rate_limit::read_rate_limits;
@@ -82,7 +86,9 @@ pub(crate) fn sanitize_terminal_text(s: &str) -> String {
         .collect()
 }
 
-use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
+use crate::model::{
+    AgentSession, OrphanPort, RateLimitInfo, SessionStatus, StatusAuthority, StatusReason,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
@@ -282,7 +288,7 @@ impl Drop for DesktopRolloutScanner {
     }
 }
 
-/// Aggregates sessions from multiple collectors (Claude, Codex, etc.)
+/// Aggregates sessions from all supported collectors.
 pub struct MultiCollector {
     collectors: Vec<Box<dyn AgentCollector>>,
     codex_enabled: bool,
@@ -334,6 +340,12 @@ impl MultiCollector {
         }
         if !is_hidden("opencode") {
             collectors.push(Box::new(OpenCodeCollector::new()));
+        }
+        if !is_hidden("grok") {
+            collectors.push(Box::new(GrokCollector::new()));
+        }
+        if !is_hidden("kimi") {
+            collectors.push(Box::new(KimiCollector::new()));
         }
         let codex_enabled = !is_hidden("codex");
         Self {
@@ -440,8 +452,19 @@ impl MultiCollector {
             }
         }
 
-        // Hide dead sessions: Codex uses pid==0 sentinel, Claude is filtered in collect().
-        all.retain(|s| !matches!(s.status, SessionStatus::Done));
+        // Keep only short-lived, source-qualified process-exit tombstones.
+        // Historical rollout files must not turn into persistent PID=0 rows.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        all.retain(|session| {
+            !matches!(session.status, SessionStatus::Done)
+                || (session.status_evidence.authority != StatusAuthority::Unavailable
+                    && session.status_evidence.reason == StatusReason::ProcessExited
+                    && session.status_evidence.observed_at_ms <= now_ms
+                    && now_ms - session.status_evidence.observed_at_ms <= 30_000)
+        });
         all.sort_by_key(|s| std::cmp::Reverse(s.started_at));
 
         // --- Orphan port detection ---
@@ -507,27 +530,35 @@ mod tests {
     #[test]
     fn with_hidden_empty_keeps_all_collectors() {
         let mc = MultiCollector::with_hidden(&[]);
-        assert_eq!(mc.collectors.len(), 3);
+        assert_eq!(mc.collectors.len(), 5);
     }
 
     #[test]
     fn with_hidden_codex_drops_codex_only() {
         let mc = MultiCollector::with_hidden(&["codex".to_string()]);
-        assert_eq!(mc.collectors.len(), 2);
+        assert_eq!(mc.collectors.len(), 4);
+    }
+
+    #[test]
+    fn with_hidden_new_providers_drops_each_provider_only() {
+        let mc = MultiCollector::with_hidden(&["grok".to_string()]);
+        assert_eq!(mc.collectors.len(), 4);
+        let mc = MultiCollector::with_hidden(&["kimi".to_string()]);
+        assert_eq!(mc.collectors.len(), 4);
     }
 
     #[test]
     fn with_hidden_is_case_insensitive() {
         let mc = MultiCollector::with_hidden(&["CODEX".to_string()]);
-        assert_eq!(mc.collectors.len(), 2);
+        assert_eq!(mc.collectors.len(), 4);
         let mc = MultiCollector::with_hidden(&["Claude".to_string()]);
-        assert_eq!(mc.collectors.len(), 2);
+        assert_eq!(mc.collectors.len(), 4);
     }
 
     #[test]
     fn with_hidden_unknown_names_are_ignored() {
         let mc = MultiCollector::with_hidden(&["kiro".to_string(), "gemini".to_string()]);
-        assert_eq!(mc.collectors.len(), 3);
+        assert_eq!(mc.collectors.len(), 5);
     }
 
     #[test]
@@ -536,6 +567,8 @@ mod tests {
             "claude".to_string(),
             "codex".to_string(),
             "opencode".to_string(),
+            "grok".to_string(),
+            "kimi".to_string(),
         ]);
         assert!(mc.collectors.is_empty());
     }
