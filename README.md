@@ -63,7 +63,10 @@ Mouse capture is off by default so terminal drag selection and copy keep working
 
 ### Terminal Jump
 
-Press `Enter` to focus the terminal running the selected agent. abtop supports cmux, tmux, and iTerm2 on macOS.
+Press `Enter` to focus the terminal running the selected agent. abtop supports
+Herdr 0.7.0 or newer, cmux, tmux, and iTerm2 on macOS. When abtop runs inside
+Herdr, it can jump to agents in any pane, tab, or workspace in the same Herdr
+session; no additional setup is required.
 
 ```bash
 tmux new -s work
@@ -72,6 +75,9 @@ tmux new -s work
 # pane 2: claude (project B)
 # → Enter on a session in abtop jumps to its pane
 ```
+
+The same flow works inside Herdr: run abtop in one pane, run agents elsewhere
+in the same session, then press `Enter` on the selected abtop row.
 
 ## Supported Agents
 

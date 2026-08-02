@@ -274,7 +274,7 @@ Tracks child processes that have open ports. When a parent session dies but the 
 | Key | Action |
 |-----|--------|
 | `↑`/`↓` or `k`/`j` | Select session in list |
-| `Enter` | Jump to session terminal (cmux / tmux / iTerm2) |
+| `Enter` | Jump to session terminal (Herdr / cmux / tmux / iTerm2) |
 | `x` | Kill selected session (SIGKILL) |
 | `X` | Kill all orphan ports |
 | `q` | Quit |
@@ -364,22 +364,27 @@ Each adapter returns a three-way `JumpAttempt`:
 - `Failed(msg)` — this backend owns the process but the focus command errored;
   stop and surface `"<backend>: <msg>"` in the status line.
 
-Order (most specific first), mutually exclusive by controlling tty:
+Order (most specific first):
 
-1. **cmux** (`jump/cmux.rs`) — reads `CMUX_WORKSPACE_ID` (a UUID cmux exports
+1. **Herdr** (`jump/herdr.rs`) — when abtop runs inside Herdr, validates the
+   selected agent PID against Herdr's pane process inventory and calls
+   `herdr agent focus`. The inherited pane ID is the fast path; `agent list`
+   recovers the current ID after a cross-workspace move. Only the same Herdr
+   session is searched.
+2. **cmux** (`jump/cmux.rs`) — reads `CMUX_WORKSPACE_ID` (a UUID cmux exports
    into every surface, inherited by the agent) from the process environment via
    `ps eww`, then `cmux select-workspace --workspace <uuid>`.
-2. **tmux** (`jump/tmux.rs`) — only when abtop itself runs inside tmux (`$TMUX`).
+3. **tmux** (`jump/tmux.rs`) — only when abtop itself runs inside tmux (`$TMUX`).
    Maps PID → pane via `tmux list-panes -a -F '#{pane_pid} #{session_name}:#{window_index}.#{pane_index}'`
    + process-tree descent, then `switch-client` / `select-window` / `select-pane`.
    PID in no pane → `NotApplicable` (lets another backend try).
-3. **iTerm2** (`jump/iterm2.rs`) — resolves the PID's controlling tty (`ps -o tty=`),
+4. **iTerm2** (`jump/iterm2.rs`) — resolves the PID's controlling tty (`ps -o tty=`),
    then AppleScript selects the session whose `tty` matches and brings its
    window/app to the front. First call triggers a one-time macOS Automation
    permission prompt; until granted, `osascript` exits non-zero → `Failed`.
 
-Parsing/registry logic is unit-tested in `jump/mod.rs`; the thin `ps`/`osascript`/
-`tmux` I/O wrappers are verified manually.
+Parsing/registry logic is unit-tested in `jump/mod.rs` and each backend; the
+thin CLI and platform I/O wrappers are also verified manually.
 
 ## Privacy
 
