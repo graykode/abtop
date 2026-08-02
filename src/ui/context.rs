@@ -151,9 +151,12 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
     let window_label = t("context.window");
 
     for session in &app.sessions {
+        let context_known = session.context_window > 0;
         let raw_pct = session.context_percent;
         let bar_pct = raw_pct.min(100.0);
-        let warn = if raw_pct >= 90.0 {
+        let warn = if !context_known {
+            ""
+        } else if raw_pct >= 90.0 {
             "⚠"
         } else if raw_pct >= 75.0 {
             "!"
@@ -178,7 +181,11 @@ fn draw_context_bars(f: &mut Frame, app: &App, area: Rect, cpu_grad: &[Color; 10
             Cell::from(Line::from({
                 let mut spans = meter_bar(bar_pct, bar_width, cpu_grad, theme.meter_bg);
                 spans.push(Span::styled(
-                    format!(" {:>3.0}%{}", raw_pct, warn),
+                    if context_known {
+                        format!(" {:>3.0}%{}", raw_pct, warn)
+                    } else {
+                        "    —".to_string()
+                    },
                     Style::default().fg(pct_color),
                 ));
                 spans

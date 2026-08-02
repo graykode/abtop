@@ -14,7 +14,8 @@ use crate::app::App;
 use crate::collector::mcp::ACTIVE_MTIME_SECS;
 use crate::host_info::{AgentAggregate, HostMetrics};
 use crate::model::{
-    ChatRole, ChildProcess, OrphanPort, RateLimitInfo, SessionStatus, MAX_CHAT_MESSAGES,
+    ChatRole, ChildProcess, OrphanPort, RateLimitInfo, SessionStatus, StatusEvidence,
+    MAX_CHAT_MESSAGES, MAX_VISIBLE_STATUS_OBSERVATIONS,
 };
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,7 +41,7 @@ pub struct Snapshot {
     pub interval_ms: u64,
     /// Live agent sessions, newest first (same order as the TUI).
     pub sessions: Vec<SessionView>,
-    /// Account-level rate limits (Claude, Codex, …).
+    /// Account-level rate limits. Currently populated for Claude and Codex.
     pub rate_limits: Vec<RateLimitInfo>,
     /// Ports left open by processes whose parent session has ended. Empty on a
     /// one-shot snapshot — orphan detection needs cross-tick history, so it
@@ -84,7 +85,7 @@ pub struct SubAgentView {
 /// A single session, flattened and curated for JSON consumers.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionView {
-    /// Owning CLI: "claude", "codex", "opencode".
+    /// Owning CLI: "claude", "codex", "opencode", "grok", or "kimi".
     pub agent_cli: &'static str,
     /// OS process id of the agent CLI for this session.
     pub pid: u32,
@@ -98,9 +99,13 @@ pub struct SessionView {
     pub config_root: String,
     /// Coarse activity state; serializes as its variant name (e.g. `"Thinking"`).
     pub status: SessionStatus,
+    /// Provenance, freshness, and the latest five content-free status samples.
+    pub status_evidence: StatusEvidence,
+    /// Whether the session is blocked on a response from the user.
+    pub awaiting_input: bool,
     /// Model identifier reported by the session (e.g. `"claude-opus-4-6"`).
     pub model: String,
-    /// Reasoning effort (Codex only); empty when N/A.
+    /// Reasoning effort reported by the provider; empty when unavailable.
     pub effort: String,
     /// Agent CLI version string, if known.
     pub version: String,
@@ -207,7 +212,9 @@ impl App {
                 project_name: s.project_name.clone(),
                 cwd: s.cwd.clone(),
                 config_root: s.config_root.clone(),
-                status: s.status.clone(),
+                status: s.status,
+                status_evidence: s.status_evidence.recent(MAX_VISIBLE_STATUS_OBSERVATIONS),
+                awaiting_input: s.is_awaiting_input(),
                 model: s.model.clone(),
                 effort: s.effort.clone(),
                 version: s.version.clone(),
@@ -226,7 +233,7 @@ impl App {
                 started_at_ms: s.started_at,
                 elapsed_secs: s.elapsed().as_secs(),
                 summary: self.session_summary(s),
-                current_task: s.current_tasks.last().cloned(),
+                current_task: s.display_task().map(str::to_owned),
                 children: s.children.clone(),
                 compaction_count: s.compaction_count,
                 token_history: tail(&s.token_history, 64),
@@ -328,8 +335,10 @@ mod tests {
             (SessionStatus::Thinking, "\"Thinking\""),
             (SessionStatus::Executing, "\"Executing\""),
             (SessionStatus::Waiting, "\"Waiting\""),
+            (SessionStatus::Idle, "\"Idle\""),
             (SessionStatus::Unknown, "\"Unknown\""),
             (SessionStatus::RateLimited, "\"RateLimited\""),
+            (SessionStatus::Error, "\"Error\""),
             (SessionStatus::Done, "\"Done\""),
         ] {
             assert_eq!(serde_json::to_string(&status).unwrap(), wire);
@@ -351,6 +360,20 @@ mod tests {
     #[test]
     fn to_snapshot_maps_fields_and_passes_interval_through() {
         let app = demo_app();
+        let awaiting_session_id = app
+            .sessions
+            .iter()
+            .find(|session| session.status == SessionStatus::Waiting)
+            .expect("demo includes an actionable wait")
+            .session_id
+            .clone();
+        let idle_session_id = app
+            .sessions
+            .iter()
+            .find(|session| session.status == SessionStatus::Idle)
+            .expect("demo includes an idle session")
+            .session_id
+            .clone();
         let snap = app.to_snapshot(1_234);
 
         assert_eq!(snap.interval_ms, 1_234);
@@ -363,11 +386,30 @@ mod tests {
             // Bounded tails.
             assert!(s.token_history.len() <= 64);
             assert!(s.tool_calls.len() <= 24);
+            assert!(s.status_evidence.observations.len() <= 5);
+            assert_eq!(
+                s.awaiting_input,
+                matches!(s.status, SessionStatus::Waiting),
+                "awaiting_input must be derived from status"
+            );
             // Chat roles map to the stable wire strings only.
             for m in &s.chat_messages {
                 assert!(m.role == "user" || m.role == "assistant");
             }
         }
+
+        assert!(snap
+            .sessions
+            .iter()
+            .find(|s| s.session_id == awaiting_session_id)
+            .is_some_and(
+                |s| s.awaiting_input && s.current_task.as_deref() == Some("waiting for user input")
+            ));
+        assert!(snap
+            .sessions
+            .iter()
+            .find(|s| s.session_id == idle_session_id)
+            .is_some_and(|s| !s.awaiting_input && s.current_task.as_deref() == Some("idle")));
     }
 
     #[test]
@@ -376,9 +418,68 @@ mod tests {
         let json = serde_json::to_string(&snap).expect("snapshot serializes");
         assert!(json.contains("\"sessions\""));
         assert!(json.contains("\"interval_ms\":2000"));
+        assert!(
+            !json.contains("action_process_incarnation"),
+            "private process anchors must never enter JSON snapshots"
+        );
         // Re-parse as generic JSON to confirm it is well-formed.
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert!(parsed["sessions"].is_array());
+        assert!(parsed["sessions"]
+            .as_array()
+            .is_some_and(|sessions| sessions
+                .iter()
+                .all(|session| session["awaiting_input"].is_boolean()
+                    && session["status_evidence"].is_object())));
+        let sessions = parsed["sessions"].as_array().expect("sessions array");
+        assert!(sessions.iter().any(|session| {
+            session["status"] == "Waiting" && session["awaiting_input"] == true
+        }));
+        assert!(sessions
+            .iter()
+            .any(|session| session["status"] == "Idle" && session["awaiting_input"] == false));
+    }
+
+    #[test]
+    fn snapshot_includes_only_the_latest_five_status_samples() {
+        use crate::model::{StatusAuthority, StatusObservation, StatusReason};
+
+        let mut app = demo_app();
+        let session = app.sessions.first_mut().expect("demo session");
+        session.status_evidence = StatusEvidence::default();
+        for observed_at_ms in 1..=8 {
+            session.status_evidence.observe(StatusObservation::new(
+                session.status,
+                StatusAuthority::Provider,
+                StatusReason::ProviderExecuting,
+                observed_at_ms,
+                1,
+            ));
+        }
+
+        let snapshot = app.to_snapshot(2_000);
+        let observations = &snapshot.sessions[0].status_evidence.observations;
+        assert_eq!(observations.len(), MAX_VISIBLE_STATUS_OBSERVATIONS);
+        assert_eq!(observations[0].observed_at_ms, 4);
+        assert_eq!(observations[4].observed_at_ms, 8);
+        assert_eq!(snapshot.sessions[0].status_evidence.consecutive_matching, 8);
+    }
+
+    #[test]
+    fn snapshot_unknown_task_cannot_reuse_a_stale_execution_label() {
+        let mut app = demo_app();
+        let session = app.sessions.first_mut().expect("demo session");
+        session.status = SessionStatus::Unknown;
+        session.current_tasks = vec!["Edit stale.rs".to_string()];
+
+        let snapshot = app.to_snapshot(2_000);
+
+        assert_eq!(snapshot.sessions[0].status, SessionStatus::Unknown);
+        assert!(!snapshot.sessions[0].awaiting_input);
+        assert_eq!(
+            snapshot.sessions[0].current_task.as_deref(),
+            Some("status evidence unavailable")
+        );
     }
 
     #[test]

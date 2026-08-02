@@ -1,4 +1,5 @@
-Output demo.gif
+Output assets/demo.gif
+Output assets/demo.mp4
 
 Set Shell "bash"
 Set FontSize 24
@@ -9,29 +10,25 @@ Set Theme "Catppuccin Mocha"
 Set Framerate 30
 
 Hide
-Type "../target/debug/abtop --demo"
+Type "unset NO_COLOR; ./target/release/abtop --demo"
 Enter
 Sleep 1s
 Show
 
-# Initial state: session 1 selected. Timeline shows the live WebSearch row
-# animating — a tool that's currently running.
+# Initial state: session 1 selected with its chat and lifecycle evidence visible.
 Sleep 3s
 
-# Navigate down — session 2 has no tool calls, so the timeline slot is empty;
-# session 3 repopulates it and also shows a live "Think" row (the model is
-# generating its next reply, no tool_use yet).
+# Navigate through the demo sessions to show provider and status differences.
 Type "j"
 Sleep 1.2s
 Type "j"
 Sleep 3.5s
 
-# Press L to enter focus mode — detail area grows and the timeline takes the
-# full width, so the Think row is easy to see growing.
+# Press L to replace chat with the selected session's tool timeline.
 Type "l"
 Sleep 4s
 
-# Press L again to return to the default side-by-side layout.
+# Press L again to return to chat.
 Type "l"
 Sleep 1.5s
 
