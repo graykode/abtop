@@ -138,6 +138,7 @@ pub(crate) fn draw_sessions_panel_active(
         let (status_icon_str, status_color) = match &session.status {
             crate::model::SessionStatus::Thinking => (t("sess.think"), theme.proc_misc),
             crate::model::SessionStatus::Executing => (t("sess.exec"), theme.hi_fg),
+            crate::model::SessionStatus::Working => (t("sess.work"), theme.proc_misc),
             crate::model::SessionStatus::Waiting => (t("sess.wait"), grad_at(&proc_grad, 50.0)),
             crate::model::SessionStatus::Idle => (t("sess.idle"), theme.inactive_fg),
             crate::model::SessionStatus::Unknown => (t("sess.unknown"), theme.inactive_fg),
@@ -991,6 +992,7 @@ fn status_evidence_text(session: &AgentSession) -> String {
         .map(|sample| match sample.status {
             SessionStatus::Thinking => "Think",
             SessionStatus::Executing => "Exec",
+            SessionStatus::Working => "Work",
             SessionStatus::Waiting => "Wait",
             SessionStatus::Idle => "Idle",
             SessionStatus::Unknown => "Unknown",
@@ -1444,12 +1446,51 @@ mod tests {
     }
 
     #[test]
+    fn working_row_renders_generic_status_and_task_labels() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut session = test_session("work1111", "work-project");
+        session.status = SessionStatus::Working;
+        session.current_tasks = vec!["Edit stale-working.rs".into()];
+        app.sessions = vec![session];
+
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_sessions_panel(
+                    f,
+                    &app,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 120,
+                        height: 12,
+                    },
+                    &app.theme,
+                )
+            })
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains(&t("sess.work")),
+            "work status missing\n{text}"
+        );
+        assert!(text.contains("└─ working"), "work task missing\n{text}");
+        assert!(
+            !text.contains("Edit stale-working.rs"),
+            "stale work task leaked\n{text}"
+        );
+    }
+
+    #[test]
     fn timeline_animates_only_active_statuses() {
         let mut session = test_session("timeline", "project");
         session.pending_since_ms = 10;
         session.thinking_since_ms = 10;
 
         for status in [
+            SessionStatus::Working,
             SessionStatus::Waiting,
             SessionStatus::Idle,
             SessionStatus::Unknown,
@@ -1494,6 +1535,23 @@ mod tests {
         assert!(text.contains("generation 2"), "{text}");
         assert!(text.contains("[Idle Idle Idle Idle Idle]"), "{text}");
         assert!(text.contains("7 matching"), "{text}");
+    }
+
+    #[test]
+    fn working_status_uses_generic_history_name() {
+        use crate::model::{StatusAuthority, StatusObservation, StatusReason};
+
+        let mut session = test_session("working", "project");
+        session.status = SessionStatus::Working;
+        session.status_evidence.observe(StatusObservation::new(
+            SessionStatus::Working,
+            StatusAuthority::Heuristic,
+            StatusReason::HerdrWorkingUnrefined,
+            1,
+            0,
+        ));
+
+        assert!(status_evidence_text(&session).contains("[Work]"));
     }
 
     #[test]

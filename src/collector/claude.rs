@@ -1133,6 +1133,7 @@ impl ClaudeCollector {
             SessionStatus::Waiting => vec!["waiting for user input".to_string()],
             SessionStatus::Executing if pending_tool => vec![current_task],
             SessionStatus::Executing => vec!["executing".to_string()],
+            SessionStatus::Working => vec!["working".to_string()],
             SessionStatus::Thinking => vec!["thinking".to_string()],
             SessionStatus::Idle => vec!["idle".to_string()],
             SessionStatus::Unknown => vec!["unknown".to_string()],

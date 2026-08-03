@@ -1,6 +1,8 @@
 pub mod claude;
 pub mod codex;
+pub(crate) mod codexbar;
 pub mod grok;
+mod herdr;
 pub mod kimi;
 pub mod mcp;
 pub mod opencode;

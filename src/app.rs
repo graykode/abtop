@@ -1,8 +1,12 @@
+use crate::collector::codexbar::{
+    canonical_provider_id, CodexBarProviderSnapshot, CodexBarQuotaPoller, CodexBarQuotaStatus,
+    CodexBarSnapshot,
+};
 use crate::collector::{read_rate_limits, McpServer, MultiCollector};
 use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
 use crate::model::{
-    AgentSession, OrphanPort, RateLimitInfo, SessionStatus, StatusAuthority, StatusEvidence,
-    StatusObservation, StatusReason, MAX_STATUS_OBSERVATIONS,
+    AgentSession, OrphanPort, RateLimitInfo, RateLimitProvenance, RateLimitWindow, SessionStatus,
+    StatusAuthority, StatusEvidence, StatusObservation, StatusReason, MAX_STATUS_OBSERVATIONS,
 };
 use crate::theme::Theme;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -16,6 +20,457 @@ const GRAPH_HISTORY_LEN: usize = 200;
 const MAX_SUMMARY_JOBS: usize = 3;
 /// Max summary attempts per session before giving up.
 const MAX_SUMMARY_RETRIES: u32 = 2;
+/// Native quota samples at or below this age take precedence over CodexBar.
+const QUOTA_FRESH_SECS: u64 = 600;
+
+#[derive(Clone)]
+struct QuotaWindowCandidate {
+    window: RateLimitWindow,
+    updated_at: Option<u64>,
+    force_stale: bool,
+}
+
+#[derive(Default)]
+struct ProviderQuotaCandidates {
+    native: Vec<QuotaWindowCandidate>,
+    codexbar: Vec<QuotaWindowCandidate>,
+    codexbar_failed: bool,
+}
+
+/// Merge native quota samples with one atomic CodexBar snapshot.
+///
+/// Matching fresh native windows win, while CodexBar contributes missing and
+/// provider-specific windows. When neither matching sample is fresh, the newer
+/// timestamp wins. Each provider keeps one whole newest valid native sample so
+/// separate accounts can never be folded into a fictional quota; ties and
+/// unknown timestamps preserve discovery order. Provider failures suppress only
+/// that provider's CodexBar values and never hide a native sample.
+fn merge_rate_limits(
+    native: &[RateLimitInfo],
+    codexbar: Option<&CodexBarSnapshot>,
+    now_secs: u64,
+    codexbar_observed_at: Option<u64>,
+    codexbar_transport_stale: bool,
+) -> Vec<RateLimitInfo> {
+    let mut providers: HashMap<String, ProviderQuotaCandidates> = HashMap::new();
+
+    for info in native {
+        let Some(provider) = canonical_provider_id(&info.source) else {
+            continue;
+        };
+        let windows = normalized_native_windows(info);
+        if windows.is_empty() {
+            continue;
+        }
+        let entry = providers.entry(provider).or_default();
+        let updated_at = valid_sample_timestamp(info.updated_at, now_secs);
+        if entry
+            .native
+            .first()
+            .is_some_and(|selected| !sample_is_newer(updated_at, selected.updated_at))
+        {
+            continue;
+        }
+        entry.native = windows
+            .into_iter()
+            .map(|window| QuotaWindowCandidate {
+                window,
+                updated_at,
+                force_stale: false,
+            })
+            .collect();
+    }
+
+    if let Some(snapshot) = codexbar {
+        for provider_snapshot in &snapshot.providers {
+            let Some(provider) = canonical_provider_id(&provider_snapshot.provider) else {
+                continue;
+            };
+            let entry = providers.entry(provider).or_default();
+            if provider_snapshot.error.is_some() {
+                entry.codexbar.clear();
+                entry.codexbar_failed = true;
+                continue;
+            }
+            if entry.codexbar_failed {
+                continue;
+            }
+            for window in &provider_snapshot.windows {
+                let Some(window) = RateLimitWindow::try_new(
+                    window.id.clone(),
+                    window.label.clone(),
+                    window.used_pct,
+                    window.resets_at,
+                    window.window_minutes,
+                    RateLimitProvenance::CodexBar,
+                ) else {
+                    continue;
+                };
+                upsert_candidate(
+                    &mut entry.codexbar,
+                    QuotaWindowCandidate {
+                        window,
+                        updated_at: codexbar_sample_timestamp(
+                            provider_snapshot.updated_at,
+                            codexbar_observed_at,
+                            now_secs,
+                            codexbar_transport_stale,
+                        ),
+                        force_stale: codexbar_transport_stale,
+                    },
+                );
+            }
+        }
+    }
+
+    let mut merged = providers
+        .into_iter()
+        .filter_map(|(provider, candidates)| {
+            merge_provider_rate_limit(provider, candidates, now_secs)
+        })
+        .collect::<Vec<_>>();
+    merged.sort_by(|left, right| provider_cmp(&left.source, &right.source));
+    merged
+}
+
+fn normalized_native_windows(info: &RateLimitInfo) -> Vec<RateLimitWindow> {
+    let mut windows = Vec::with_capacity(info.windows.len().saturating_add(2));
+    for window in &info.windows {
+        if windows
+            .iter()
+            .any(|existing: &RateLimitWindow| existing.id.eq_ignore_ascii_case(&window.id))
+        {
+            continue;
+        }
+        if let Some(window) = RateLimitWindow::try_new(
+            window.id.clone(),
+            window.label.clone(),
+            window.used_pct,
+            window.resets_at,
+            window.window_minutes,
+            RateLimitProvenance::Native,
+        ) {
+            windows.push(window);
+        }
+    }
+
+    // Exact source-slot identities are authoritative. Legacy short/long fields
+    // are only a compatibility fallback; mixing both would duplicate cases
+    // such as a free-plan `primary` window projected into the historical long
+    // slot.
+    if !info.windows.is_empty() {
+        return windows;
+    }
+
+    if let Some(used_pct) = info.five_hour_pct {
+        if !windows
+            .iter()
+            .any(|window| window.id.eq_ignore_ascii_case("primary"))
+        {
+            if let Some(window) = RateLimitWindow::try_new(
+                "primary",
+                native_window_label(info.five_hour_window_minutes, "5h"),
+                used_pct,
+                info.five_hour_resets_at,
+                info.five_hour_window_minutes,
+                RateLimitProvenance::Native,
+            ) {
+                windows.push(window);
+            }
+        }
+    }
+    if let Some(used_pct) = info.seven_day_pct {
+        if !windows
+            .iter()
+            .any(|window| window.id.eq_ignore_ascii_case("secondary"))
+        {
+            if let Some(window) = RateLimitWindow::try_new(
+                "secondary",
+                native_window_label(info.seven_day_window_minutes, "7d"),
+                used_pct,
+                info.seven_day_resets_at,
+                info.seven_day_window_minutes,
+                RateLimitProvenance::Native,
+            ) {
+                windows.push(window);
+            }
+        }
+    }
+
+    windows
+}
+
+fn native_window_label(window_minutes: Option<u64>, fallback: &str) -> String {
+    match window_minutes {
+        None | Some(0) => fallback.to_string(),
+        Some(minutes) if minutes % (24 * 60) == 0 => format!("{}d", minutes / (24 * 60)),
+        Some(minutes) if minutes % 60 == 0 => format!("{}h", minutes / 60),
+        Some(minutes) => format!("{minutes}m"),
+    }
+}
+
+fn valid_sample_timestamp(updated_at: Option<u64>, now_secs: u64) -> Option<u64> {
+    updated_at.filter(|updated_at| *updated_at <= now_secs)
+}
+
+fn codexbar_sample_timestamp(
+    provider_updated_at: Option<u64>,
+    observed_at: Option<u64>,
+    now_secs: u64,
+    transport_stale: bool,
+) -> Option<u64> {
+    match provider_updated_at {
+        Some(updated_at) => valid_sample_timestamp(Some(updated_at), now_secs),
+        None if !transport_stale => valid_sample_timestamp(observed_at, now_secs),
+        None => None,
+    }
+}
+
+fn upsert_candidate(candidates: &mut Vec<QuotaWindowCandidate>, incoming: QuotaWindowCandidate) {
+    if let Some(existing) = candidates.iter_mut().find(|candidate| {
+        candidate
+            .window
+            .id
+            .eq_ignore_ascii_case(&incoming.window.id)
+    }) {
+        if sample_is_newer(incoming.updated_at, existing.updated_at) {
+            *existing = incoming;
+        }
+    } else {
+        candidates.push(incoming);
+    }
+}
+
+fn merge_provider_rate_limit(
+    provider: String,
+    candidates: ProviderQuotaCandidates,
+    now_secs: u64,
+) -> Option<RateLimitInfo> {
+    let mut selected = Vec::with_capacity(
+        candidates
+            .native
+            .len()
+            .saturating_add(candidates.codexbar.len()),
+    );
+
+    let mut codexbar_matched = vec![false; candidates.codexbar.len()];
+    let mut native_matches = vec![None; candidates.native.len()];
+
+    // Built-in slot positions can shift when a plan omits its short window.
+    // Pair exact semantic fingerprints first so a native weekly `primary`
+    // cannot consume CodexBar's unrelated 5h `primary` by name alone.
+    for (native_index, native) in candidates.native.iter().enumerate() {
+        if let Some(codexbar_index) = candidates
+            .codexbar
+            .iter()
+            .enumerate()
+            .find(|(index, codexbar)| {
+                !codexbar_matched[*index]
+                    && quota_windows_structurally_alias(&native.window, &codexbar.window)
+            })
+            .map(|(index, _)| index)
+        {
+            native_matches[native_index] = Some((codexbar_index, true));
+            codexbar_matched[codexbar_index] = true;
+        }
+    }
+
+    if !structural_mapping_has_unique_builtin_ids(
+        &candidates.native,
+        &candidates.codexbar,
+        &native_matches,
+        &codexbar_matched,
+    ) {
+        native_matches.fill(None);
+        codexbar_matched.fill(false);
+    }
+
+    // When exact reset metadata is unavailable or crosses a reset boundary,
+    // retain the stable source-owned ID as the conservative fallback.
+    for (native_index, native) in candidates.native.iter().enumerate() {
+        if native_matches[native_index].is_some() {
+            continue;
+        }
+        if let Some(codexbar_index) = candidates
+            .codexbar
+            .iter()
+            .enumerate()
+            .find(|(index, codexbar)| {
+                !codexbar_matched[*index]
+                    && native.window.id.eq_ignore_ascii_case(&codexbar.window.id)
+            })
+            .map(|(index, _)| index)
+        {
+            native_matches[native_index] = Some((codexbar_index, false));
+            codexbar_matched[codexbar_index] = true;
+        }
+    }
+
+    for (native_index, native) in candidates.native.iter().enumerate() {
+        let candidate = native_matches[native_index]
+            .map(|(index, structural)| {
+                let codexbar = &candidates.codexbar[index];
+                let mut selected = preferred_candidate(native, codexbar, now_secs).clone();
+                if structural {
+                    // CodexBar's built-in ID is the normalized combined-view
+                    // slot; the winning values and provenance remain native.
+                    selected.window.id.clone_from(&codexbar.window.id);
+                }
+                selected
+            })
+            .unwrap_or_else(|| native.clone());
+        selected.push(candidate);
+    }
+    for (index, codexbar) in candidates.codexbar.iter().enumerate() {
+        if !codexbar_matched[index] {
+            selected.push(codexbar.clone());
+        }
+    }
+
+    if selected.is_empty() {
+        return None;
+    }
+    selected.sort_by_key(|candidate| window_sort_rank(&candidate.window.id));
+    // A provider-level timestamp must describe every displayed window. The
+    // oldest selected sample is conservative; any unknown timestamp makes the
+    // combined provider timestamp unknown as well.
+    let updated_at = selected.iter().try_fold(u64::MAX, |oldest, candidate| {
+        if candidate.force_stale {
+            None
+        } else {
+            candidate
+                .updated_at
+                .map(|updated_at| oldest.min(updated_at))
+        }
+    });
+    let windows = selected
+        .into_iter()
+        .map(|candidate| candidate.window)
+        .collect::<Vec<_>>();
+    let primary = windows
+        .iter()
+        .find(|window| window.id.eq_ignore_ascii_case("primary"));
+    let secondary = windows
+        .iter()
+        .find(|window| window.id.eq_ignore_ascii_case("secondary"));
+
+    Some(RateLimitInfo {
+        source: provider,
+        five_hour_pct: primary.map(|window| window.used_pct),
+        five_hour_resets_at: primary.and_then(|window| window.resets_at),
+        five_hour_window_minutes: primary.and_then(|window| window.window_minutes),
+        seven_day_pct: secondary.map(|window| window.used_pct),
+        seven_day_resets_at: secondary.and_then(|window| window.resets_at),
+        seven_day_window_minutes: secondary.and_then(|window| window.window_minutes),
+        updated_at,
+        windows,
+    })
+}
+
+fn structural_mapping_has_unique_builtin_ids(
+    native: &[QuotaWindowCandidate],
+    codexbar: &[QuotaWindowCandidate],
+    native_matches: &[Option<(usize, bool)>],
+    codexbar_matched: &[bool],
+) -> bool {
+    let mut ids = HashSet::new();
+    for (index, native) in native.iter().enumerate() {
+        let id = native_matches[index]
+            .filter(|(_, structural)| *structural)
+            .map(|(codexbar_index, _)| codexbar[codexbar_index].window.id.as_str())
+            .unwrap_or(native.window.id.as_str());
+        if is_builtin_quota_slot(id) && !ids.insert(id.to_ascii_lowercase()) {
+            return false;
+        }
+    }
+    for (index, candidate) in codexbar.iter().enumerate() {
+        if !codexbar_matched[index]
+            && is_builtin_quota_slot(&candidate.window.id)
+            && !ids.insert(candidate.window.id.to_ascii_lowercase())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn quota_windows_structurally_alias(left: &RateLimitWindow, right: &RateLimitWindow) -> bool {
+    // A provider can expose a long-only plan window in its native `primary`
+    // slot while CodexBar normalizes the same standard window to `secondary`.
+    // Treat only an exact built-in fingerprint as an alias; provider-specific
+    // extra windows remain distinct even when they share a duration.
+    is_builtin_quota_slot(&left.id)
+        && is_builtin_quota_slot(&right.id)
+        && left.window_minutes.is_some()
+        && left.window_minutes == right.window_minutes
+        && left.resets_at.is_some()
+        && left.resets_at == right.resets_at
+}
+
+fn is_builtin_quota_slot(id: &str) -> bool {
+    ["primary", "secondary", "tertiary"]
+        .iter()
+        .any(|slot| id.eq_ignore_ascii_case(slot))
+}
+
+fn preferred_candidate<'a>(
+    native: &'a QuotaWindowCandidate,
+    codexbar: &'a QuotaWindowCandidate,
+    now_secs: u64,
+) -> &'a QuotaWindowCandidate {
+    if candidate_is_fresh(native, now_secs) {
+        native
+    } else if candidate_is_fresh(codexbar, now_secs)
+        || sample_is_newer(codexbar.updated_at, native.updated_at)
+    {
+        codexbar
+    } else {
+        native
+    }
+}
+
+fn candidate_is_fresh(candidate: &QuotaWindowCandidate, now_secs: u64) -> bool {
+    !candidate.force_stale
+        && candidate
+            .updated_at
+            .is_some_and(|updated_at| now_secs.saturating_sub(updated_at) <= QUOTA_FRESH_SECS)
+}
+
+fn sample_is_newer(candidate: Option<u64>, current: Option<u64>) -> bool {
+    match (candidate, current) {
+        (Some(candidate), Some(current)) => candidate > current,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+fn provider_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    provider_sort_rank(left)
+        .cmp(&provider_sort_rank(right))
+        .then_with(|| left.cmp(right))
+}
+
+fn provider_sort_rank(provider: &str) -> u8 {
+    match provider {
+        "claude" => 0,
+        "codex" => 1,
+        "grok" => 2,
+        "kimi" => 3,
+        _ => 4,
+    }
+}
+
+fn window_sort_rank(window_id: &str) -> u8 {
+    if window_id.eq_ignore_ascii_case("primary") {
+        0
+    } else if window_id.eq_ignore_ascii_case("secondary") {
+        1
+    } else if window_id.eq_ignore_ascii_case("tertiary") {
+        2
+    } else {
+        3
+    }
+}
 
 /// Cross-poll identity for status evidence. The opaque incarnation marker is
 /// only valid together with its PID, so both are part of the key.
@@ -158,8 +613,10 @@ pub struct App {
     pub should_quit: bool,
     /// Token rate per tick (delta). Ring buffer for the braille graph.
     pub token_rates: VecDeque<f64>,
-    /// Account-level rate limits (currently Claude and Codex only).
+    /// Account-level rate limits from native sources and enabled CodexBar providers.
     pub rate_limits: Vec<RateLimitInfo>,
+    /// Native provider quota before the optional CodexBar data is merged.
+    native_rate_limits: Vec<RateLimitInfo>,
     /// Per-session previous token totals, keyed by (agent_cli, session_id).
     prev_tokens: HashMap<(String, String), u64>,
     /// Cross-poll status ledger keyed by exact logical and process identity.
@@ -168,6 +625,9 @@ pub struct App {
     status_evidence_ledger: HashMap<StatusEvidenceKey, StatusEvidence>,
     /// Rate limit poll counter (read every 5 ticks = 10s)
     rate_limit_counter: u32,
+    codexbar_quota_poller: CodexBarQuotaPoller,
+    codexbar_quota_status: CodexBarQuotaStatus,
+    codexbar_provider_snapshots: Vec<CodexBarProviderSnapshot>,
     collector: MultiCollector,
     /// Cached LLM-generated summaries, keyed by session_id.
     pub summaries: HashMap<String, String>,
@@ -193,6 +653,7 @@ pub struct App {
     pub show_ports: bool,
     pub show_sessions: bool,
     pub show_mcp: bool,
+    pub codexbar_quota_fallback: bool,
     pub narrow_tab: NarrowTab,
     pub active_narrow_section: Option<NarrowSection>,
     pub maximized_narrow_section: Option<NarrowSection>,
@@ -239,20 +700,42 @@ impl App {
         panels: crate::config::PanelVisibility,
         claude_config_dirs: &[PathBuf],
     ) -> Self {
+        Self::new_with_config_and_claude_dirs_and_codexbar(
+            theme,
+            hidden_agents,
+            panels,
+            claude_config_dirs,
+            false,
+        )
+    }
+
+    pub fn new_with_config_and_claude_dirs_and_codexbar(
+        theme: Theme,
+        hidden_agents: &[String],
+        panels: crate::config::PanelVisibility,
+        claude_config_dirs: &[PathBuf],
+        codexbar_quota_fallback: bool,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let summaries = load_summary_cache();
         let mut collector =
             MultiCollector::with_hidden_and_claude_config_dirs(hidden_agents, claude_config_dirs);
         collector.set_mcp_suppress(true);
+        let codexbar_quota_poller = CodexBarQuotaPoller::new(codexbar_quota_fallback);
+        let codexbar_quota_status = codexbar_quota_poller.status();
         Self {
             sessions: Vec::new(),
             selected: 0,
             should_quit: false,
             token_rates: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
             rate_limits: Vec::new(),
+            native_rate_limits: Vec::new(),
             prev_tokens: HashMap::new(),
             status_evidence_ledger: HashMap::new(),
             rate_limit_counter: 5,
+            codexbar_quota_poller,
+            codexbar_quota_status,
+            codexbar_provider_snapshots: Vec::new(),
             collector,
             summaries,
             pending_summaries: HashSet::new(),
@@ -270,6 +753,7 @@ impl App {
             show_ports: panels.ports,
             show_sessions: panels.sessions,
             show_mcp: panels.mcp,
+            codexbar_quota_fallback,
             narrow_tab: NarrowTab::Work,
             active_narrow_section: Some(NarrowSection::Sessions),
             maximized_narrow_section: None,
@@ -361,7 +845,7 @@ impl App {
     }
 
     pub fn config_item_count(&self) -> usize {
-        8 // theme + 7 panel toggles
+        9 // theme + 7 panel toggles + CodexBar quota fallback
     }
 
     pub fn config_select_next(&mut self) {
@@ -387,10 +871,26 @@ impl App {
             5 => self.show_ports = !self.show_ports,
             6 => self.show_sessions = !self.show_sessions,
             7 => self.show_mcp = !self.show_mcp,
+            8 => {
+                self.toggle_codexbar_quota_fallback();
+                return;
+            }
             _ => return,
         }
         self.persist_panel_visibility();
         self.clamp_narrow_tab();
+    }
+
+    fn toggle_codexbar_quota_fallback(&mut self) {
+        self.codexbar_quota_fallback = !self.codexbar_quota_fallback;
+        self.codexbar_quota_poller
+            .set_enabled(self.codexbar_quota_fallback);
+        self.refresh_codexbar_quota();
+        if let Err(error) =
+            crate::config::save_codexbar_quota_fallback(self.codexbar_quota_fallback)
+        {
+            self.set_status(format!("CodexBar quota setting save failed: {error}"));
+        }
     }
 
     pub fn narrow_tab_visible(&self, tab: NarrowTab) -> bool {
@@ -577,7 +1077,9 @@ impl App {
     /// `tick` additionally calls [`App::drain_and_retry_summaries`], which
     /// shells out to `claude --print` to generate session titles. Headless
     /// consumers (e.g. the web snapshot API) call this variant so they never
-    /// spawn subprocesses or consume the user's Claude quota.
+    /// invoke that summary path or consume the user's Claude quota. When the
+    /// explicit CodexBar fallback is enabled, this variant may still start its
+    /// bounded Codex CLI quota subprocess.
     pub fn tick_no_summaries(&mut self) {
         self.collector.set_mcp_suppress(self.mcp_suppress_sessions);
         let mut sessions = self.collector.collect();
@@ -618,18 +1120,67 @@ impl App {
         }
 
         // Poll rate limits: first tick immediately, then every 5 ticks ≈ 10s
-        if self.rate_limits.is_empty() || self.rate_limit_counter >= 5 {
+        if self.native_rate_limits.is_empty() || self.rate_limit_counter >= 5 {
             self.rate_limit_counter = 0;
             let extra_dirs = self.collector.all_config_dirs();
-            self.rate_limits = read_rate_limits(&extra_dirs);
+            self.native_rate_limits = read_rate_limits(&extra_dirs);
             // Merge live rate limits from agent collectors (e.g. Codex JSONL parsing)
-            self.rate_limits.extend(self.collector.agent_rate_limits());
+            self.native_rate_limits
+                .extend(self.collector.agent_rate_limits());
         } else {
             self.rate_limit_counter += 1;
         }
+        self.refresh_codexbar_quota();
 
         // Quota percentages are display-only. A lifecycle can become
         // RateLimited only when the provider reports an active block.
+    }
+
+    /// Wait for the first enabled CodexBar quota poll without changing session
+    /// state. Used only by one-shot output modes; normal TUI ticks never block.
+    pub fn wait_for_initial_codexbar_quota(&mut self, timeout: std::time::Duration) {
+        self.refresh_codexbar_quota_with_wait(timeout);
+    }
+
+    pub(crate) fn codexbar_quota_status(&self) -> &CodexBarQuotaStatus {
+        &self.codexbar_quota_status
+    }
+
+    pub(crate) fn codexbar_provider_snapshots(&self) -> &[CodexBarProviderSnapshot] {
+        &self.codexbar_provider_snapshots
+    }
+
+    fn refresh_codexbar_quota(&mut self) {
+        self.refresh_codexbar_quota_with_wait(std::time::Duration::ZERO);
+    }
+
+    fn refresh_codexbar_quota_with_wait(&mut self, timeout: std::time::Duration) {
+        let codexbar = if timeout.is_zero() {
+            self.codexbar_quota_poller.update()
+        } else {
+            self.codexbar_quota_poller.wait_for_initial(timeout)
+        };
+        // One-shot modes may block here while CodexBar fetches providers. Take
+        // the merge clock only after that wait so timestamps produced by the
+        // completed poll are not misclassified as future data.
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.codexbar_quota_status = self.codexbar_quota_poller.status();
+        self.codexbar_provider_snapshots = codexbar
+            .as_ref()
+            .map(|snapshot| snapshot.providers.clone())
+            .unwrap_or_default();
+        self.codexbar_provider_snapshots
+            .sort_by(|left, right| provider_cmp(&left.provider, &right.provider));
+        self.rate_limits = merge_rate_limits(
+            &self.native_rate_limits,
+            codexbar.as_ref(),
+            now_secs,
+            self.codexbar_quota_status.last_checked_at,
+            self.codexbar_quota_status.error.is_some(),
+        );
     }
 
     /// Drain completed summary results and spawn retries. Does NOT recollect
@@ -923,10 +1474,22 @@ impl App {
     /// terminal, so PID reuse cannot redirect the action. No-op when nothing is
     /// selected or no backend recognizes the process.
     pub fn jump_to_session(&mut self) -> JumpOutcome {
+        self.jump_to_session_with(crate::jump::run_herdr_session_jump, crate::jump::run_jump)
+    }
+
+    fn jump_to_session_with(
+        &mut self,
+        semantic_jump: impl FnOnce(&str, &str) -> JumpOutcome,
+        process_jump: impl FnOnce(u32) -> JumpOutcome,
+    ) -> JumpOutcome {
         if self.sessions.is_empty() {
             return JumpOutcome::NoOp;
         }
         let selected = &self.sessions[self.selected];
+        match semantic_jump(selected.agent_cli, &selected.session_id) {
+            JumpOutcome::NoOp => {}
+            outcome => return outcome,
+        }
         if !session_process_is_actionable(selected) {
             return JumpOutcome::NoOp;
         }
@@ -942,7 +1505,7 @@ impl App {
             ));
         }
         let target_pid = selected.pid;
-        crate::jump::run_jump(target_pid)
+        process_jump(target_pid)
     }
 
     /// Get the display summary for a session: LLM summary > "..." if pending > raw prompt > "—"
@@ -991,8 +1554,10 @@ impl App {
 /// ACP, or plugin hosts. Keep those heuristic rows visible while preventing
 /// kill and terminal-jump actions from targeting the wrong host process.
 fn session_process_is_actionable(session: &AgentSession) -> bool {
-    !matches!(session.status, SessionStatus::Unknown | SessionStatus::Done)
-        && session.pid > 0
+    !matches!(
+        session.status,
+        SessionStatus::Working | SessionStatus::Unknown | SessionStatus::Done
+    ) && session.pid > 0
         && session.action_process_incarnation.is_some()
         && session.status_evidence.authority != StatusAuthority::Unavailable
         && (session.agent_cli != "kimi"
@@ -1444,6 +2009,622 @@ fn kill_confirmation_message(provider: &str, pid: u32, name: &str, affected: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_quota(
+        provider: &str,
+        updated_at: u64,
+        primary_pct: Option<f64>,
+        secondary_pct: Option<f64>,
+    ) -> RateLimitInfo {
+        RateLimitInfo {
+            source: provider.to_string(),
+            five_hour_pct: primary_pct,
+            five_hour_resets_at: primary_pct.map(|_| updated_at + 300),
+            five_hour_window_minutes: primary_pct.map(|_| 300),
+            seven_day_pct: secondary_pct,
+            seven_day_resets_at: secondary_pct.map(|_| updated_at + 10_080),
+            seven_day_window_minutes: secondary_pct.map(|_| 10_080),
+            updated_at: Some(updated_at),
+            windows: Vec::new(),
+        }
+    }
+
+    fn codexbar_window(id: &str, used_pct: f64) -> crate::collector::codexbar::CodexBarWindow {
+        crate::collector::codexbar::CodexBarWindow {
+            id: id.to_string(),
+            label: id.to_string(),
+            used_pct,
+            resets_at: Some(20_000),
+            window_minutes: Some(300),
+        }
+    }
+
+    fn codexbar_provider(
+        provider: &str,
+        updated_at: u64,
+        windows: Vec<crate::collector::codexbar::CodexBarWindow>,
+    ) -> CodexBarProviderSnapshot {
+        CodexBarProviderSnapshot {
+            provider: provider.to_string(),
+            windows,
+            updated_at: Some(updated_at),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn quota_merge_keeps_fresh_native_overlaps_and_codexbar_only_windows() {
+        let now = 10_000;
+        let native = native_quota("codex", now - 10, Some(12.0), Some(34.0));
+        let snapshot = CodexBarSnapshot {
+            providers: vec![codexbar_provider(
+                "codex",
+                now,
+                vec![
+                    codexbar_window("primary", 91.0),
+                    codexbar_window("secondary", 92.0),
+                    codexbar_window("tertiary", 93.0),
+                    codexbar_window("codex-spark-weekly", 94.0),
+                ],
+            )],
+        };
+
+        let merged = merge_rate_limits(&[native], Some(&snapshot), now, None, false);
+        assert_eq!(merged.len(), 1);
+        let codex = &merged[0];
+        assert_eq!(codex.five_hour_pct, Some(12.0));
+        assert_eq!(codex.seven_day_pct, Some(34.0));
+        assert_eq!(codex.updated_at, Some(now - 10));
+        assert_eq!(codex.windows.len(), 4);
+        assert_eq!(
+            codex
+                .windows
+                .iter()
+                .map(|window| (window.id.as_str(), window.used_pct, window.provenance))
+                .collect::<Vec<_>>(),
+            vec![
+                ("primary", 12.0, RateLimitProvenance::Native),
+                ("secondary", 34.0, RateLimitProvenance::Native),
+                ("tertiary", 93.0, RateLimitProvenance::CodexBar),
+                ("codex-spark-weekly", 94.0, RateLimitProvenance::CodexBar,),
+            ]
+        );
+    }
+
+    #[test]
+    fn quota_merge_selects_the_newest_whole_native_provider_sample() {
+        let now = 10_000;
+        let first_account = native_quota("claude", now - 20, Some(11.0), None);
+        let second_account = native_quota("claude", now - 10, None, Some(92.0));
+
+        let merged = merge_rate_limits(&[first_account, second_account], None, now, None, false);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].five_hour_pct, None);
+        assert_eq!(merged[0].seven_day_pct, Some(92.0));
+        assert_eq!(merged[0].windows.len(), 1);
+        assert_eq!(merged[0].updated_at, Some(now - 10));
+    }
+
+    #[test]
+    fn quota_merge_preserves_discovery_order_for_equal_native_timestamps() {
+        let now = 10_000;
+        let first_account = native_quota("claude", now - 10, Some(11.0), None);
+        let second_account = native_quota("claude", now - 10, None, Some(92.0));
+
+        let merged = merge_rate_limits(&[first_account, second_account], None, now, None, false);
+
+        assert_eq!(merged[0].five_hour_pct, Some(11.0));
+        assert_eq!(merged[0].seven_day_pct, None);
+        assert_eq!(merged[0].windows.len(), 1);
+    }
+
+    #[test]
+    fn exact_native_primary_does_not_duplicate_its_legacy_long_projection() {
+        let now = 10_000;
+        let mut free_plan = native_quota("codex", now, None, Some(48.0));
+        free_plan.windows = vec![RateLimitWindow::try_new(
+            "primary",
+            "30d",
+            48.0,
+            Some(now + 43_200),
+            Some(43_200),
+            RateLimitProvenance::Native,
+        )
+        .unwrap()];
+
+        let merged = merge_rate_limits(&[free_plan], None, now, None, false);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].windows.len(), 1);
+        assert_eq!(merged[0].windows[0].id, "primary");
+        assert_eq!(merged[0].five_hour_pct, Some(48.0));
+        assert_eq!(merged[0].seven_day_pct, None);
+    }
+
+    #[test]
+    fn codex_shifted_builtin_slots_merge_by_exact_window_fingerprint() {
+        let now = 10_000;
+        let reset = 20_000;
+        let mut native = native_quota("codex", now - 10, None, None);
+        native.windows = vec![RateLimitWindow::try_new(
+            "primary",
+            "7d",
+            55.0,
+            Some(reset),
+            Some(10_080),
+            RateLimitProvenance::Native,
+        )
+        .unwrap()];
+        let mut shifted = codexbar_window("secondary", 56.0);
+        shifted.resets_at = Some(reset);
+        shifted.window_minutes = Some(10_080);
+        let snapshot = CodexBarSnapshot {
+            providers: vec![codexbar_provider("codex", now, vec![shifted])],
+        };
+
+        let merged = merge_rate_limits(
+            std::slice::from_ref(&native),
+            Some(&snapshot),
+            now,
+            None,
+            false,
+        );
+        assert_eq!(merged[0].windows.len(), 1);
+        assert_eq!(merged[0].windows[0].id, "secondary");
+        assert_eq!(merged[0].windows[0].used_pct, 55.0);
+        assert_eq!(merged[0].windows[0].provenance, RateLimitProvenance::Native);
+        assert_eq!(merged[0].five_hour_pct, None);
+        assert_eq!(merged[0].seven_day_pct, Some(55.0));
+
+        native.updated_at = Some(now - QUOTA_FRESH_SECS - 1);
+        let merged = merge_rate_limits(&[native], Some(&snapshot), now, None, false);
+        assert_eq!(merged[0].windows.len(), 1);
+        assert_eq!(merged[0].windows[0].id, "secondary");
+        assert_eq!(merged[0].windows[0].used_pct, 56.0);
+        assert_eq!(
+            merged[0].windows[0].provenance,
+            RateLimitProvenance::CodexBar
+        );
+    }
+
+    #[test]
+    fn structural_slot_matching_precedes_positional_id_fallback() {
+        let now = 10_000;
+        let mut native = native_quota("codex", now - 10, None, None);
+        native.windows = vec![RateLimitWindow::try_new(
+            "primary",
+            "7d",
+            55.0,
+            Some(30_000),
+            Some(10_080),
+            RateLimitProvenance::Native,
+        )
+        .unwrap()];
+        let mut five_hour = codexbar_window("primary", 12.0);
+        five_hour.resets_at = Some(20_000);
+        five_hour.window_minutes = Some(300);
+        let mut weekly = codexbar_window("secondary", 56.0);
+        weekly.resets_at = Some(30_000);
+        weekly.window_minutes = Some(10_080);
+        let snapshot = CodexBarSnapshot {
+            providers: vec![codexbar_provider("codex", now, vec![five_hour, weekly])],
+        };
+
+        let merged = merge_rate_limits(&[native], Some(&snapshot), now, None, false);
+        assert_eq!(merged[0].windows.len(), 2);
+        assert_eq!(
+            merged[0]
+                .windows
+                .iter()
+                .map(|window| { (window.id.as_str(), window.used_pct, window.provenance,) })
+                .collect::<Vec<_>>(),
+            vec![
+                ("primary", 12.0, RateLimitProvenance::CodexBar),
+                ("secondary", 55.0, RateLimitProvenance::Native),
+            ]
+        );
+        assert_eq!(merged[0].five_hour_pct, Some(12.0));
+        assert_eq!(merged[0].seven_day_pct, Some(55.0));
+    }
+
+    #[test]
+    fn structural_aliasing_never_collapses_custom_or_incomplete_windows() {
+        let now = 10_000;
+        let mut native = native_quota("codex", now, None, None);
+        native.windows = vec![
+            RateLimitWindow::try_new(
+                "primary",
+                "7d",
+                55.0,
+                Some(30_000),
+                Some(10_080),
+                RateLimitProvenance::Native,
+            )
+            .unwrap(),
+            RateLimitWindow::try_new(
+                "secondary",
+                "Unknown",
+                20.0,
+                None,
+                None,
+                RateLimitProvenance::Native,
+            )
+            .unwrap(),
+        ];
+        let mut custom = codexbar_window("scoped-weekly", 56.0);
+        custom.resets_at = Some(30_000);
+        custom.window_minutes = Some(10_080);
+        let mut different_reset = codexbar_window("tertiary", 57.0);
+        different_reset.resets_at = Some(30_001);
+        different_reset.window_minutes = Some(10_080);
+        let snapshot = CodexBarSnapshot {
+            providers: vec![codexbar_provider(
+                "codex",
+                now,
+                vec![custom, different_reset],
+            )],
+        };
+
+        let merged = merge_rate_limits(&[native], Some(&snapshot), now, None, false);
+        assert_eq!(merged[0].windows.len(), 4);
+
+        let mut incomplete_native = native_quota("codex", now, None, None);
+        incomplete_native.windows = vec![RateLimitWindow::try_new(
+            "primary",
+            "Primary",
+            20.0,
+            None,
+            None,
+            RateLimitProvenance::Native,
+        )
+        .unwrap()];
+        let mut incomplete_codexbar = codexbar_window("secondary", 21.0);
+        incomplete_codexbar.resets_at = None;
+        incomplete_codexbar.window_minutes = None;
+        let snapshot = CodexBarSnapshot {
+            providers: vec![codexbar_provider("codex", now, vec![incomplete_codexbar])],
+        };
+        let merged = merge_rate_limits(&[incomplete_native], Some(&snapshot), now, None, false);
+        assert_eq!(merged[0].windows.len(), 2);
+    }
+
+    #[test]
+    fn structural_alias_matches_are_consumed_one_to_one() {
+        let now = 10_000;
+        let mut native = native_quota("codex", now, None, None);
+        native.windows = ["primary", "secondary"]
+            .into_iter()
+            .map(|id| {
+                RateLimitWindow::try_new(
+                    id,
+                    id,
+                    10.0,
+                    Some(30_000),
+                    Some(10_080),
+                    RateLimitProvenance::Native,
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut codexbar = codexbar_window("tertiary", 99.0);
+        codexbar.resets_at = Some(30_000);
+        codexbar.window_minutes = Some(10_080);
+        let snapshot = CodexBarSnapshot {
+            providers: vec![codexbar_provider("codex", now, vec![codexbar])],
+        };
+
+        let merged = merge_rate_limits(&[native], Some(&snapshot), now, None, false);
+        assert_eq!(merged[0].windows.len(), 2);
+        assert_eq!(
+            merged[0]
+                .windows
+                .iter()
+                .filter(|window| window.used_pct == 99.0)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn ambiguous_structural_slot_mapping_falls_back_to_unique_ids() {
+        let now = 10_000;
+        let mut native = native_quota("codex", now, None, None);
+        native.windows = vec![
+            RateLimitWindow::try_new(
+                "primary",
+                "Weekly",
+                55.0,
+                Some(30_000),
+                Some(10_080),
+                RateLimitProvenance::Native,
+            )
+            .unwrap(),
+            RateLimitWindow::try_new(
+                "secondary",
+                "Other",
+                22.0,
+                Some(40_000),
+                Some(43_200),
+                RateLimitProvenance::Native,
+            )
+            .unwrap(),
+        ];
+        let mut shifted = codexbar_window("secondary", 56.0);
+        shifted.resets_at = Some(30_000);
+        shifted.window_minutes = Some(10_080);
+        let snapshot = CodexBarSnapshot {
+            providers: vec![codexbar_provider("codex", now, vec![shifted])],
+        };
+
+        let merged = merge_rate_limits(&[native], Some(&snapshot), now, None, false);
+        assert_eq!(merged[0].windows.len(), 2);
+        assert_eq!(
+            merged[0]
+                .windows
+                .iter()
+                .map(|window| (window.id.as_str(), window.used_pct))
+                .collect::<Vec<_>>(),
+            vec![("primary", 55.0), ("secondary", 22.0)]
+        );
+    }
+
+    #[test]
+    fn provider_timestamp_is_the_oldest_complete_selected_window_timestamp() {
+        let now = 10_000;
+        let stale_native = native_quota("codex", now - QUOTA_FRESH_SECS - 10, Some(12.0), None);
+        let fresh_extra = CodexBarSnapshot {
+            providers: vec![codexbar_provider(
+                "codex",
+                now,
+                vec![codexbar_window("codex-spark-weekly", 1.0)],
+            )],
+        };
+
+        let merged = merge_rate_limits(&[stale_native], Some(&fresh_extra), now, None, false);
+        assert_eq!(merged[0].updated_at, Some(now - QUOTA_FRESH_SECS - 10));
+
+        let mut unknown_native = native_quota("codex", now, Some(12.0), None);
+        unknown_native.updated_at = None;
+        let merged = merge_rate_limits(&[unknown_native], Some(&fresh_extra), now, None, false);
+        assert_eq!(merged[0].updated_at, None);
+    }
+
+    #[test]
+    fn future_native_timestamp_is_unavailable_for_merge_decisions() {
+        let now = 10_000;
+        let future_native = native_quota("codex", now + 3_600, Some(12.0), None);
+        let stale_codexbar = CodexBarSnapshot {
+            providers: vec![codexbar_provider(
+                "codex",
+                now - QUOTA_FRESH_SECS - 1,
+                vec![codexbar_window("primary", 91.0)],
+            )],
+        };
+
+        let merged = merge_rate_limits(
+            std::slice::from_ref(&future_native),
+            Some(&stale_codexbar),
+            now,
+            None,
+            false,
+        );
+        assert_eq!(merged[0].five_hour_pct, Some(91.0));
+        assert_eq!(
+            merged[0].windows[0].provenance,
+            RateLimitProvenance::CodexBar
+        );
+
+        let native_only = merge_rate_limits(&[future_native], None, now, None, false);
+        assert_eq!(native_only[0].updated_at, None);
+    }
+
+    #[test]
+    fn future_codexbar_timestamp_is_unavailable_for_merge_decisions() {
+        let now = 10_000;
+        let stale_native = native_quota("codex", now - QUOTA_FRESH_SECS - 1, Some(12.0), None);
+        let future_codexbar = CodexBarSnapshot {
+            providers: vec![codexbar_provider(
+                "codex",
+                now + 3_600,
+                vec![codexbar_window("primary", 91.0)],
+            )],
+        };
+
+        let merged = merge_rate_limits(
+            &[stale_native],
+            Some(&future_codexbar),
+            now,
+            Some(now),
+            false,
+        );
+        assert_eq!(merged[0].five_hour_pct, Some(12.0));
+        assert_eq!(merged[0].updated_at, Some(now - QUOTA_FRESH_SECS - 1));
+
+        let codexbar_only = merge_rate_limits(&[], Some(&future_codexbar), now, Some(now), false);
+        assert_eq!(codexbar_only[0].updated_at, None);
+    }
+
+    #[test]
+    fn successful_poll_observation_dates_codexbar_rows_without_provider_timestamp() {
+        let now = 10_000;
+        let stale_native = native_quota("grok", now - QUOTA_FRESH_SECS - 1, Some(12.0), None);
+        let mut provider = codexbar_provider("grok", now, vec![codexbar_window("primary", 91.0)]);
+        provider.updated_at = None;
+        let snapshot = CodexBarSnapshot {
+            providers: vec![provider],
+        };
+
+        let merged = merge_rate_limits(&[stale_native], Some(&snapshot), now, Some(now - 1), false);
+
+        assert_eq!(merged[0].five_hour_pct, Some(91.0));
+        assert_eq!(merged[0].updated_at, Some(now - 1));
+        assert_eq!(
+            merged[0].windows[0].provenance,
+            RateLimitProvenance::CodexBar
+        );
+    }
+
+    #[test]
+    fn transport_failed_codexbar_cache_is_immediately_stale() {
+        let now = 10_000;
+        let cached = CodexBarSnapshot {
+            providers: vec![codexbar_provider(
+                "grok",
+                now,
+                vec![codexbar_window("primary", 18.0)],
+            )],
+        };
+
+        let merged = merge_rate_limits(&[], Some(&cached), now, Some(now), true);
+
+        assert_eq!(merged[0].five_hour_pct, Some(18.0));
+        assert_eq!(
+            merged[0].windows[0].provenance,
+            RateLimitProvenance::CodexBar
+        );
+        assert_eq!(merged[0].updated_at, None);
+    }
+
+    #[test]
+    fn quota_merge_uses_fresh_codexbar_for_a_stale_native_overlap() {
+        let now = 10_000;
+        let native = native_quota("codex", now - QUOTA_FRESH_SECS - 1, Some(12.0), None);
+        let snapshot = CodexBarSnapshot {
+            providers: vec![codexbar_provider(
+                "codex",
+                now - 1,
+                vec![codexbar_window("primary", 91.0)],
+            )],
+        };
+
+        let merged = merge_rate_limits(&[native], Some(&snapshot), now, None, false);
+        assert_eq!(merged[0].five_hour_pct, Some(91.0));
+        assert_eq!(
+            merged[0].windows[0].provenance,
+            RateLimitProvenance::CodexBar
+        );
+    }
+
+    #[test]
+    fn quota_merge_uses_the_newer_sample_when_both_overlaps_are_stale() {
+        let now = 10_000;
+        let native = native_quota("codex", now - QUOTA_FRESH_SECS - 20, Some(12.0), None);
+        let snapshot = CodexBarSnapshot {
+            providers: vec![codexbar_provider(
+                "codex",
+                now - QUOTA_FRESH_SECS - 10,
+                vec![codexbar_window("primary", 91.0)],
+            )],
+        };
+
+        let merged = merge_rate_limits(&[native], Some(&snapshot), now, None, false);
+        assert_eq!(merged[0].five_hour_pct, Some(91.0));
+
+        let newer_native = native_quota("codex", now - QUOTA_FRESH_SECS - 5, Some(23.0), None);
+        let older_codexbar = CodexBarSnapshot {
+            providers: vec![codexbar_provider(
+                "codex",
+                now - QUOTA_FRESH_SECS - 15,
+                vec![codexbar_window("primary", 82.0)],
+            )],
+        };
+        let merged = merge_rate_limits(&[newer_native], Some(&older_codexbar), now, None, false);
+        assert_eq!(merged[0].five_hour_pct, Some(23.0));
+        assert_eq!(merged[0].windows[0].provenance, RateLimitProvenance::Native);
+    }
+
+    #[test]
+    fn codexbar_provider_error_does_not_hide_native_quota() {
+        let now = 10_000;
+        let snapshot = CodexBarSnapshot {
+            providers: vec![
+                CodexBarProviderSnapshot {
+                    provider: "codex".to_string(),
+                    windows: Vec::new(),
+                    updated_at: None,
+                    error: Some(crate::collector::codexbar::CodexBarProviderError::Unavailable),
+                },
+                CodexBarProviderSnapshot {
+                    provider: "kimi".to_string(),
+                    windows: Vec::new(),
+                    updated_at: None,
+                    error: Some(crate::collector::codexbar::CodexBarProviderError::Unavailable),
+                },
+            ],
+        };
+
+        let merged = merge_rate_limits(
+            &[native_quota("codex", now, Some(12.0), None)],
+            Some(&snapshot),
+            now,
+            None,
+            false,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source, "codex");
+        assert_eq!(merged[0].five_hour_pct, Some(12.0));
+    }
+
+    #[test]
+    fn quota_providers_have_a_stable_preferred_then_lexical_order() {
+        let now = 10_000;
+        let providers = ["zeta", "kimi", "grok", "codex", "claude", "alpha"]
+            .into_iter()
+            .map(|provider| codexbar_provider(provider, now, vec![codexbar_window("primary", 1.0)]))
+            .collect();
+        let merged =
+            merge_rate_limits(&[], Some(&CodexBarSnapshot { providers }), now, None, false);
+
+        assert_eq!(
+            merged
+                .iter()
+                .map(|rate_limit| rate_limit.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex", "grok", "kimi", "alpha", "zeta"]
+        );
+    }
+
+    #[test]
+    fn quota_provider_ids_are_strict_content_free_ascii_identifiers() {
+        assert_eq!(
+            canonical_provider_id("Claude-Code_1.2"),
+            Some("claude-code_1.2".into())
+        );
+        for invalid in [
+            "private@example.com",
+            " claude",
+            "claude ",
+            "claude\n",
+            "grok\u{202e}",
+        ] {
+            assert_eq!(canonical_provider_id(invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn session_visibility_does_not_disable_codexbar_quota() {
+        for hidden in [
+            vec!["codex".to_string()],
+            vec!["grok".to_string(), "kimi".to_string()],
+            vec!["codex".to_string(), "grok".to_string(), "kimi".to_string()],
+        ] {
+            let app = App::new_with_config_and_claude_dirs_and_codexbar(
+                Theme::default(),
+                &hidden,
+                crate::config::PanelVisibility::default(),
+                &[],
+                true,
+            );
+
+            assert!(app.codexbar_quota_fallback, "{hidden:?}");
+            assert_eq!(
+                app.codexbar_quota_status().state,
+                crate::collector::codexbar::CodexBarQuotaState::Unavailable,
+                "{hidden:?}"
+            );
+        }
+    }
 
     fn waiting_session(cli: &'static str) -> AgentSession {
         AgentSession {
@@ -2039,7 +3220,38 @@ mod tests {
     }
 
     #[test]
-    fn unknown_ownership_cannot_jump_to_a_process() {
+    fn exact_semantic_focus_precedes_the_non_actionable_status_guard() {
+        for (provider, status) in [
+            ("codex", SessionStatus::Working),
+            ("kimi", SessionStatus::Unknown),
+            ("kimi", SessionStatus::Done),
+        ] {
+            let mut app = App::new_with_config(
+                Theme::default(),
+                &[],
+                crate::config::PanelVisibility::default(),
+            );
+            let mut session = waiting_session(provider);
+            session.status = status;
+            session.session_id = "session-1".to_string();
+            app.sessions.push(session);
+
+            assert_eq!(
+                app.jump_to_session_with(
+                    |actual_provider, session_id| {
+                        assert_eq!(actual_provider, provider);
+                        assert_eq!(session_id, "session-1");
+                        JumpOutcome::Jumped
+                    },
+                    |_| panic!("PID fallback must not run after semantic focus")
+                ),
+                JumpOutcome::Jumped
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_row_without_semantic_identity_cannot_use_pid_fallback() {
         let mut app = App::new_with_config(
             Theme::default(),
             &[],
@@ -2049,7 +3261,22 @@ mod tests {
         session.status = SessionStatus::Unknown;
         app.sessions.push(session);
 
-        assert_eq!(app.jump_to_session(), JumpOutcome::NoOp);
+        assert_eq!(
+            app.jump_to_session_with(
+                |_, _| JumpOutcome::NoOp,
+                |_| panic!("non-actionable row must not reach PID fallback")
+            ),
+            JumpOutcome::NoOp
+        );
+    }
+
+    #[test]
+    fn working_row_is_never_pid_actionable() {
+        let mut session = waiting_session("codex");
+        session.status = SessionStatus::Working;
+        session.status_evidence.authority = StatusAuthority::Provider;
+
+        assert!(!session_process_is_actionable(&session));
     }
 
     #[test]
@@ -2064,7 +3291,10 @@ mod tests {
         app.sessions.push(session);
 
         assert!(matches!(
-            app.jump_to_session(),
+            app.jump_to_session_with(
+                |_, _| JumpOutcome::NoOp,
+                |_| panic!("failed process validation must stop before PID jump")
+            ),
             JumpOutcome::Failed(message)
                 if message == "PID 1 is no longer the selected agent process"
         ));

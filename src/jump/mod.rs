@@ -85,6 +85,17 @@ pub fn run_jump(pid: u32) -> JumpOutcome {
     resolve(&jumpers(), pid)
 }
 
+/// Try the exact Herdr-native session identity before any PID-based adapter.
+/// `NoOp` means Herdr had no exact reference and the caller may apply the
+/// existing process-action policy before falling back to [`run_jump`].
+pub(crate) fn run_herdr_session_jump(provider: &str, session_id: &str) -> JumpOutcome {
+    match herdr::try_session_jump(provider, session_id) {
+        JumpAttempt::NotApplicable => JumpOutcome::NoOp,
+        JumpAttempt::Jumped => JumpOutcome::Jumped,
+        JumpAttempt::Failed(message) => JumpOutcome::Failed(format!("herdr: {message}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared parsing helpers (pure — unit-tested below).
 // ---------------------------------------------------------------------------

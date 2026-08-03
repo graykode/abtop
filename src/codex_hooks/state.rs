@@ -24,11 +24,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const HOOK_STATE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_STATE_SAMPLES: usize = 128;
 const MAX_OPEN_ITEMS: usize = 256;
+const MAX_COMPLETED_ITEMS: usize = 256;
 const MAX_STATE_FILES: usize = 256;
 const MAX_FAULT_FILES: usize = 128;
+const MAX_FAULT_RECOVERY_FILES: usize = 512;
 const MAX_TEMP_FILES: usize = 8;
 const MAX_DIRECTORY_ENTRIES: usize = MAX_STATE_FILES + 16;
 const MAX_FAULT_DIRECTORY_ENTRIES: usize = MAX_FAULT_FILES + 8;
+const MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES: usize = MAX_FAULT_RECOVERY_FILES + MAX_TEMP_FILES + 8;
+const MAX_FAULT_COMPACTION_BATCH_FILES: usize = 64;
+const MAX_FAULT_COMPACTION_SCAN_ENTRIES: usize = MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES;
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_FAULT_BYTES: u64 = 32 * 1024;
 const MAX_ID_BYTES: usize = 512;
@@ -37,6 +42,7 @@ const STATE_DIR_NAME: &str = "states";
 const FAULT_DIR_NAME: &str = "faults";
 const FAULT_PREFIX: &str = "hook-";
 const FAULT_OVERFLOW_NAME: &str = "overflow.json";
+const FAULT_COMPACTION_TEMP_NAME: &str = ".tmp-6162746f70636f6d70616374696f6e31";
 const LAUNCH_FAULT_PREFIX: &str = "launch-";
 const LAUNCH_FAULT_SUFFIX: &str = ".pending";
 const LAUNCH_UNIQUE_SEPARATOR: &str = "-pending.";
@@ -208,6 +214,11 @@ pub struct HookSessionState {
     #[serde(default)]
     pub tool_opened_at_ms: BTreeMap<String, u64>,
     pub closed_tools: BTreeSet<String>,
+    /// Oldest-to-newest insertion order for the bounded root-tool replay
+    /// cache. Legacy schema-v1 states omit this metadata and are normalized
+    /// deterministically before the next fold.
+    #[serde(default)]
+    pub completed_tool_order: Vec<String>,
     /// Exact ordinary child-tool ownership. Child tools cannot be projected
     /// as execution because Codex does not attest their approval coverage.
     #[serde(default)]
@@ -216,6 +227,10 @@ pub struct HookSessionState {
     pub child_tool_opened_at_ms: BTreeMap<String, u64>,
     #[serde(default)]
     pub closed_child_tools: BTreeMap<String, String>,
+    /// Oldest-to-newest insertion order for the bounded child-tool replay
+    /// cache.
+    #[serde(default)]
+    pub completed_child_tool_order: Vec<String>,
     pub open_subagents: BTreeSet<String>,
     #[serde(default)]
     pub subagent_opened_at_ms: BTreeMap<String, u64>,
@@ -223,11 +238,23 @@ pub struct HookSessionState {
     pub provisional_stopped_subagents: BTreeSet<String>,
     #[serde(default)]
     pub subagent_stopped_at_ms: BTreeMap<String, u64>,
+    /// Replay cache reserved for descendants with independently proven exact
+    /// completion. `SubagentStop` itself is provisional and deliberately
+    /// remains in the open/provisional collections instead of entering this
+    /// cache.
     pub closed_subagents: BTreeSet<String>,
+    /// Oldest-to-newest insertion order for the bounded subagent replay
+    /// cache.
+    #[serde(default)]
+    pub completed_subagent_order: Vec<String>,
     pub open_questions: BTreeSet<String>,
     #[serde(default)]
     pub question_opened_at_ms: BTreeMap<String, u64>,
     pub closed_questions: BTreeSet<String>,
+    /// Oldest-to-newest insertion order for the bounded question replay
+    /// cache.
+    #[serde(default)]
+    pub completed_question_order: Vec<String>,
     #[serde(default)]
     pub question_agents: BTreeMap<String, String>,
     pub permission_ambiguity: bool,
@@ -239,6 +266,11 @@ pub struct HookSessionState {
     pub child_permission_observed_at_ms: BTreeMap<String, u64>,
     pub compaction_open: bool,
     pub sticky_fault: Option<StatusReason>,
+    /// At least one completed lifecycle ID was evicted from a replay cache.
+    /// This is audit metadata only; an unmatched later close still fails
+    /// closed through the normal event-gap path.
+    #[serde(default)]
+    pub completed_history_truncated: bool,
     #[serde(default)]
     pub completed_ingests: Vec<String>,
     pub samples: Vec<HookStateSample>,
@@ -298,8 +330,8 @@ impl HookSessionState {
             return HookProjection::Unknown(StatusReason::HookInteractionResolutionUnavailable);
         }
         if self.has_open_child_tools() {
-            // Codex 0.146 does not attest whether an ordinary child tool can
-            // surface an approval. Exact open-tool evidence therefore blocks
+            // The supported Codex hook contract does not attest whether an
+            // ordinary child tool can surface an approval. Exact open-tool evidence therefore blocks
             // the tool-free child-model projection and stays Unknown.
             return HookProjection::Unknown(StatusReason::HookToolOpen);
         }
@@ -332,8 +364,8 @@ impl HookSessionState {
             return HookRootProjection::ToolOpen(self.open_tools.keys().cloned().collect());
         }
         match self.last_root_event {
-            // Codex 0.146 queues every SessionStart source and runs the hook
-            // from inside the next turn, immediately before UserPromptSubmit.
+            // Supported Codex releases queue every SessionStart source and run
+            // the hook from inside the next turn, immediately before UserPromptSubmit.
             // It therefore proves a clean generation boundary, not Idle.
             Some(HookEventKind::SessionStart)
                 if self.session_start_source == Some(SessionStartSource::Compact)
@@ -385,17 +417,21 @@ impl HookSessionState {
             open_tools: BTreeMap::new(),
             tool_opened_at_ms: BTreeMap::new(),
             closed_tools: BTreeSet::new(),
+            completed_tool_order: Vec::new(),
             open_child_tools: BTreeMap::new(),
             child_tool_opened_at_ms: BTreeMap::new(),
             closed_child_tools: BTreeMap::new(),
+            completed_child_tool_order: Vec::new(),
             open_subagents: BTreeSet::new(),
             subagent_opened_at_ms: BTreeMap::new(),
             provisional_stopped_subagents: BTreeSet::new(),
             subagent_stopped_at_ms: BTreeMap::new(),
             closed_subagents: BTreeSet::new(),
+            completed_subagent_order: Vec::new(),
             open_questions: BTreeSet::new(),
             question_opened_at_ms: BTreeMap::new(),
             closed_questions: BTreeSet::new(),
+            completed_question_order: Vec::new(),
             question_agents: BTreeMap::new(),
             permission_ambiguity: false,
             permission_observed_at_ms: 0,
@@ -403,12 +439,94 @@ impl HookSessionState {
             child_permission_observed_at_ms: BTreeMap::new(),
             compaction_open: false,
             sticky_fault: None,
+            completed_history_truncated: false,
             completed_ingests: Vec::new(),
             samples: Vec::new(),
         }
     }
 
+    fn normalize_completed_history(&mut self) {
+        // Schema v1 originally persisted only the membership collections.
+        // An empty order next to a non-empty cache is therefore a valid
+        // legacy shape. Use its stable key order as the initial FIFO order;
+        // every later write persists the explicit insertion order.
+        if self.completed_tool_order.is_empty() && !self.closed_tools.is_empty() {
+            self.completed_tool_order
+                .extend(self.closed_tools.iter().cloned());
+        }
+        if self.completed_child_tool_order.is_empty() && !self.closed_child_tools.is_empty() {
+            self.completed_child_tool_order
+                .extend(self.closed_child_tools.keys().cloned());
+        }
+        if self.completed_subagent_order.is_empty() && !self.closed_subagents.is_empty() {
+            self.completed_subagent_order
+                .extend(self.closed_subagents.iter().cloned());
+        }
+        if self.completed_question_order.is_empty() && !self.closed_questions.is_empty() {
+            self.completed_question_order
+                .extend(self.closed_questions.iter().cloned());
+        }
+    }
+
+    fn compact_completed_history(&mut self) {
+        let valid_orders =
+            completed_order_matches(&self.completed_tool_order, self.closed_tools.iter())
+                && completed_order_matches(
+                    &self.completed_child_tool_order,
+                    self.closed_child_tools.keys(),
+                )
+                && completed_order_matches(
+                    &self.completed_subagent_order,
+                    self.closed_subagents.iter(),
+                )
+                && completed_order_matches(
+                    &self.completed_question_order,
+                    self.closed_questions.iter(),
+                );
+        if !valid_orders {
+            self.sticky_fault = Some(StatusReason::HookStateMalformed);
+            return;
+        }
+
+        let root_excess = self
+            .completed_tool_order
+            .len()
+            .saturating_sub(MAX_COMPLETED_ITEMS);
+        for tool_id in self.completed_tool_order.drain(..root_excess) {
+            self.closed_tools.remove(&tool_id);
+            self.completed_history_truncated = true;
+        }
+
+        let child_excess = self
+            .completed_child_tool_order
+            .len()
+            .saturating_sub(MAX_COMPLETED_ITEMS);
+        for tool_id in self.completed_child_tool_order.drain(..child_excess) {
+            self.closed_child_tools.remove(&tool_id);
+            self.completed_history_truncated = true;
+        }
+
+        let subagent_excess = self
+            .completed_subagent_order
+            .len()
+            .saturating_sub(MAX_COMPLETED_ITEMS);
+        for agent_id in self.completed_subagent_order.drain(..subagent_excess) {
+            self.closed_subagents.remove(&agent_id);
+            self.completed_history_truncated = true;
+        }
+
+        let question_excess = self
+            .completed_question_order
+            .len()
+            .saturating_sub(MAX_COMPLETED_ITEMS);
+        for tool_id in self.completed_question_order.drain(..question_excess) {
+            self.closed_questions.remove(&tool_id);
+            self.completed_history_truncated = true;
+        }
+    }
+
     fn apply(&mut self, event: &HookEvent) {
+        self.normalize_completed_history();
         if self.integration != event.integration {
             self.sticky_fault = Some(StatusReason::HookConfigChanged);
         }
@@ -544,17 +662,21 @@ impl HookSessionState {
                         self.open_tools.clear();
                         self.tool_opened_at_ms.clear();
                         self.closed_tools.clear();
+                        self.completed_tool_order.clear();
                         self.open_child_tools.clear();
                         self.child_tool_opened_at_ms.clear();
                         self.closed_child_tools.clear();
+                        self.completed_child_tool_order.clear();
                         self.open_subagents.clear();
                         self.subagent_opened_at_ms.clear();
                         self.provisional_stopped_subagents.clear();
                         self.subagent_stopped_at_ms.clear();
                         self.closed_subagents.clear();
+                        self.completed_subagent_order.clear();
                         self.open_questions.clear();
                         self.question_opened_at_ms.clear();
                         self.closed_questions.clear();
+                        self.completed_question_order.clear();
                         self.question_agents.clear();
                         self.permission_ambiguity = false;
                         self.permission_observed_at_ms = 0;
@@ -562,6 +684,7 @@ impl HookSessionState {
                         self.child_permission_observed_at_ms.clear();
                         self.compaction_open = false;
                         self.sticky_fault = None;
+                        self.completed_history_truncated = false;
                         // A marker may have been durably committed immediately
                         // before this boundary and then survived a crash before
                         // unlink. Retain every valid exact commit proof so the
@@ -600,7 +723,9 @@ impl HookSessionState {
                     self.active_turn_id = turn.map(ToOwned::to_owned);
                     clear_root_questions(self);
                     self.closed_tools.clear();
+                    self.completed_tool_order.clear();
                     self.closed_child_tools.clear();
+                    self.completed_child_tool_order.clear();
                     self.permission_ambiguity = false;
                     self.permission_observed_at_ms = 0;
                 }
@@ -750,7 +875,9 @@ impl HookSessionState {
                         if actor_matches && self.open_questions.remove(tool_id) {
                             self.question_agents.remove(tool_id);
                             self.question_opened_at_ms.remove(tool_id);
-                            self.closed_questions.insert(tool_id.to_string());
+                            if self.closed_questions.insert(tool_id.to_string()) {
+                                self.completed_question_order.push(tool_id.to_string());
+                            }
                         } else if !self.closed_questions.contains(tool_id) {
                             self.sticky_fault = Some(StatusReason::HookEventGap);
                         }
@@ -775,8 +902,13 @@ impl HookSessionState {
                                 }
                                 self.open_child_tools.remove(tool_id);
                                 self.child_tool_opened_at_ms.remove(tool_id);
-                                self.closed_child_tools
-                                    .insert(tool_id.to_string(), agent.to_string());
+                                if self
+                                    .closed_child_tools
+                                    .insert(tool_id.to_string(), agent.to_string())
+                                    .is_none()
+                                {
+                                    self.completed_child_tool_order.push(tool_id.to_string());
+                                }
                             } else if self
                                 .closed_child_tools
                                 .get(tool_id)
@@ -797,7 +929,9 @@ impl HookSessionState {
                                 self.sticky_fault = Some(StatusReason::HookEventGap);
                             }
                             self.tool_opened_at_ms.remove(tool_id);
-                            self.closed_tools.insert(tool_id.to_string());
+                            if self.closed_tools.insert(tool_id.to_string()) {
+                                self.completed_tool_order.push(tool_id.to_string());
+                            }
                         } else if !self.closed_tools.contains(tool_id) {
                             self.sticky_fault = Some(StatusReason::HookEventGap);
                         }
@@ -909,23 +1043,28 @@ impl HookSessionState {
                 self.open_tools.clear();
                 self.tool_opened_at_ms.clear();
                 self.closed_tools.clear();
+                self.completed_tool_order.clear();
                 self.open_child_tools.clear();
                 self.child_tool_opened_at_ms.clear();
                 self.closed_child_tools.clear();
+                self.completed_child_tool_order.clear();
                 self.open_subagents.clear();
                 self.subagent_opened_at_ms.clear();
                 self.provisional_stopped_subagents.clear();
                 self.subagent_stopped_at_ms.clear();
                 self.closed_subagents.clear();
+                self.completed_subagent_order.clear();
                 self.open_questions.clear();
                 self.question_opened_at_ms.clear();
                 self.closed_questions.clear();
+                self.completed_question_order.clear();
                 self.question_agents.clear();
                 self.permission_ambiguity = false;
                 self.permission_observed_at_ms = 0;
                 self.child_permission_ambiguities.clear();
                 self.child_permission_observed_at_ms.clear();
                 self.compaction_open = false;
+                self.completed_history_truncated = false;
             }
         }
         self.finish_sample(event);
@@ -947,6 +1086,7 @@ impl HookSessionState {
             self.completed_ingests.drain(..remove);
         }
         self.updated_at_ms = self.updated_at_ms.max(event.observed_at_ms);
+        self.compact_completed_history();
         // Historical hook candidates are not independently sufficient for a
         // public status. The collector promotes only the current candidate
         // after exact rollout/process correlation, so persisted history stays
@@ -975,16 +1115,12 @@ impl HookSessionState {
             || self.tool_opened_at_ms.len() > MAX_OPEN_ITEMS
             || self.open_child_tools.len() > MAX_OPEN_ITEMS
             || self.child_tool_opened_at_ms.len() > MAX_OPEN_ITEMS
-            || self.closed_child_tools.len() > MAX_OPEN_ITEMS
             || self.open_subagents.len() > MAX_OPEN_ITEMS
             || self.subagent_opened_at_ms.len() > MAX_OPEN_ITEMS
             || self.provisional_stopped_subagents.len() > MAX_OPEN_ITEMS
             || self.subagent_stopped_at_ms.len() > MAX_OPEN_ITEMS
             || self.open_questions.len() > MAX_OPEN_ITEMS
             || self.question_opened_at_ms.len() > MAX_OPEN_ITEMS
-            || self.closed_tools.len() > MAX_OPEN_ITEMS
-            || self.closed_subagents.len() > MAX_OPEN_ITEMS
-            || self.closed_questions.len() > MAX_OPEN_ITEMS
             || self.question_agents.len() > MAX_OPEN_ITEMS
             || self.child_permission_ambiguities.len() > MAX_OPEN_ITEMS
             || self.child_permission_observed_at_ms.len() > MAX_OPEN_ITEMS
@@ -1000,11 +1136,6 @@ impl HookSessionState {
                 if let Some(key) = self.open_child_tools.keys().next_back().cloned() {
                     self.open_child_tools.remove(&key);
                     self.child_tool_opened_at_ms.remove(&key);
-                }
-            }
-            while self.closed_child_tools.len() > MAX_OPEN_ITEMS {
-                if let Some(key) = self.closed_child_tools.keys().next_back().cloned() {
-                    self.closed_child_tools.remove(&key);
                 }
             }
             while self.open_subagents.len() > MAX_OPEN_ITEMS {
@@ -1023,6 +1154,8 @@ impl HookSessionState {
                         self.child_tool_opened_at_ms.remove(&tool);
                     }
                     self.closed_child_tools.retain(|_, owner| owner != &key);
+                    self.completed_child_tool_order
+                        .retain(|tool| self.closed_child_tools.contains_key(tool));
                 }
             }
             while self.open_questions.len() > MAX_OPEN_ITEMS {
@@ -1030,21 +1163,6 @@ impl HookSessionState {
                     self.open_questions.remove(&key);
                     self.question_opened_at_ms.remove(&key);
                     self.question_agents.remove(&key);
-                }
-            }
-            while self.closed_tools.len() > MAX_OPEN_ITEMS {
-                if let Some(key) = self.closed_tools.iter().next_back().cloned() {
-                    self.closed_tools.remove(&key);
-                }
-            }
-            while self.closed_subagents.len() > MAX_OPEN_ITEMS {
-                if let Some(key) = self.closed_subagents.iter().next_back().cloned() {
-                    self.closed_subagents.remove(&key);
-                }
-            }
-            while self.closed_questions.len() > MAX_OPEN_ITEMS {
-                if let Some(key) = self.closed_questions.iter().next_back().cloned() {
-                    self.closed_questions.remove(&key);
                 }
             }
             while self.child_permission_ambiguities.len() > MAX_OPEN_ITEMS {
@@ -1060,6 +1178,24 @@ impl HookSessionState {
             }
         }
     }
+}
+
+fn completed_order_matches<'a>(
+    order: &'a [String],
+    members: impl Iterator<Item = &'a String>,
+) -> bool {
+    let ordered = order.iter().collect::<BTreeSet<_>>();
+    let members = members.collect::<BTreeSet<_>>();
+    ordered.len() == order.len() && ordered == members
+}
+
+fn persisted_completed_order_matches<'a>(
+    order: &'a [String],
+    members: impl Iterator<Item = &'a String>,
+) -> bool {
+    // Empty order metadata is the only legacy schema-v1 exception. Partial,
+    // duplicate, or conflicting metadata is malformed rather than repaired.
+    order.is_empty() || completed_order_matches(order, members)
 }
 
 #[derive(Debug, Default)]
@@ -1303,103 +1439,71 @@ impl HookStateStore {
     }
 
     pub fn read_all(&self, now_ms: u64) -> io::Result<HookStateScan> {
-        let mut scan = HookStateScan::default();
-        let mut latest_failure_ms = 0_u64;
-        let mut poison_all = false;
-        let mut saw_lock = false;
-        let mut saw_state_file = false;
-        let (entries, truncated) = self.state_dir.list_names(MAX_DIRECTORY_ENTRIES)?;
-        if truncated {
-            scan.rejected += 1;
-            poison_all = true;
-        }
-        for name in entries {
-            let Some(name) = name.to_str() else {
-                scan.rejected += 1;
-                poison_all = true;
-                continue;
-            };
-            if name == ".lock" {
-                saw_lock = true;
-                let lock_is_unsafe = match self
-                    .state_dir
-                    .open_private_read(OsStr::new(name))
-                    .and_then(|file| file.metadata())
-                {
-                    Ok(metadata) => metadata.len() != 0,
-                    Err(_) => true,
-                };
-                if lock_is_unsafe {
-                    scan.rejected += 1;
-                    poison_all = true;
-                }
-                continue;
-            }
-            if name == FAULT_DIR_NAME {
-                continue;
-            }
-            if valid_temporary_filename(name) {
-                // An in-flight atomic replacement still leaves the prior
-                // state readable. Count unexpected temp accumulation so it
-                // cannot be used to bypass the directory bound.
-                scan.rejected += 1;
-                poison_all = true;
-                continue;
-            }
-            if !valid_state_filename(name) {
-                scan.rejected += 1;
-                poison_all = true;
-                continue;
-            }
-            saw_state_file = true;
-            match read_state_file(&self.state_dir, OsStr::new(name)) {
-                Ok(Some(mut state)) => {
-                    if validate_state(&state).is_err() {
-                        scan.rejected += 1;
-                        poison_all = true;
-                        continue;
-                    }
-                    let expected_name = format!("state-{}.json", state.generation_id);
-                    if name != expected_name {
-                        scan.rejected += 1;
-                        poison_all = true;
-                        continue;
-                    }
-                    if state.integration.installation_id != self.expected.installation_id {
-                        // A prior installation is retained for bounded audit
-                        // and GC, but is not malformed evidence for the
-                        // current integration and cannot produce a live row.
-                        continue;
-                    }
-                    if state.integration != self.expected {
-                        state.sticky_fault = Some(StatusReason::HookConfigChanged);
-                    }
-                    if state.updated_at_ms > now_ms.saturating_add(60_000) {
-                        state.sticky_fault = Some(StatusReason::HookStateMalformed);
-                    }
-                    if state.first_confirmed_gone_at_ms > now_ms.saturating_add(60_000) {
-                        state.sticky_fault = Some(StatusReason::HookStateMalformed);
-                    }
-                    scan.states.push(state);
-                }
-                _ => {
-                    scan.rejected += 1;
-                    poison_all = true;
-                }
-            }
-        }
-        if scan.states.len() > MAX_STATE_FILES {
-            scan.rejected += 1;
-            scan.states.truncate(MAX_STATE_FILES);
-            poison_all = true;
-        }
-        if saw_state_file && !saw_lock {
-            scan.rejected += 1;
-            poison_all = true;
+        self.read_all_with_between_snapshot(now_ms, || {})
+    }
+
+    fn read_all_with_between_snapshot<F>(
+        &self,
+        now_ms: u64,
+        mut between_snapshot_halves: F,
+    ) -> io::Result<HookStateScan>
+    where
+        F: FnMut(),
+    {
+        // State replacements and fault-ledger compaction are serialized by
+        // the same retained lock. Keep the shared collector lock through both
+        // halves so commit proofs and their markers come from one coherent
+        // snapshot. Any temporary file left after acquisition is abandoned
+        // evidence and still fails closed.
+        if let Some(_lock) = StateLock::acquire_existing(&self.state_dir)? {
+            return self.read_all_snapshot(now_ms, &mut between_snapshot_halves);
         }
 
-        let (faults, faults_truncated) = self.fault_dir.list_names(MAX_FAULT_DIRECTORY_ENTRIES)?;
+        // A freshly prepared store has no lock yet. Snapshot it without
+        // creating one, then double-check: if the first writer appeared at
+        // any point, wait for it and rerun the entire state-plus-fault scan.
+        let unlocked = self.read_all_snapshot(now_ms, &mut between_snapshot_halves)?;
+        if let Some(_lock) = StateLock::acquire_existing(&self.state_dir)? {
+            return self.read_all_snapshot(now_ms, &mut between_snapshot_halves);
+        }
+        Ok(unlocked)
+    }
+
+    fn read_all_snapshot<F>(
+        &self,
+        now_ms: u64,
+        between_snapshot_halves: &mut F,
+    ) -> io::Result<HookStateScan>
+    where
+        F: FnMut(),
+    {
+        let (mut scan, mut poison_all) = self.read_state_directory_snapshot(now_ms)?;
+        between_snapshot_halves();
+        let mut latest_failure_ms = 0_u64;
+
+        // The launcher creates its marker before the helper can take the
+        // state lock. A broken older helper can therefore leave more than the
+        // steady-state fault budget behind. Read a larger, still-bounded
+        // recovery window so a complete ledger of valid records remains
+        // reducible instead of becoming malformed solely because it exceeds
+        // the writer's soft cap.
+        let (faults, faults_truncated) = self
+            .fault_dir
+            .list_names(MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES)?;
         if faults_truncated {
+            scan.rejected += 1;
+            poison_all = true;
+        }
+        if faults
+            .iter()
+            .filter(|name| {
+                name.to_str().is_some_and(|name| {
+                    valid_fault_filename(name) || valid_launcher_fault_filename(name)
+                })
+            })
+            .count()
+            > MAX_FAULT_RECOVERY_FILES
+        {
             scan.rejected += 1;
             poison_all = true;
         }
@@ -1485,6 +1589,105 @@ impl HookStateStore {
             }
         }
         Ok(scan)
+    }
+
+    fn read_state_directory_snapshot(&self, now_ms: u64) -> io::Result<(HookStateScan, bool)> {
+        let mut scan = HookStateScan::default();
+        let mut poison_all = false;
+        let mut saw_lock = false;
+        let mut saw_state_file = false;
+        let (entries, truncated) = self.state_dir.list_names(MAX_DIRECTORY_ENTRIES)?;
+        if truncated {
+            scan.rejected += 1;
+            poison_all = true;
+        }
+        for name in entries {
+            let Some(name) = name.to_str() else {
+                scan.rejected += 1;
+                poison_all = true;
+                continue;
+            };
+            if name == ".lock" {
+                saw_lock = true;
+                let lock_is_unsafe = match self
+                    .state_dir
+                    .open_private_read(OsStr::new(name))
+                    .and_then(|file| file.metadata())
+                {
+                    Ok(metadata) => metadata.len() != 0,
+                    Err(_) => true,
+                };
+                if lock_is_unsafe {
+                    scan.rejected += 1;
+                    poison_all = true;
+                }
+                continue;
+            }
+            if name == FAULT_DIR_NAME {
+                continue;
+            }
+            if valid_temporary_filename(name) {
+                // Synchronization is attempted before and after an initially
+                // lock-free snapshot, so a conforming atomic writer cannot
+                // leave this file in the returned snapshot. Count an
+                // abandoned artifact so it cannot bypass the directory bound
+                // or preserve stale positive evidence.
+                scan.rejected += 1;
+                poison_all = true;
+                continue;
+            }
+            if !valid_state_filename(name) {
+                scan.rejected += 1;
+                poison_all = true;
+                continue;
+            }
+            saw_state_file = true;
+            match read_state_file(&self.state_dir, OsStr::new(name)) {
+                Ok(Some(mut state)) => {
+                    if validate_state(&state).is_err() {
+                        scan.rejected += 1;
+                        poison_all = true;
+                        continue;
+                    }
+                    let expected_name = format!("state-{}.json", state.generation_id);
+                    if name != expected_name {
+                        scan.rejected += 1;
+                        poison_all = true;
+                        continue;
+                    }
+                    if state.integration.installation_id != self.expected.installation_id {
+                        // A prior installation is retained for bounded audit
+                        // and GC, but is not malformed evidence for the
+                        // current integration and cannot produce a live row.
+                        continue;
+                    }
+                    if state.integration != self.expected {
+                        state.sticky_fault = Some(StatusReason::HookConfigChanged);
+                    }
+                    if state.updated_at_ms > now_ms.saturating_add(60_000) {
+                        state.sticky_fault = Some(StatusReason::HookStateMalformed);
+                    }
+                    if state.first_confirmed_gone_at_ms > now_ms.saturating_add(60_000) {
+                        state.sticky_fault = Some(StatusReason::HookStateMalformed);
+                    }
+                    scan.states.push(state);
+                }
+                _ => {
+                    scan.rejected += 1;
+                    poison_all = true;
+                }
+            }
+        }
+        if scan.states.len() > MAX_STATE_FILES {
+            scan.rejected += 1;
+            scan.states.truncate(MAX_STATE_FILES);
+            poison_all = true;
+        }
+        if saw_state_file && !saw_lock {
+            scan.rejected += 1;
+            poison_all = true;
+        }
+        Ok((scan, poison_all))
     }
 
     #[cfg(all(test, unix))]
@@ -1643,36 +1846,77 @@ impl HookStateIngress {
     /// This intentionally performs process-incarnation probes and therefore
     /// must not run on the latency-critical path before stdin drain or durable
     /// marker adoption. Collector reads never call this mutation.
-    pub fn reclaim_stale_artifacts_after_drain(&self, now_ms: u64) -> io::Result<()> {
+    pub fn reclaim_stale_artifacts_after_drain(
+        &self,
+        now_ms: u64,
+        protected_marker_id: Option<&str>,
+    ) -> io::Result<()> {
         if now_ms == 0 {
             return Err(invalid_data("invalid hook-ingest cleanup time"));
         }
-        let Some(states_before_probe) = generations_for_artifact_reclamation(&self.state_dir)?
-        else {
-            return Ok(());
-        };
-        // Process inspection is deliberately outside the global state lock:
-        // another concurrent hook must still be able to adopt its durable
-        // marker and drain stdin within Codex's one-second timeout.
-        let process_cache = process_death_snapshot(&states_before_probe);
-        let _lock = StateLock::acquire(&self.state_dir)?;
-        let Some(states_after_probe) = generations_for_artifact_reclamation(&self.state_dir)?
-        else {
-            return Ok(());
-        };
-        if states_before_probe != states_after_probe {
-            // Never apply process observations to a state set that changed
-            // while those observations were collected.
-            return Ok(());
+        // Fault-ledger compaction must not depend on the slower out-of-lock
+        // process probes below. Active parallel hooks can legitimately change
+        // generation state during those probes; tying compaction to their
+        // snapshot equality would let valid launcher faults grow forever.
+        let mut compaction_error = None;
+        if fault_compaction_may_be_needed(&self.fault_dir, now_ms, protected_marker_id)? {
+            if let Some(_lock) = StateLock::try_acquire(&self.state_dir)? {
+                if let Some(states) = generations_for_artifact_reclamation(&self.state_dir)? {
+                    if let Err(error) = compact_adopted_generic_launcher_faults(
+                        &self.fault_dir,
+                        &states,
+                        now_ms,
+                        protected_marker_id,
+                    ) {
+                        // Keep the current ingest fail-closed, but do not let a
+                        // stale compaction artifact prevent its own separately
+                        // authorized 24-hour cleanup. A later ingest can retry
+                        // compaction after that exact artifact is reclaimed.
+                        compaction_error = Some(error);
+                    }
+                }
+            }
         }
-        reclaim_stale_ingest_artifacts(
-            &self.state_dir,
-            &self.fault_dir,
-            &states_after_probe,
-            now_ms,
-            &process_cache,
-        )?;
-        reclaim_expired_faults(&self.fault_dir, &states_after_probe, now_ms, &process_cache)
+        let stale_reclamation = (|| -> io::Result<()> {
+            if !stale_artifact_reclamation_may_be_needed(
+                &self.state_dir,
+                &self.fault_dir,
+                now_ms,
+                protected_marker_id,
+            )? {
+                return Ok(());
+            }
+            let Some(states_before_probe) = generations_for_artifact_reclamation(&self.state_dir)?
+            else {
+                return Ok(());
+            };
+            // Process inspection is deliberately outside the global state lock:
+            // another concurrent hook must still be able to adopt its durable
+            // marker and drain stdin within Codex's one-second timeout.
+            let process_cache = process_death_snapshot(&states_before_probe);
+            let _lock = StateLock::acquire(&self.state_dir)?;
+            let Some(states_after_probe) = generations_for_artifact_reclamation(&self.state_dir)?
+            else {
+                return Ok(());
+            };
+            if states_before_probe != states_after_probe {
+                // Never apply process observations to a state set that changed
+                // while those observations were collected.
+                return Ok(());
+            }
+            reclaim_stale_ingest_artifacts(
+                &self.state_dir,
+                &self.fault_dir,
+                &states_after_probe,
+                now_ms,
+                &process_cache,
+            )?;
+            reclaim_expired_faults(&self.fault_dir, &states_after_probe, now_ms, &process_cache)
+        })();
+        if let Some(error) = compaction_error {
+            return Err(error);
+        }
+        stale_reclamation
     }
 
     /// Adopt only the unique launcher token grammar (or its bounded fixed-slot
@@ -1719,6 +1963,294 @@ impl HookStateIngress {
             &commit_id,
             true,
         )
+    }
+}
+
+fn fault_compaction_may_be_needed(
+    fault_dir: &SecureDirectory,
+    now_ms: u64,
+    protected_marker_id: Option<&str>,
+) -> io::Result<bool> {
+    let protected_name = protected_marker_id
+        .map(|proof| {
+            parse_ingest_commit_proof(proof)
+                .map(|(name, _)| name)
+                .ok_or_else(|| invalid_data("invalid protected hook marker identity"))
+        })
+        .transpose()?;
+    if protected_name == Some(FAULT_OVERFLOW_NAME) {
+        return Ok(false);
+    }
+    let (names, _) = fault_dir.list_names(MAX_FAULT_COMPACTION_SCAN_ENTRIES)?;
+    for name in names {
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !valid_launcher_fault_filename(name_str) || protected_name == Some(name_str) {
+            continue;
+        }
+        let Ok((file, bytes)) = fault_dir.read_private_bounded(&name, MAX_FAULT_BYTES) else {
+            continue;
+        };
+        let Ok(fault) = serde_json::from_slice::<HookIngestFault>(&bytes) else {
+            continue;
+        };
+        if valid_ingest_fault(&fault)
+            && fault.integration.is_none()
+            && fault.observed_at_ms <= now_ms.saturating_add(60_000)
+            && try_lock_marker(&file)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn stale_artifact_reclamation_may_be_needed(
+    state_dir: &SecureDirectory,
+    fault_dir: &SecureDirectory,
+    now_ms: u64,
+    protected_marker_id: Option<&str>,
+) -> io::Result<bool> {
+    let protected_name = protected_marker_id
+        .and_then(parse_ingest_commit_proof)
+        .map(|(name, _)| name);
+    let (state_names, state_truncated) = state_dir.list_names(MAX_DIRECTORY_ENTRIES)?;
+    if state_truncated {
+        return Ok(false);
+    }
+    for name in state_names {
+        if !name.to_str().is_some_and(valid_temporary_filename) {
+            continue;
+        }
+        if let Ok(file) = state_dir.open_private_read(&name) {
+            if stale_artifact_cutoff(&file, now_ms).is_some() {
+                return Ok(true);
+            }
+        }
+    }
+
+    let (fault_names, _) = fault_dir.list_names(MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES)?;
+    // Inspect the retained recovery window even when more names exist. A
+    // truncated directory alone does not justify the expensive state/death
+    // probes: fresh markers are not reclaimable and already keep reads
+    // fail-closed. Once any marker in this bounded window becomes eligible,
+    // batched reclamation makes room for later entries on subsequent hooks.
+    for name in fault_names {
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if protected_name == Some(name_str) || name_str == FAULT_OVERFLOW_NAME {
+            continue;
+        }
+        let eligible = valid_temporary_filename(name_str)
+            || valid_launcher_fault_filename(name_str)
+            || valid_fault_filename(name_str);
+        if !eligible {
+            continue;
+        }
+        if let Ok(file) = fault_dir.open_private_read(&name) {
+            if stale_artifact_cutoff(&file, now_ms).is_some() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Losslessly collapse completed or failed adopted launcher markers.
+///
+/// The launcher itself does not participate in `StateLock`, so this function
+/// operates only on exact inodes from one complete bounded snapshot. Locked,
+/// malformed, empty, scoped, future-dated, and newly-created markers are left
+/// untouched. Uncommitted generic failures are represented by the permanent
+/// monotonic overflow record before their exact inodes are removed.
+fn compact_adopted_generic_launcher_faults(
+    fault_dir: &Arc<SecureDirectory>,
+    states: &[HookSessionState],
+    now_ms: u64,
+    protected_marker_id: Option<&str>,
+) -> io::Result<()> {
+    compact_adopted_generic_launcher_faults_with(
+        fault_dir,
+        states,
+        now_ms,
+        protected_marker_id,
+        || {},
+    )
+}
+
+fn compact_adopted_generic_launcher_faults_with<F>(
+    fault_dir: &Arc<SecureDirectory>,
+    states: &[HookSessionState],
+    now_ms: u64,
+    protected_marker_id: Option<&str>,
+    before_exclusive_overflow_create: F,
+) -> io::Result<()>
+where
+    F: FnOnce(),
+{
+    let protected_name = match protected_marker_id {
+        Some(proof) => Some(
+            parse_ingest_commit_proof(proof)
+                .ok_or_else(|| invalid_data("invalid protected hook marker identity"))?
+                .0,
+        ),
+        None => None,
+    };
+    if protected_name == Some(FAULT_OVERFLOW_NAME) {
+        return Ok(());
+    }
+
+    // Process a fixed batch even when more names exist. Every selected inode
+    // is independently validated and summarized, while unseen entries remain
+    // fail-closed for the reader and become eligible on later passes as the
+    // directory shrinks.
+    let (names, _) = fault_dir.list_names(MAX_FAULT_COMPACTION_SCAN_ENTRIES)?;
+
+    let mut candidates = Vec::new();
+    for name in names {
+        if candidates.len() >= MAX_FAULT_COMPACTION_BATCH_FILES {
+            break;
+        }
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !valid_launcher_fault_filename(name_str) {
+            continue;
+        }
+        let Ok((file, bytes)) = fault_dir.read_private_bounded(&name, MAX_FAULT_BYTES) else {
+            continue;
+        };
+        let Ok(fault) = serde_json::from_slice::<HookIngestFault>(&bytes) else {
+            continue;
+        };
+        if !valid_ingest_fault(&fault)
+            || fault.integration.is_some()
+            || fault.observed_at_ms > now_ms.saturating_add(60_000)
+        {
+            continue;
+        }
+        let Ok(commit_proof) = ingest_commit_proof(name_str, &fault.commit_id) else {
+            continue;
+        };
+        if protected_marker_id == Some(commit_proof.as_str()) || !try_lock_marker(&file)? {
+            continue;
+        }
+        let committed = states.iter().any(|state| {
+            state.updated_at_ms >= fault.observed_at_ms
+                && state
+                    .completed_ingests
+                    .iter()
+                    .any(|proof| proof == &commit_proof)
+        });
+        candidates.push((name, file, fault.observed_at_ms, committed));
+    }
+
+    let latest_uncommitted = candidates
+        .iter()
+        .filter_map(|(_, _, observed_at_ms, committed)| (!committed).then_some(*observed_at_ms))
+        .max()
+        .unwrap_or_default();
+    if latest_uncommitted != 0
+        && !persist_compaction_overflow_with(
+            fault_dir,
+            latest_uncommitted,
+            now_ms,
+            before_exclusive_overflow_create,
+        )?
+    {
+        return Ok(());
+    }
+
+    let mut removed_any = false;
+    for (name, file, _, _) in candidates {
+        // A concurrent launcher can add a new marker, but it cannot make this
+        // exact opened inode match a replacement at the same name.
+        if fault_dir.remove_if_same_without_sync(&name, &file).is_ok() {
+            removed_any = true;
+        }
+    }
+    if removed_any {
+        // The overflow record or exact state commit proofs are already durable.
+        // One directory sync now commits the exact-inode batch without putting
+        // one fsync on the one-second hook path for every old marker.
+        fault_dir.sync()?;
+    }
+    Ok(())
+}
+
+fn persist_compaction_overflow_with<F>(
+    fault_dir: &Arc<SecureDirectory>,
+    observed_at_ms: u64,
+    now_ms: u64,
+    before_exclusive_create: F,
+) -> io::Result<bool>
+where
+    F: FnOnce(),
+{
+    let existing =
+        match fault_dir.read_private_bounded(OsStr::new(FAULT_OVERFLOW_NAME), MAX_FAULT_BYTES) {
+            Ok((file, bytes)) => {
+                let Ok(fault) = serde_json::from_slice::<HookIngestFault>(&bytes) else {
+                    return Ok(false);
+                };
+                if !valid_ingest_fault(&fault)
+                    || fault.observed_at_ms > now_ms.saturating_add(60_000)
+                    || !try_lock_marker(&file)?
+                {
+                    return Ok(false);
+                }
+                Some((file, fault))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => return Ok(false),
+        };
+
+    let commit_id = new_ingest_commit_id()?;
+    let fault = HookIngestFault {
+        schema_version: HOOK_STATE_SCHEMA_VERSION,
+        integration: None,
+        observed_at_ms: existing
+            .as_ref()
+            .map(|(_, fault)| fault.observed_at_ms)
+            .unwrap_or_default()
+            .max(observed_at_ms),
+        commit_id,
+    };
+    let bytes = encode_fault(&fault)?;
+
+    if let Some((file, old)) = existing {
+        if old.integration.is_none() && old.observed_at_ms >= observed_at_ms {
+            let Ok(current) = fault_dir.open_private_read(OsStr::new(FAULT_OVERFLOW_NAME)) else {
+                return Ok(false);
+            };
+            if !same_file(&current.metadata()?, &file.metadata()?) {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+        fault_dir.atomic_replace_if_same_with_temporary(
+            OsStr::new(FAULT_OVERFLOW_NAME),
+            &file,
+            OsStr::new(FAULT_COMPACTION_TEMP_NAME),
+            &bytes,
+        )?;
+        return Ok(true);
+    }
+
+    // The launcher does not take StateLock and can create an empty overflow
+    // marker after our absence check. O_EXCL makes that exact race observable:
+    // the concurrent marker wins, remains fail-closed, and no source marker is
+    // deleted by this pass.
+    before_exclusive_create();
+    match fault_dir.create_private_new(OsStr::new(FAULT_OVERFLOW_NAME), &bytes) {
+        Ok(file) => {
+            drop(file);
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -1892,12 +2424,17 @@ fn affected_generations_confirmed_gone(
 fn reclaim_stale_temporary_files(
     directory: &SecureDirectory,
     listing_bound: usize,
+    removal_limit: usize,
     states: &[HookSessionState],
     now_ms: u64,
     process_cache: &BTreeMap<(u32, String), bool>,
 ) -> io::Result<()> {
     let (names, _) = directory.list_names(listing_bound)?;
+    let mut removed = 0;
     for name in names {
+        if removed >= removal_limit {
+            break;
+        }
         let Some(name_str) = name.to_str() else {
             continue;
         };
@@ -1910,9 +2447,14 @@ fn reclaim_stale_temporary_files(
         let Some(cutoff_ms) = stale_artifact_cutoff(&file, now_ms) else {
             continue;
         };
-        if affected_generations_confirmed_gone(states, cutoff_ms, process_cache) {
-            let _ = directory.remove_if_same(&name, &file);
+        if affected_generations_confirmed_gone(states, cutoff_ms, process_cache)
+            && directory.remove_if_same_without_sync(&name, &file).is_ok()
+        {
+            removed += 1;
         }
+    }
+    if removed != 0 {
+        directory.sync()?;
     }
     Ok(())
 }
@@ -1923,8 +2465,12 @@ fn reclaim_stale_launcher_markers(
     now_ms: u64,
     process_cache: &BTreeMap<(u32, String), bool>,
 ) -> io::Result<()> {
-    let (names, _) = fault_dir.list_names(MAX_FAULT_DIRECTORY_ENTRIES)?;
+    let (names, _) = fault_dir.list_names(MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES)?;
+    let mut removed = 0;
     for name in names {
+        if removed >= MAX_FAULT_COMPACTION_BATCH_FILES {
+            break;
+        }
         let Some(name_str) = name.to_str() else {
             continue;
         };
@@ -1959,9 +2505,13 @@ fn reclaim_stale_launcher_markers(
 
         if affected_generations_confirmed_gone(states, cutoff_ms, process_cache)
             && try_lock_marker(&file)?
+            && fault_dir.remove_if_same_without_sync(&name, &file).is_ok()
         {
-            let _ = fault_dir.remove_if_same(&name, &file);
+            removed += 1;
         }
+    }
+    if removed != 0 {
+        fault_dir.sync()?;
     }
     Ok(())
 }
@@ -1976,13 +2526,15 @@ fn reclaim_stale_ingest_artifacts(
     reclaim_stale_temporary_files(
         state_dir,
         MAX_DIRECTORY_ENTRIES,
+        MAX_TEMP_FILES,
         states,
         now_ms,
         process_cache,
     )?;
     reclaim_stale_temporary_files(
         fault_dir,
-        MAX_FAULT_DIRECTORY_ENTRIES,
+        MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES,
+        MAX_FAULT_COMPACTION_BATCH_FILES,
         states,
         now_ms,
         process_cache,
@@ -1996,8 +2548,12 @@ fn reclaim_expired_faults(
     now_ms: u64,
     process_cache: &BTreeMap<(u32, String), bool>,
 ) -> io::Result<()> {
-    let (fault_names, _) = fault_dir.list_names(MAX_FAULT_DIRECTORY_ENTRIES)?;
+    let (fault_names, _) = fault_dir.list_names(MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES)?;
+    let mut removed = 0;
     for name in fault_names {
+        if removed >= MAX_FAULT_COMPACTION_BATCH_FILES {
+            break;
+        }
         let Some(name_str) = name.to_str() else {
             continue;
         };
@@ -2035,9 +2591,15 @@ fn reclaim_expired_faults(
                 && state.created_at_ms <= fault.observed_at_ms
                 && !process_cache.get(&process_key).copied().unwrap_or(false)
         });
-        if !still_relevant && try_lock_marker(&file)? {
-            let _ = fault_dir.remove_if_same(&name, &file);
+        if !still_relevant
+            && try_lock_marker(&file)?
+            && fault_dir.remove_if_same_without_sync(&name, &file).is_ok()
+        {
+            removed += 1;
         }
+    }
+    if removed != 0 {
+        fault_dir.sync()?;
     }
     Ok(())
 }
@@ -2094,7 +2656,11 @@ fn record_overflow_fault(
             .max(observed_at_ms),
         commit_id: commit_id.clone(),
     };
-    fault_dir.atomic_replace(OsStr::new(FAULT_OVERFLOW_NAME), &encode_fault(&fault)?)?;
+    fault_dir.atomic_replace_with_listing_bound(
+        OsStr::new(FAULT_OVERFLOW_NAME),
+        &encode_fault(&fault)?,
+        MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES,
+    )?;
     Ok(commit_id)
 }
 
@@ -2127,6 +2693,7 @@ fn clear_root_questions(state: &mut HookSessionState) {
         state.question_opened_at_ms.remove(&tool_id);
     }
     state.closed_questions.clear();
+    state.completed_question_order.clear();
 }
 
 fn clear_agent_questions(state: &mut HookSessionState, agent: &str) {
@@ -2245,19 +2812,39 @@ fn validate_state(state: &HookSessionState) -> io::Result<()> {
         || state.tool_opened_at_ms.len() > MAX_OPEN_ITEMS
         || state.open_child_tools.len() > MAX_OPEN_ITEMS
         || state.child_tool_opened_at_ms.len() > MAX_OPEN_ITEMS
-        || state.closed_child_tools.len() > MAX_OPEN_ITEMS
         || state.open_subagents.len() > MAX_OPEN_ITEMS
         || state.subagent_opened_at_ms.len() > MAX_OPEN_ITEMS
         || state.provisional_stopped_subagents.len() > MAX_OPEN_ITEMS
         || state.subagent_stopped_at_ms.len() > MAX_OPEN_ITEMS
         || state.open_questions.len() > MAX_OPEN_ITEMS
         || state.question_opened_at_ms.len() > MAX_OPEN_ITEMS
-        || state.closed_tools.len() > MAX_OPEN_ITEMS
-        || state.closed_subagents.len() > MAX_OPEN_ITEMS
-        || state.closed_questions.len() > MAX_OPEN_ITEMS
         || state.question_agents.len() > MAX_OPEN_ITEMS
         || state.child_permission_ambiguities.len() > MAX_OPEN_ITEMS
         || state.child_permission_observed_at_ms.len() > MAX_OPEN_ITEMS
+        || state.closed_tools.len() > MAX_COMPLETED_ITEMS
+        || state.completed_tool_order.len() > MAX_COMPLETED_ITEMS
+        || state.closed_child_tools.len() > MAX_COMPLETED_ITEMS
+        || state.completed_child_tool_order.len() > MAX_COMPLETED_ITEMS
+        || state.closed_subagents.len() > MAX_COMPLETED_ITEMS
+        || state.completed_subagent_order.len() > MAX_COMPLETED_ITEMS
+        || state.closed_questions.len() > MAX_COMPLETED_ITEMS
+        || state.completed_question_order.len() > MAX_COMPLETED_ITEMS
+        || !persisted_completed_order_matches(
+            &state.completed_tool_order,
+            state.closed_tools.iter(),
+        )
+        || !persisted_completed_order_matches(
+            &state.completed_child_tool_order,
+            state.closed_child_tools.keys(),
+        )
+        || !persisted_completed_order_matches(
+            &state.completed_subagent_order,
+            state.closed_subagents.iter(),
+        )
+        || !persisted_completed_order_matches(
+            &state.completed_question_order,
+            state.closed_questions.iter(),
+        )
         || (state.prompt_accepted != (state.prompt_observed_at_ms != 0))
         || (state.permission_ambiguity != (state.permission_observed_at_ms != 0))
         || (state.stop_turn_id.is_some() != (state.stop_observed_at_ms != 0))
@@ -2561,12 +3148,17 @@ fn write_state_file(
     name: &OsStr,
     state: &HookSessionState,
 ) -> io::Result<()> {
+    let bytes = encode_state(state)?;
+    dir.atomic_replace(name, &bytes)
+}
+
+fn encode_state(state: &HookSessionState) -> io::Result<Vec<u8>> {
     let bytes = serde_json::to_vec(state)
         .map_err(|error| invalid_data(format!("cannot encode hook state: {error}")))?;
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err(invalid_data("hook state exceeds its storage bound"));
     }
-    dir.atomic_replace(name, &bytes)
+    Ok(bytes)
 }
 
 struct SecureDirectory {
@@ -2721,7 +3313,12 @@ impl SecureDirectory {
                 }
                 if names.len() >= maximum {
                     truncated = true;
-                    continue;
+                    // The caller needs only bounded evidence plus the fact
+                    // that more entries exist. Do not walk an arbitrarily
+                    // large launcher-created directory synchronously.
+                    // SAFETY: directory is live and uniquely owned here.
+                    unsafe { libc::closedir(directory) };
+                    break;
                 }
                 names.push(OsString::from_vec(bytes));
             }
@@ -2735,6 +3332,7 @@ impl SecureDirectory {
                 let entry = entry?;
                 if names.len() >= maximum {
                     truncated = true;
+                    break;
                 } else {
                     names.push(entry.file_name());
                 }
@@ -2818,6 +3416,15 @@ impl SecureDirectory {
     }
 
     fn atomic_replace(&self, name: &OsStr, bytes: &[u8]) -> io::Result<()> {
+        self.atomic_replace_with_listing_bound(name, bytes, MAX_DIRECTORY_ENTRIES)
+    }
+
+    fn atomic_replace_with_listing_bound(
+        &self,
+        name: &OsStr,
+        bytes: &[u8],
+        listing_bound: usize,
+    ) -> io::Result<()> {
         validate_component_name(name)?;
         if bytes.len() as u64 > MAX_STATE_BYTES {
             return Err(invalid_data("private hook file exceeds storage bound"));
@@ -2827,7 +3434,7 @@ impl SecureDirectory {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let (entries, truncated) = self.list_names(MAX_DIRECTORY_ENTRIES)?;
+        let (entries, truncated) = self.list_names(listing_bound)?;
         let temporary_count = entries
             .iter()
             .filter(|entry| entry.to_str().is_some_and(valid_temporary_filename))
@@ -2874,16 +3481,99 @@ impl SecureDirectory {
         self.sync()
     }
 
+    fn atomic_replace_if_same_with_temporary(
+        &self,
+        name: &OsStr,
+        expected: &File,
+        temporary_name: &OsStr,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        validate_component_name(name)?;
+        validate_component_name(temporary_name)?;
+        if !temporary_name
+            .to_str()
+            .is_some_and(valid_temporary_filename)
+        {
+            return Err(invalid_data("invalid private hook temporary filename"));
+        }
+        if bytes.len() as u64 > MAX_STATE_BYTES {
+            return Err(invalid_data("private hook file exceeds storage bound"));
+        }
+        let current = self.open_private_read(name)?;
+        if !same_file(&current.metadata()?, &expected.metadata()?) {
+            return Err(invalid_data("private hook file changed before replacement"));
+        }
+        drop(current);
+
+        let temporary = self.create_private_new(temporary_name, bytes)?;
+        drop(temporary);
+        let current = match self.open_private_read(name) {
+            Ok(current) => current,
+            Err(error) => {
+                let _ = self.remove(temporary_name);
+                return Err(error);
+            }
+        };
+        if !same_file(&current.metadata()?, &expected.metadata()?) {
+            drop(current);
+            let _ = self.remove(temporary_name);
+            return Err(invalid_data("private hook file changed before replacement"));
+        }
+        drop(current);
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let old = os_cstring(temporary_name)?;
+            let new = os_cstring(name)?;
+            // SAFETY: both names are validated single components and both
+            // descriptors are the same retained private directory. The exact
+            // destination inode was revalidated immediately above.
+            let result = unsafe {
+                libc::renameat(
+                    self.file.as_raw_fd(),
+                    old.as_ptr(),
+                    self.file.as_raw_fd(),
+                    new.as_ptr(),
+                )
+            };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                let _ = self.remove(temporary_name);
+                return Err(error);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let temporary_path = self.path.join(temporary_name);
+            if let Err(error) = fs::rename(&temporary_path, self.path.join(name)) {
+                let _ = fs::remove_file(temporary_path);
+                return Err(error);
+            }
+        }
+        self.sync()
+    }
+
     fn remove_if_same(&self, name: &OsStr, expected: &File) -> io::Result<()> {
+        self.remove_if_same_without_sync(name, expected)?;
+        self.sync()
+    }
+
+    fn remove_if_same_without_sync(&self, name: &OsStr, expected: &File) -> io::Result<()> {
         let current = self.open_private_read(name)?;
         if !same_file(&current.metadata()?, &expected.metadata()?) {
             return Err(invalid_data("private hook file changed before removal"));
         }
         drop(current);
-        self.remove(name)
+        self.remove_without_sync(name)
     }
 
     fn remove(&self, name: &OsStr) -> io::Result<()> {
+        self.remove_without_sync(name)?;
+        self.sync()
+    }
+
+    fn remove_without_sync(&self, name: &OsStr) -> io::Result<()> {
         validate_component_name(name)?;
         #[cfg(unix)]
         {
@@ -2897,7 +3587,7 @@ impl SecureDirectory {
         }
         #[cfg(not(unix))]
         fs::remove_file(self.path.join(name))?;
-        self.sync()
+        Ok(())
     }
 
     fn sync(&self) -> io::Result<()> {
@@ -3094,6 +3784,75 @@ struct StateLock {
 }
 
 impl StateLock {
+    /// Acquire the retained lock without creating it.
+    ///
+    /// Collector reads use this path so they can synchronize with an active
+    /// atomic replacement while remaining strictly read-only. Reopening the
+    /// name after locking verifies that the descriptor still names the
+    /// retained lock inode rather than an unlinked predecessor.
+    fn acquire_existing(directory: &SecureDirectory) -> io::Result<Option<Self>> {
+        #[cfg(unix)]
+        {
+            let file = match directory.open_private_read(OsStr::new(".lock")) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            lock_shared_with_budget(&file)?;
+            let current = directory.open_private_read(OsStr::new(".lock"))?;
+            if !same_file(&file.metadata()?, &current.metadata()?) {
+                return Err(invalid_data("hook-state lock changed while acquiring it"));
+            }
+            Ok(Some(Self { file }))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = directory;
+            Ok(None)
+        }
+    }
+
+    fn try_acquire(directory: &SecureDirectory) -> io::Result<Option<Self>> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let file = match directory.open_private_rw_existing(OsStr::new(".lock")) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match directory.create_private_new(OsStr::new(".lock"), &[]) {
+                        Ok(file) => file,
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                            directory.open_private_rw_existing(OsStr::new(".lock"))?
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            };
+            // SAFETY: descriptor is live for the returned guard's lifetime.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(Some(Self { file }));
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK)
+                || error.raw_os_error() == Some(libc::EAGAIN)
+            {
+                return Ok(None);
+            }
+            Err(error)
+        }
+        #[cfg(not(unix))]
+        {
+            let path = directory.path.join(".lock");
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => Ok(Some(Self { _file: file, path })),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
     fn acquire(directory: &SecureDirectory) -> io::Result<Self> {
         #[cfg(unix)]
         {
@@ -3135,10 +3894,20 @@ impl StateLock {
 
 #[cfg(unix)]
 fn lock_with_budget(file: &File) -> io::Result<()> {
+    lock_with_budget_operation(file, libc::LOCK_EX)
+}
+
+#[cfg(unix)]
+fn lock_shared_with_budget(file: &File) -> io::Result<()> {
+    lock_with_budget_operation(file, libc::LOCK_SH)
+}
+
+#[cfg(unix)]
+fn lock_with_budget_operation(file: &File, operation: libc::c_int) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     for _ in 0..160 {
         // SAFETY: descriptor is live for the duration of the caller's guard.
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let result = unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) };
         if result == 0 {
             return Ok(());
         }
@@ -3307,6 +4076,34 @@ mod tests {
             shared_host: false,
             launch_config_ambiguous: false,
         }
+    }
+
+    #[cfg(unix)]
+    fn launcher_marker_name(index: u64) -> OsString {
+        OsString::from(format!(
+            "launch-{}-pending.{:016x}",
+            100_000_u64 + index,
+            index
+        ))
+    }
+
+    #[cfg(unix)]
+    fn write_adopted_generic_launcher_fault(
+        fault_dir: &SecureDirectory,
+        index: u64,
+        observed_at_ms: u64,
+    ) -> OsString {
+        let name = launcher_marker_name(index);
+        let fault = HookIngestFault {
+            schema_version: HOOK_STATE_SCHEMA_VERSION,
+            integration: None,
+            observed_at_ms,
+            commit_id: format!("{:032x}", index + 1),
+        };
+        fault_dir
+            .create_private_new(&name, &encode_fault(&fault).unwrap())
+            .unwrap();
+        name
     }
 
     #[test]
@@ -3890,6 +4687,305 @@ mod tests {
     }
 
     #[test]
+    fn completed_root_tool_history_compacts_fifo_without_poisoning() {
+        let start = event(HookEventKind::SessionStart, 10);
+        let mut state = HookSessionState::new(&start);
+        state.apply(&start);
+        let mut prompt = event(HookEventKind::UserPromptSubmit, 20);
+        prompt.turn_id = Some("turn-root".into());
+        state.apply(&prompt);
+
+        let total = MAX_COMPLETED_ITEMS + 24;
+        for index in 0..total {
+            let tool_id = format!("root-call-{index:04}");
+            let at = 30 + (index as u64 * 2);
+            let mut pre = event(HookEventKind::PreToolUse, at);
+            pre.turn_id = Some("turn-root".into());
+            pre.tool_use_id = Some(tool_id.clone());
+            pre.tool_class = Some(HookToolClass::Ordinary);
+            state.apply(&pre);
+
+            let mut post = event(HookEventKind::PostToolUse, at + 1);
+            post.turn_id = Some("turn-root".into());
+            post.tool_use_id = Some(tool_id);
+            post.tool_class = Some(HookToolClass::Ordinary);
+            state.apply(&post);
+        }
+
+        assert_eq!(state.sticky_fault, None);
+        assert!(state.completed_history_truncated);
+        assert_eq!(state.closed_tools.len(), MAX_COMPLETED_ITEMS);
+        assert_eq!(state.completed_tool_order.len(), MAX_COMPLETED_ITEMS);
+        assert_eq!(
+            state.completed_tool_order.first().map(String::as_str),
+            Some("root-call-0024")
+        );
+        assert_eq!(
+            state.completed_tool_order.last().map(String::as_str),
+            Some("root-call-0279")
+        );
+        assert!(!state.closed_tools.contains("root-call-0000"));
+        assert_eq!(state.projection(), HookProjection::TurnOpen);
+        assert!(validate_state(&state).is_ok());
+        let persisted = serde_json::to_vec(&state).unwrap();
+        assert!(persisted.len() < MAX_STATE_BYTES as usize);
+        let restored: HookSessionState = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(restored, state);
+        assert!(validate_state(&restored).is_ok());
+
+        let retained_order = state.completed_tool_order.clone();
+        let mut duplicate_close = event(HookEventKind::PostToolUse, 1_000);
+        duplicate_close.turn_id = Some("turn-root".into());
+        duplicate_close.tool_use_id = Some("root-call-0279".into());
+        duplicate_close.tool_class = Some(HookToolClass::Ordinary);
+        state.apply(&duplicate_close);
+        assert_eq!(state.sticky_fault, None);
+        assert_eq!(state.completed_tool_order, retained_order);
+
+        let mut evicted_replay = state.clone();
+        let mut evicted_close = duplicate_close.clone();
+        evicted_close.observed_at_ms = 1_001;
+        evicted_close.tool_use_id = Some("root-call-0000".into());
+        evicted_replay.apply(&evicted_close);
+        assert_eq!(
+            evicted_replay.sticky_fault,
+            Some(StatusReason::HookEventGap)
+        );
+
+        let mut retained_replay = state;
+        let mut duplicate_open = event(HookEventKind::PreToolUse, 1_002);
+        duplicate_open.turn_id = Some("turn-root".into());
+        duplicate_open.tool_use_id = Some("root-call-0279".into());
+        duplicate_open.tool_class = Some(HookToolClass::Ordinary);
+        retained_replay.apply(&duplicate_open);
+        assert_eq!(
+            retained_replay.sticky_fault,
+            Some(StatusReason::HookEventGap)
+        );
+    }
+
+    #[test]
+    fn completed_child_tool_history_compacts_fifo_and_preserves_ownership() {
+        let start = event(HookEventKind::SessionStart, 10);
+        let mut state = HookSessionState::new(&start);
+        state.apply(&start);
+        let mut prompt = event(HookEventKind::UserPromptSubmit, 20);
+        prompt.turn_id = Some("turn-root".into());
+        state.apply(&prompt);
+        let mut child = event(HookEventKind::SubagentStart, 30);
+        child.agent_id = Some("child-a".into());
+        child.turn_id = Some("turn-child-a".into());
+        state.apply(&child);
+
+        let total = MAX_COMPLETED_ITEMS + 24;
+        for index in 0..total {
+            let tool_id = format!("child-call-{index:04}");
+            let at = 40 + (index as u64 * 2);
+            let mut pre = event(HookEventKind::PreToolUse, at);
+            pre.agent_id = Some("child-a".into());
+            pre.turn_id = Some("turn-child-a".into());
+            pre.tool_use_id = Some(tool_id.clone());
+            pre.tool_class = Some(HookToolClass::Ordinary);
+            state.apply(&pre);
+
+            let mut post = event(HookEventKind::PostToolUse, at + 1);
+            post.agent_id = Some("child-a".into());
+            post.turn_id = Some("turn-child-a".into());
+            post.tool_use_id = Some(tool_id);
+            post.tool_class = Some(HookToolClass::Ordinary);
+            state.apply(&post);
+        }
+
+        assert_eq!(state.sticky_fault, None);
+        assert!(state.completed_history_truncated);
+        assert_eq!(state.closed_child_tools.len(), MAX_COMPLETED_ITEMS);
+        assert_eq!(
+            state.completed_child_tool_order.first().map(String::as_str),
+            Some("child-call-0024")
+        );
+        assert_eq!(
+            state
+                .closed_child_tools
+                .get("child-call-0279")
+                .map(String::as_str),
+            Some("child-a")
+        );
+        assert!(validate_state(&state).is_ok());
+        assert!(serde_json::to_vec(&state).unwrap().len() < MAX_STATE_BYTES as usize);
+
+        let retained_order = state.completed_child_tool_order.clone();
+        let mut duplicate_close = event(HookEventKind::PostToolUse, 1_000);
+        duplicate_close.agent_id = Some("child-a".into());
+        duplicate_close.turn_id = Some("turn-child-a".into());
+        duplicate_close.tool_use_id = Some("child-call-0279".into());
+        duplicate_close.tool_class = Some(HookToolClass::Ordinary);
+        state.apply(&duplicate_close);
+        assert_eq!(state.sticky_fault, None);
+        assert_eq!(state.completed_child_tool_order, retained_order);
+
+        let mut child_b = event(HookEventKind::SubagentStart, 1_001);
+        child_b.agent_id = Some("child-b".into());
+        child_b.turn_id = Some("turn-child-b".into());
+        state.apply(&child_b);
+        let mut wrong_owner = duplicate_close;
+        wrong_owner.observed_at_ms = 1_002;
+        wrong_owner.agent_id = Some("child-b".into());
+        wrong_owner.turn_id = Some("turn-child-b".into());
+        state.apply(&wrong_owner);
+        assert_eq!(state.sticky_fault, Some(StatusReason::HookEventGap));
+    }
+
+    #[test]
+    fn completed_subagent_and_question_histories_compact_fifo() {
+        let start = event(HookEventKind::SessionStart, 10);
+        let mut state = HookSessionState::new(&start);
+        state.apply(&start);
+
+        for index in 0..(MAX_COMPLETED_ITEMS + 8) {
+            let agent_id = format!("closed-child-{index:04}");
+            state.closed_subagents.insert(agent_id.clone());
+            state.completed_subagent_order.push(agent_id);
+            let question_id = format!("closed-question-{index:04}");
+            state.closed_questions.insert(question_id.clone());
+            state.completed_question_order.push(question_id);
+        }
+        state.compact_completed_history();
+
+        assert_eq!(state.sticky_fault, None);
+        assert!(state.completed_history_truncated);
+        assert_eq!(state.closed_subagents.len(), MAX_COMPLETED_ITEMS);
+        assert_eq!(state.closed_questions.len(), MAX_COMPLETED_ITEMS);
+        assert_eq!(
+            state.completed_subagent_order.first().map(String::as_str),
+            Some("closed-child-0008")
+        );
+        assert_eq!(
+            state.completed_question_order.first().map(String::as_str),
+            Some("closed-question-0008")
+        );
+        assert!(validate_state(&state).is_ok());
+    }
+
+    #[test]
+    fn legacy_completed_history_without_order_metadata_is_normalized_on_fold() {
+        let start = event(HookEventKind::SessionStart, 10);
+        let mut state = HookSessionState::new(&start);
+        state.apply(&start);
+        let mut prompt = event(HookEventKind::UserPromptSubmit, 20);
+        prompt.turn_id = Some("turn-root".into());
+        state.apply(&prompt);
+        let mut pre = event(HookEventKind::PreToolUse, 30);
+        pre.turn_id = Some("turn-root".into());
+        pre.tool_use_id = Some("root-call-a".into());
+        pre.tool_class = Some(HookToolClass::Ordinary);
+        state.apply(&pre);
+        let mut post = event(HookEventKind::PostToolUse, 40);
+        post.turn_id = Some("turn-root".into());
+        post.tool_use_id = Some("root-call-a".into());
+        post.tool_class = Some(HookToolClass::Ordinary);
+        state.apply(&post);
+
+        let mut value = serde_json::to_value(&state).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "completed_tool_order",
+            "completed_child_tool_order",
+            "completed_subagent_order",
+            "completed_question_order",
+            "completed_history_truncated",
+        ] {
+            object.remove(field);
+        }
+        let mut legacy: HookSessionState = serde_json::from_value(value).unwrap();
+        assert!(legacy.completed_tool_order.is_empty());
+        assert!(validate_state(&legacy).is_ok());
+
+        let mut next_pre = event(HookEventKind::PreToolUse, 50);
+        next_pre.turn_id = Some("turn-root".into());
+        next_pre.tool_use_id = Some("root-call-b".into());
+        next_pre.tool_class = Some(HookToolClass::Ordinary);
+        legacy.apply(&next_pre);
+        let mut next_post = event(HookEventKind::PostToolUse, 60);
+        next_post.turn_id = Some("turn-root".into());
+        next_post.tool_use_id = Some("root-call-b".into());
+        next_post.tool_class = Some(HookToolClass::Ordinary);
+        legacy.apply(&next_post);
+
+        assert_eq!(
+            legacy.completed_tool_order,
+            ["root-call-a".to_string(), "root-call-b".to_string()]
+        );
+        assert_eq!(legacy.schema_version, HOOK_STATE_SCHEMA_VERSION);
+        assert!(validate_state(&legacy).is_ok());
+    }
+
+    #[test]
+    fn unresolved_tool_capacity_still_fails_closed() {
+        let start = event(HookEventKind::SessionStart, 10);
+        let mut state = HookSessionState::new(&start);
+        state.apply(&start);
+        let mut prompt = event(HookEventKind::UserPromptSubmit, 20);
+        prompt.turn_id = Some("turn-root".into());
+        state.apply(&prompt);
+
+        for index in 0..=MAX_OPEN_ITEMS {
+            let mut pre = event(HookEventKind::PreToolUse, 30 + index as u64);
+            pre.turn_id = Some("turn-root".into());
+            pre.tool_use_id = Some(format!("open-call-{index:04}"));
+            pre.tool_class = Some(HookToolClass::Ordinary);
+            state.apply(&pre);
+        }
+
+        assert_eq!(state.open_tools.len(), MAX_OPEN_ITEMS);
+        assert_eq!(state.sticky_fault, Some(StatusReason::HookStateMalformed));
+        assert_eq!(
+            state.projection(),
+            HookProjection::Unknown(StatusReason::HookStateMalformed)
+        );
+        assert!(validate_state(&state).is_ok());
+    }
+
+    #[test]
+    fn encoding_rejects_structurally_bounded_state_above_storage_limit() {
+        fn maximal_id(category: &str, index: usize) -> String {
+            let prefix = format!("{category}-{index:04}-");
+            format!("{prefix}{}", "x".repeat(MAX_ID_BYTES - prefix.len()))
+        }
+
+        let start = event(HookEventKind::SessionStart, 10);
+        let mut state = HookSessionState::new(&start);
+        state.apply(&start);
+        let owner = maximal_id("owner", 0);
+        state.open_subagents.insert(owner.clone());
+        state.subagent_opened_at_ms.insert(owner.clone(), 10);
+
+        for index in 0..MAX_COMPLETED_ITEMS {
+            let root_tool = maximal_id("root", index);
+            state.closed_tools.insert(root_tool.clone());
+            state.completed_tool_order.push(root_tool);
+
+            let child_tool = maximal_id("child-tool", index);
+            state
+                .closed_child_tools
+                .insert(child_tool.clone(), owner.clone());
+            state.completed_child_tool_order.push(child_tool);
+
+            let subagent = maximal_id("closed-agent", index);
+            state.closed_subagents.insert(subagent.clone());
+            state.completed_subagent_order.push(subagent);
+
+            let question = maximal_id("question", index);
+            state.closed_questions.insert(question.clone());
+            state.completed_question_order.push(question);
+        }
+
+        assert!(serde_json::to_vec(&state).unwrap().len() > MAX_STATE_BYTES as usize);
+        assert!(validate_state(&state).is_ok());
+        let error = encode_state(&state).unwrap_err();
+        assert!(error.to_string().contains("storage bound"));
+    }
+
+    #[test]
     fn sample_history_is_bounded() {
         let start = event(HookEventKind::SessionStart, 1);
         let mut state = HookSessionState::new(&start);
@@ -3961,6 +5057,164 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn in_flight_atomic_state_temp_does_not_poison_a_read() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        let state = store.fold(event(HookEventKind::SessionStart, 10)).unwrap();
+        let reader = ingress.bind(identity()).unwrap();
+
+        let write_lock = StateLock::acquire(&store.state_dir).unwrap();
+        let temporary_name = OsStr::new(".tmp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        drop(
+            store
+                .state_dir
+                .create_private_new(temporary_name, &encode_state(&state).unwrap())
+                .unwrap(),
+        );
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader_thread = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx.send(reader.read_all(20)).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        // An unsynchronized reader returns the poisoned snapshot while the
+        // writer is paused here. A synchronized reader waits for the atomic
+        // replacement window to close and then takes a fresh snapshot.
+        let early = match result_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => Some(result),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => panic!("state reader disconnected"),
+        };
+        store.state_dir.remove(temporary_name).unwrap();
+        drop(write_lock);
+        let scan = early
+            .unwrap_or_else(|| {
+                result_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("state reader remained blocked")
+            })
+            .unwrap();
+        reader_thread.join().unwrap();
+
+        assert_eq!(scan.rejected, 0);
+        assert_eq!(scan.states, vec![state]);
+        assert_eq!(scan.states[0].sticky_fault, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn combined_read_lock_blocks_state_writer_between_snapshot_halves() {
+        use std::cell::Cell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        let state = store.fold(event(HookEventKind::SessionStart, 10)).unwrap();
+        let state_name = OsString::from(format!("state-{}.json", state.generation_id));
+        let mut replacement = state.clone();
+        replacement.updated_at_ms = 15;
+        replacement.sticky_fault = Some(StatusReason::HookStateMalformed);
+        let writer_interposed = Cell::new(false);
+
+        let scan = store
+            .read_all_with_between_snapshot(20, || {
+                if let Some(_lock) = StateLock::try_acquire(&store.state_dir).unwrap() {
+                    writer_interposed.set(true);
+                    write_state_file(&store.state_dir, &state_name, &replacement).unwrap();
+                }
+            })
+            .unwrap();
+
+        assert!(!writer_interposed.get());
+        assert_eq!(scan.rejected, 0);
+        assert_eq!(scan.states, vec![state]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn combined_read_lock_blocks_fault_compaction_temp_between_snapshot_halves() {
+        use std::cell::RefCell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        let state = store.fold(event(HookEventKind::SessionStart, 10)).unwrap();
+        let compaction_lock = RefCell::new(None);
+        let fault = HookIngestFault {
+            schema_version: HOOK_STATE_SCHEMA_VERSION,
+            integration: None,
+            observed_at_ms: 15,
+            commit_id: "a".repeat(INGEST_COMMIT_ID_LEN),
+        };
+        let fault_bytes = encode_fault(&fault).unwrap();
+        let temporary_name = OsStr::new(FAULT_COMPACTION_TEMP_NAME);
+
+        let scan = store
+            .read_all_with_between_snapshot(20, || {
+                if let Some(lock) = StateLock::try_acquire(&store.state_dir).unwrap() {
+                    drop(
+                        store
+                            .fault_dir
+                            .create_private_new(temporary_name, &fault_bytes)
+                            .unwrap(),
+                    );
+                    compaction_lock.replace(Some(lock));
+                }
+            })
+            .unwrap();
+
+        let compactor_interposed = compaction_lock.borrow().is_some();
+        if compactor_interposed {
+            store.fault_dir.remove(temporary_name).unwrap();
+            drop(compaction_lock.borrow_mut().take());
+        }
+        assert!(!compactor_interposed);
+        assert_eq!(scan.rejected, 0);
+        assert_eq!(scan.states, vec![state]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_writer_reruns_the_entire_combined_snapshot() {
+        use std::cell::Cell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        let writer_started = Cell::new(false);
+        let snapshot_count = Cell::new(0_u8);
+
+        let scan = store
+            .read_all_with_between_snapshot(30, || {
+                snapshot_count.set(snapshot_count.get() + 1);
+                if !writer_started.replace(true) {
+                    store.fold(event(HookEventKind::SessionStart, 10)).unwrap();
+                    drop(store.begin_ingest(20).unwrap());
+                }
+            })
+            .unwrap();
+
+        assert_eq!(snapshot_count.get(), 2);
+        assert_eq!(scan.rejected, 0);
+        assert_eq!(scan.states.len(), 1);
+        assert_eq!(
+            scan.states[0].sticky_fault,
+            Some(StatusReason::HookEventGap)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn failed_ingest_poison_persists_until_a_clean_generation() {
         let temp = tempfile::tempdir().unwrap();
         let plugin_data = private_plugin_data(&temp);
@@ -3985,6 +5239,408 @@ mod tests {
         successful.succeed().unwrap();
         let still_clean = store.read_all(70).unwrap();
         assert_eq!(still_clean.states[0].sticky_fault, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_over_soft_cap_fault_ledger_is_read_through_the_recovery_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        let mut first = event(HookEventKind::SessionStart, 10);
+        first.session_id = "session-a".into();
+        store.fold(first).unwrap();
+        let mut second = event(HookEventKind::SessionStart, 11);
+        second.session_id = "session-b".into();
+        store.fold(second).unwrap();
+
+        for index in 0..148 {
+            write_adopted_generic_launcher_fault(&store.fault_dir, index, 20 + index);
+        }
+
+        let mut clean = event(HookEventKind::SessionStart, 1_000);
+        clean.session_id = "session-a".into();
+        store.fold(clean).unwrap();
+        let scan = store.read_all(1_100).unwrap();
+        assert_eq!(scan.rejected, 0);
+        let first = scan
+            .states
+            .iter()
+            .find(|state| state.session_id == "session-a")
+            .unwrap();
+        let second = scan
+            .states
+            .iter()
+            .find(|state| state.session_id == "session-b")
+            .unwrap();
+        assert_eq!(first.created_at_ms, 1_000);
+        assert_eq!(first.sticky_fault, None);
+        assert_eq!(second.sticky_fault, Some(StatusReason::HookEventGap));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn over_hard_cap_ledger_is_fail_closed_then_recovers_in_bounded_batches() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        store.fold(event(HookEventKind::SessionStart, 10)).unwrap();
+        for index in 0..600 {
+            write_adopted_generic_launcher_fault(&store.fault_dir, index, 20 + index);
+        }
+
+        let before = store.read_all(1_000).unwrap();
+        assert!(before.rejected >= 1);
+        assert_eq!(
+            before.states[0].sticky_fault,
+            Some(StatusReason::HookStateMalformed)
+        );
+
+        ingress
+            .reclaim_stale_artifacts_after_drain(1_000, None)
+            .unwrap();
+        assert!(store.read_all(1_000).unwrap().rejected >= 1);
+        ingress
+            .reclaim_stale_artifacts_after_drain(1_000, None)
+            .unwrap();
+        let after = store.read_all(1_000).unwrap();
+        assert_eq!(after.rejected, 0);
+        assert_eq!(
+            after.states[0].sticky_fault,
+            Some(StatusReason::HookEventGap)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_cap_recovery_preserves_the_current_protected_marker() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        store.fold(event(HookEventKind::SessionStart, 10)).unwrap();
+        for index in 0..MAX_FAULT_RECOVERY_FILES as u64 {
+            write_adopted_generic_launcher_fault(&store.fault_dir, index, 20 + index);
+        }
+        let protected_name = launcher_marker_name(2_000);
+        drop(
+            store
+                .fault_dir
+                .create_private_new(&protected_name, &[])
+                .unwrap(),
+        );
+        let protected = ingress.adopt_launcher_marker(&protected_name, 900).unwrap();
+        let protected_proof = protected.marker_id().unwrap().to_string();
+        let path = store.fault_dir.path.join(&protected_name);
+        let before = fs::metadata(&path).unwrap();
+
+        assert!(store.read_all(1_000).unwrap().rejected >= 1);
+        ingress
+            .reclaim_stale_artifacts_after_drain(1_000, Some(&protected_proof))
+            .unwrap();
+        let after = store.read_all(1_000).unwrap();
+        assert_eq!(after.rejected, 0);
+        let current = fs::metadata(&path).unwrap();
+        assert_eq!((before.dev(), before.ino()), (current.dev(), current.ino()));
+        protected.succeed().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compaction_persists_overflow_before_removing_exact_launcher_inodes() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        store.fold(event(HookEventKind::SessionStart, 10)).unwrap();
+
+        // Exceed both the 128-file soft cap and the old generic atomic-write
+        // listing bound so overflow replacement exercises its recovery bound.
+        for index in 0..300 {
+            write_adopted_generic_launcher_fault(&store.fault_dir, index, 20 + index);
+        }
+
+        let protected_name = launcher_marker_name(1_000);
+        drop(
+            store
+                .fault_dir
+                .create_private_new(&protected_name, &[])
+                .unwrap(),
+        );
+        let protected = ingress
+            .adopt_launcher_marker(&protected_name, 1_000)
+            .unwrap();
+        let protected_proof = protected.marker_id().unwrap().to_string();
+        let protected_path = store.fault_dir.path.join(&protected_name);
+        let before = fs::metadata(&protected_path).unwrap();
+
+        for _ in 0..8 {
+            ingress
+                .reclaim_stale_artifacts_after_drain(1_100, Some(&protected_proof))
+                .unwrap();
+        }
+
+        let overflow = read_fault_file(&store.fault_dir, OsStr::new(FAULT_OVERFLOW_NAME)).unwrap();
+        assert_eq!(overflow.integration, None);
+        assert_eq!(overflow.observed_at_ms, 319);
+        let after = fs::metadata(&protected_path).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        let (names, truncated) = store
+            .fault_dir
+            .list_names(MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES)
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| {
+                    name.to_str().is_some_and(|name| {
+                        valid_fault_filename(name) || valid_launcher_fault_filename(name)
+                    })
+                })
+                .count(),
+            2
+        );
+        let scan = store.read_all(1_100).unwrap();
+        assert_eq!(scan.rejected, 0);
+        assert_eq!(
+            scan.states[0].sticky_fault,
+            Some(StatusReason::HookEventGap)
+        );
+        protected.succeed().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compaction_drops_committed_marker_without_promoting_it_to_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        store.fold(event(HookEventKind::SessionStart, 10)).unwrap();
+        let unresolved_name = write_adopted_generic_launcher_fault(&store.fault_dir, 0, 20);
+
+        let committed_name = launcher_marker_name(1);
+        drop(
+            store
+                .fault_dir
+                .create_private_new(&committed_name, &[])
+                .unwrap(),
+        );
+        let committed_guard = ingress.adopt_launcher_marker(&committed_name, 30).unwrap();
+        let committed_proof = committed_guard.marker_id().unwrap().to_string();
+        let mut prompt = event(HookEventKind::UserPromptSubmit, 30);
+        prompt.turn_id = Some("turn-a".into());
+        prompt.ingest_marker_id = committed_proof.clone();
+        store.fold(prompt).unwrap();
+        drop(committed_guard);
+
+        ingress
+            .reclaim_stale_artifacts_after_drain(40, None)
+            .unwrap();
+
+        let overflow = read_fault_file(&store.fault_dir, OsStr::new(FAULT_OVERFLOW_NAME)).unwrap();
+        assert_eq!(overflow.observed_at_ms, 20);
+        assert!(!store.fault_dir.path.join(unresolved_name).exists());
+        assert!(!store.fault_dir.path.join(committed_name).exists());
+        let state = store.read_all(40).unwrap().states.remove(0);
+        assert!(state.completed_ingests.contains(&committed_proof));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_empty_overflow_creation_aborts_compaction_without_deletion() {
+        use std::cell::Cell;
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        store.fold(event(HookEventKind::SessionStart, 10)).unwrap();
+        let marker = write_adopted_generic_launcher_fault(&store.fault_dir, 0, 20);
+        let states = generations_for_artifact_reclamation(&store.state_dir)
+            .unwrap()
+            .unwrap();
+        let created_inode = Cell::new(None);
+
+        let _lock = StateLock::acquire(&store.state_dir).unwrap();
+        compact_adopted_generic_launcher_faults_with(&store.fault_dir, &states, 30, None, || {
+            drop(
+                store
+                    .fault_dir
+                    .create_private_new(OsStr::new(FAULT_OVERFLOW_NAME), &[])
+                    .unwrap(),
+            );
+            let metadata = fs::metadata(store.fault_dir.path.join(FAULT_OVERFLOW_NAME)).unwrap();
+            created_inode.set(Some((metadata.dev(), metadata.ino())));
+        })
+        .unwrap();
+        drop(_lock);
+
+        assert!(store.fault_dir.path.join(marker).exists());
+        let overflow_metadata =
+            fs::metadata(store.fault_dir.path.join(FAULT_OVERFLOW_NAME)).unwrap();
+        assert_eq!(overflow_metadata.len(), 0);
+        assert_eq!(
+            created_inode.get(),
+            Some((overflow_metadata.dev(), overflow_metadata.ino()))
+        );
+        let scan = store.read_all(30).unwrap();
+        assert!(scan.rejected >= 1);
+        assert_eq!(
+            scan.states[0].sticky_fault,
+            Some(StatusReason::HookStateMalformed)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reserved_compaction_temp_blocks_replacement_without_deleting_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        let mut start = event(HookEventKind::SessionStart, 10);
+        start.process = gone_process_identity();
+        store.fold(start).unwrap();
+        store.record_overflow_fault(15, None).unwrap();
+        let source = write_adopted_generic_launcher_fault(&store.fault_dir, 0, 20);
+        let source_path = store.fault_dir.path.join(&source);
+        let temporary_path = store.fault_dir.path.join(FAULT_COMPACTION_TEMP_NAME);
+        drop(
+            store
+                .fault_dir
+                .create_private_new(OsStr::new(FAULT_COMPACTION_TEMP_NAME), b"stale")
+                .unwrap(),
+        );
+        let recovery_at_ms = 2_000 + TERMINAL_RETENTION_MS + 1;
+        set_modified_ms(&temporary_path, 2_000);
+        set_modified_ms(&source_path, recovery_at_ms - 1_000);
+
+        assert!(ingress
+            .reclaim_stale_artifacts_after_drain(30, None)
+            .is_err());
+        assert!(source_path.exists());
+        assert!(temporary_path.exists());
+        let scan = store.read_all(30).unwrap();
+        assert!(scan.rejected >= 1);
+        assert_eq!(
+            scan.states[0].sticky_fault,
+            Some(StatusReason::HookStateMalformed)
+        );
+
+        // The failed compaction remains fail-closed, but it must not starve
+        // independently authorized stale-temp recovery forever.
+        assert!(ingress
+            .reclaim_stale_artifacts_after_drain(recovery_at_ms, None)
+            .is_err());
+        assert!(!temporary_path.exists());
+        assert!(source_path.exists());
+
+        ingress
+            .reclaim_stale_artifacts_after_drain(recovery_at_ms + 1, None)
+            .unwrap();
+        assert!(!source_path.exists());
+        let overflow = read_fault_file(&store.fault_dir, OsStr::new(FAULT_OVERFLOW_NAME)).unwrap();
+        assert_eq!(overflow.observed_at_ms, 20);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contended_state_lock_skips_compaction_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        store.fold(event(HookEventKind::SessionStart, 10)).unwrap();
+        let source = write_adopted_generic_launcher_fault(&store.fault_dir, 0, 20);
+        let source_path = store.fault_dir.path.join(&source);
+        let before = fs::metadata(&source_path).unwrap();
+        let _held = StateLock::acquire(&store.state_dir).unwrap();
+
+        ingress
+            .reclaim_stale_artifacts_after_drain(30, None)
+            .unwrap();
+
+        let after = fs::metadata(&source_path).unwrap();
+        assert!(same_file(&before, &after));
+        assert!(!store.fault_dir.path.join(FAULT_OVERFLOW_NAME).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compaction_scans_past_uncompactable_entries_but_stops_at_its_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        store.fold(event(HookEventKind::SessionStart, 10)).unwrap();
+
+        for index in 0..80 {
+            let name = launcher_marker_name(index);
+            drop(store.fault_dir.create_private_new(&name, &[]).unwrap());
+        }
+        let valid = (100..170)
+            .map(|index| write_adopted_generic_launcher_fault(&store.fault_dir, index, 20 + index))
+            .collect::<Vec<_>>();
+
+        ingress
+            .reclaim_stale_artifacts_after_drain(300, None)
+            .unwrap();
+
+        let remaining_valid = valid
+            .iter()
+            .filter(|name| store.fault_dir.path.join(name).exists())
+            .count();
+        assert_eq!(remaining_valid, 70 - MAX_FAULT_COMPACTION_BATCH_FILES);
+        assert!(store.fault_dir.path.join(FAULT_OVERFLOW_NAME).exists());
+        assert!((0..80).all(|index| {
+            store
+                .fault_dir
+                .path
+                .join(launcher_marker_name(index))
+                .exists()
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_marker_and_overflow_take_the_fast_no_compaction_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        store.record_overflow_fault(10, None).unwrap();
+        let current_name = launcher_marker_name(1);
+        drop(
+            store
+                .fault_dir
+                .create_private_new(&current_name, &[])
+                .unwrap(),
+        );
+        let current = ingress.adopt_launcher_marker(&current_name, 20).unwrap();
+        let proof = current.marker_id().unwrap();
+        for index in 10..20 {
+            let name = launcher_marker_name(index);
+            drop(store.fault_dir.create_private_new(&name, &[]).unwrap());
+        }
+
+        assert!(!fault_compaction_may_be_needed(&store.fault_dir, 30, Some(proof)).unwrap());
+        assert!(!stale_artifact_reclamation_may_be_needed(
+            &store.state_dir,
+            &store.fault_dir,
+            30,
+            Some(proof),
+        )
+        .unwrap());
+        current.succeed().unwrap();
     }
 
     #[cfg(unix)]
@@ -4254,14 +5910,14 @@ mod tests {
         );
 
         ingress
-            .reclaim_stale_artifacts_after_drain(marker_time + TERMINAL_RETENTION_MS)
+            .reclaim_stale_artifacts_after_drain(marker_time + TERMINAL_RETENTION_MS, None)
             .unwrap();
         assert!(
             marker_path.exists(),
             "the 24h boundary is still fail-closed"
         );
         ingress
-            .reclaim_stale_artifacts_after_drain(marker_time + TERMINAL_RETENTION_MS + 1)
+            .reclaim_stale_artifacts_after_drain(marker_time + TERMINAL_RETENTION_MS + 1, None)
             .unwrap();
         assert!(!marker_path.exists());
         let recovered = store
@@ -4282,6 +5938,100 @@ mod tests {
         );
         guard.succeed().unwrap();
         assert!(!marker_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncated_stale_launcher_directory_reclaims_in_bounded_batches() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        let mut start = event(HookEventKind::SessionStart, 1_000);
+        start.process = gone_process_identity();
+        store.fold(start).unwrap();
+
+        for index in 0..=MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES as u64 {
+            let name = launcher_marker_name(index);
+            let path = store.fault_dir.path.join(&name);
+            drop(store.fault_dir.create_private_new(&name, &[]).unwrap());
+            set_modified_ms(&path, 2_000);
+        }
+        let now_ms = 2_000 + TERMINAL_RETENTION_MS + 1;
+        assert!(
+            store
+                .fault_dir
+                .list_names(MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES)
+                .unwrap()
+                .1
+        );
+
+        ingress
+            .reclaim_stale_artifacts_after_drain(now_ms, None)
+            .unwrap();
+        assert_eq!(
+            fs::read_dir(&store.fault_dir.path).unwrap().count(),
+            MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES + 1 - MAX_FAULT_COMPACTION_BATCH_FILES
+        );
+        for _ in 0..8 {
+            ingress
+                .reclaim_stale_artifacts_after_drain(now_ms, None)
+                .unwrap();
+        }
+
+        let (remaining, truncated) = store
+            .fault_dir
+            .list_names(MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES)
+            .unwrap();
+        assert!(!truncated);
+        assert!(remaining.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_soft_cap_prefix_does_not_hide_a_stale_launcher_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_data = private_plugin_data(&temp);
+        let ingress = HookStateStore::prepare(&plugin_data).unwrap();
+        let store = ingress.bind(identity()).unwrap();
+        let mut start = event(HookEventKind::SessionStart, 1_000);
+        start.process = gone_process_identity();
+        store.fold(start).unwrap();
+        let now_ms = TERMINAL_RETENTION_MS + 10_000;
+
+        for index in 0..(MAX_FAULT_DIRECTORY_ENTRIES + 32) as u64 {
+            let name = launcher_marker_name(index);
+            let path = store.fault_dir.path.join(&name);
+            drop(store.fault_dir.create_private_new(&name, &[]).unwrap());
+            set_modified_ms(&path, now_ms - 1_000);
+        }
+
+        let (soft_names, soft_truncated) = store
+            .fault_dir
+            .list_names(MAX_FAULT_DIRECTORY_ENTRIES)
+            .unwrap();
+        assert!(soft_truncated);
+        let soft_names = soft_names.into_iter().collect::<BTreeSet<_>>();
+        let (recovery_names, recovery_truncated) = store
+            .fault_dir
+            .list_names(MAX_FAULT_RECOVERY_DIRECTORY_ENTRIES)
+            .unwrap();
+        assert!(!recovery_truncated);
+        let stale_name = recovery_names
+            .into_iter()
+            .find(|name| !soft_names.contains(name))
+            .expect("the widened scan must expose a marker outside the soft prefix");
+        let stale_path = store.fault_dir.path.join(&stale_name);
+        set_modified_ms(&stale_path, 2_000);
+
+        ingress
+            .reclaim_stale_artifacts_after_drain(now_ms, None)
+            .unwrap();
+
+        assert!(!stale_path.exists());
+        for name in soft_names {
+            assert!(store.fault_dir.path.join(name).exists());
+        }
     }
 
     #[cfg(unix)]
@@ -4307,7 +6057,7 @@ mod tests {
             .unwrap();
 
         ingress
-            .reclaim_stale_artifacts_after_drain(marker_time + TERMINAL_RETENTION_MS + 1)
+            .reclaim_stale_artifacts_after_drain(marker_time + TERMINAL_RETENTION_MS + 1, None)
             .unwrap();
         assert!(marker_path.exists());
         let scan = store
@@ -4364,12 +6114,12 @@ mod tests {
         );
 
         ingress
-            .reclaim_stale_artifacts_after_drain(artifact_time + TERMINAL_RETENTION_MS)
+            .reclaim_stale_artifacts_after_drain(artifact_time + TERMINAL_RETENTION_MS, None)
             .unwrap();
         assert!(state_temp_path.exists());
         assert!(fault_temp_path.exists());
         ingress
-            .reclaim_stale_artifacts_after_drain(artifact_time + TERMINAL_RETENTION_MS + 1)
+            .reclaim_stale_artifacts_after_drain(artifact_time + TERMINAL_RETENTION_MS + 1, None)
             .unwrap();
         assert!(!state_temp_path.exists());
         assert!(!fault_temp_path.exists());
@@ -4390,7 +6140,7 @@ mod tests {
         store.record_overflow_fault(10, None).unwrap();
 
         ingress
-            .reclaim_stale_artifacts_after_drain(TERMINAL_RETENTION_MS + 100)
+            .reclaim_stale_artifacts_after_drain(TERMINAL_RETENTION_MS + 100, None)
             .unwrap();
         let overflow = read_fault_file(&store.fault_dir, OsStr::new(FAULT_OVERFLOW_NAME)).unwrap();
         assert_eq!(overflow.observed_at_ms, 10);
@@ -4533,6 +6283,11 @@ mod tests {
         let plugin_data = private_plugin_data(&temp);
         assert!(HookStateStore::open_existing(&plugin_data, identity()).is_err());
         assert!(!plugin_data.join(STATE_DIR_NAME).exists());
+
+        HookStateStore::prepare(&plugin_data).unwrap();
+        let store = HookStateStore::open_existing(&plugin_data, identity()).unwrap();
+        assert!(store.read_all(10).unwrap().states.is_empty());
+        assert!(!store.state_dir.path.join(".lock").exists());
     }
 
     #[cfg(unix)]

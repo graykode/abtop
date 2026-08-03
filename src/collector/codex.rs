@@ -1,15 +1,18 @@
+use super::herdr::{HerdrObservation, HerdrStatus, HerdrStatusResolver, HerdrTarget};
 use super::process::{self, ProcInfo};
 use crate::codex_hooks::{
     plugin::{self, PluginPaths},
     state::{
-        HookProjection, HookRootProjection, HookSessionState, HookStateStore, IntegrationIdentity,
+        HookProjection, HookRootProjection, HookSessionState, HookStateStore, HookToolClass,
+        IntegrationIdentity,
     },
 };
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, RateLimitInfo, SessionStatus,
-    StatusAuthority, StatusEvidence, StatusObservation, StatusReason, SubAgent, ToolCall,
-    MAX_CHAT_MESSAGES,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, RateLimitInfo, RateLimitProvenance,
+    RateLimitWindow, SessionStatus, StatusAuthority, StatusEvidence, StatusObservation,
+    StatusReason, SubAgent, ToolCall, MAX_CHAT_MESSAGES,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -46,10 +49,23 @@ pub struct CodexCollector {
     hook_process_rollout_bindings: RefCell<HashMap<HookDoneKey, HookProcessRolloutBinding>>,
     hook_live_session_snapshots: RefCell<HashMap<HookDoneKey, HookSessionSnapshot>>,
     hook_done_tombstones: RefCell<HashMap<HookDoneKey, HookDoneTombstone>>,
+    herdr_status_resolver: RefCell<HerdrStatusResolver>,
+    herdr_working_continuity: RefCell<HashMap<HerdrWorkingContinuityKey, u32>>,
 }
 
 const MAX_CODEX_PARSE_CACHE_ENTRIES: usize = 256;
 const MAX_CODEX_DONE_TOMBSTONES: usize = 128;
+const MAX_OPEN_ROLLOUT_CALLS: usize = 256;
+const MAX_TRACKED_ROLLOUT_CALL_IDS: usize = 4096;
+const MAX_COPIED_ROLLOUT_SESSION_META: usize = 64;
+const MAX_ROLLOUT_LIFECYCLE_ID_BYTES: usize = 512;
+const MAX_ROLLOUT_TOOL_NAME_BYTES: usize = 256;
+const MAX_TRACKED_CODE_MODE_CELLS: usize = 128;
+const MAX_CODE_MODE_STATUS_FRAME_BYTES: usize = 256;
+/// Native account quota windows longer than one year are malformed rather
+/// than useful display data. Bounding the duration also keeps derived labels
+/// predictably small and content-free.
+const MAX_NATIVE_RATE_LIMIT_WINDOW_MINUTES: u64 = 365 * 24 * 60;
 #[derive(Clone, PartialEq, Eq)]
 struct RolloutFingerprint {
     len: u64,
@@ -219,6 +235,11 @@ struct RolloutLifecycle {
     task_completed_at_ms: u64,
     open_tool_ids: HashSet<String>,
     open_tool_started_at_ms: HashMap<String, u64>,
+    open_tool_classes: HashMap<String, RolloutToolClass>,
+    completed_tool_calls: HashMap<String, CompletedRolloutCall>,
+    nested_code_mode_end_at_ms: HashMap<String, u64>,
+    live_code_mode_cells: usize,
+    code_mode_correlation_ambiguous: bool,
     descendants: Vec<DescendantRolloutLifecycle>,
     relevant_process_descendant: bool,
 }
@@ -238,6 +259,31 @@ struct DescendantRolloutLifecycle {
     task_completed_at_ms: u64,
     open_tool_ids: HashSet<String>,
     open_tool_started_at_ms: HashMap<String, u64>,
+    open_tool_classes: HashMap<String, RolloutToolClass>,
+    live_code_mode_cells: usize,
+    code_mode_correlation_ambiguous: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RolloutToolClass {
+    Ordinary,
+    RequestUserInput,
+    CodeModeExec {
+        exec_started_at_ms: u64,
+    },
+    CodeModeWait {
+        exec_started_at_ms: u64,
+        exec_yielded_at_ms: u64,
+    },
+    CodeModeUncorrelatable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompletedRolloutCall {
+    started_at_ms: u64,
+    completed_at_ms: u64,
+    class: RolloutToolClass,
+    code_mode_terminal: bool,
 }
 
 impl Default for RolloutLifecycle {
@@ -254,6 +300,11 @@ impl Default for RolloutLifecycle {
             task_completed_at_ms: 0,
             open_tool_ids: HashSet::new(),
             open_tool_started_at_ms: HashMap::new(),
+            open_tool_classes: HashMap::new(),
+            completed_tool_calls: HashMap::new(),
+            nested_code_mode_end_at_ms: HashMap::new(),
+            live_code_mode_cells: 0,
+            code_mode_correlation_ambiguous: false,
             descendants: Vec::new(),
             relevant_process_descendant: false,
         }
@@ -277,14 +328,25 @@ impl DescendantRolloutLifecycle {
                     && *timestamp >= self.turn_started_at_ms
                     && *timestamp <= self.latest_lifecycle_at_ms
             })
+            && self.open_tool_classes.len() == self.open_tool_ids.len()
+            && self
+                .open_tool_classes
+                .keys()
+                .all(|id| self.open_tool_ids.contains(id))
     }
 
     fn is_exact_active(&self, now_ms: u64) -> bool {
-        self.has_exact_active_shape(now_ms) && self.open_tool_ids.is_empty()
+        self.has_exact_active_shape(now_ms)
+            && self.open_tool_ids.is_empty()
+            && self.live_code_mode_cells == 0
+            && !self.code_mode_correlation_ambiguous
     }
 
     fn is_exact_active_with_open_tool(&self, now_ms: u64) -> bool {
-        self.has_exact_active_shape(now_ms) && !self.open_tool_ids.is_empty()
+        self.has_exact_active_shape(now_ms)
+            && !self.open_tool_ids.is_empty()
+            && self.live_code_mode_cells == 0
+            && !self.code_mode_correlation_ambiguous
     }
 
     fn is_exact_terminal(&self, now_ms: u64) -> bool {
@@ -299,15 +361,18 @@ impl DescendantRolloutLifecycle {
             && self.task_completed_at_ms <= now_ms
             && self.open_tool_ids.is_empty()
             && self.open_tool_started_at_ms.is_empty()
+            && self.open_tool_classes.is_empty()
+            && self.live_code_mode_cells == 0
+            && !self.code_mode_correlation_ambiguous
     }
 }
 
 impl RolloutLifecycle {
-    fn has_exact_supported_release(&self) -> bool {
+    fn has_compatible_release_tree(&self) -> bool {
         // Only the selected root attests the process release. Descendant
         // metadata cannot supply a missing root version, and disagreement
         // makes the selected lifecycle tree internally inconsistent.
-        self.root_cli_version == plugin::SUPPORTED_CODEX_VERSION
+        plugin::codex_version_is_supported(&self.root_cli_version)
             && self
                 .descendants
                 .iter()
@@ -330,6 +395,30 @@ impl RolloutLifecycle {
                     && *timestamp >= self.turn_started_at_ms
                     && *timestamp <= self.latest_lifecycle_at_ms
             })
+            && self.open_tool_classes.len() == self.open_tool_ids.len()
+            && self
+                .open_tool_classes
+                .keys()
+                .all(|id| self.open_tool_ids.contains(id))
+            && self.completed_tool_calls.len() <= MAX_TRACKED_ROLLOUT_CALL_IDS
+            && self.completed_tool_calls.iter().all(|(id, completion)| {
+                !self.open_tool_ids.contains(id)
+                    && completed_rollout_call_is_exact(
+                        id,
+                        completion,
+                        self.turn_started_at_ms,
+                        self.latest_lifecycle_at_ms,
+                    )
+            })
+            && self.nested_code_mode_end_at_ms.len() <= MAX_TRACKED_ROLLOUT_CALL_IDS
+            && self
+                .nested_code_mode_end_at_ms
+                .iter()
+                .all(|(id, timestamp)| {
+                    code_mode_nested_call_id_is_exact(id)
+                        && *timestamp >= self.turn_started_at_ms
+                        && *timestamp <= self.latest_lifecycle_at_ms
+                })
     }
 
     fn descendants_are_exact_terminal(&self, now_ms: u64) -> bool {
@@ -549,7 +638,7 @@ struct HookCollectorRecord {
     status_since_ms: u64,
     ended_at_ms: u64,
     exit_observed_at_ms: u64,
-    /// The last exact live root binding used the audited Codex release.
+    /// The last exact live root binding used a compatible Codex release.
     exit_supported_rollout_correlated: bool,
     pid: u32,
     process_incarnation: Option<String>,
@@ -558,9 +647,10 @@ struct HookCollectorRecord {
     /// Current process ownership and the matched root rollout both attest the audited release.
     supported_release_attested: bool,
     /// Exact, thread-bound proof that this live Codex process actually loaded
-    /// and enabled abtop's complete hook engine. Codex 0.146 exposes no such
-    /// proof, so production state conversion always leaves this false. Tests
-    /// may set it to true to exercise the hypothetical lifecycle projector.
+    /// and enabled abtop's complete hook engine. Supported Codex releases expose no such
+    /// proof, so production state conversion always leaves this false. It is
+    /// an actionability boundary; exact lifecycle shapes may still support a
+    /// conservative, non-actionable heuristic display.
     effective_hook_engine_attested: bool,
     actionable: bool,
     owns_resources: bool,
@@ -571,6 +661,7 @@ struct HookCollectorRecord {
     prompt_observed_at_ms: u64,
     stop_observed_at_ms: u64,
     tool_opened_at_ms: HashMap<String, u64>,
+    tool_classes: HashMap<String, HookToolClass>,
     subagent_opened_at_ms: HashMap<String, u64>,
     subagent_stopped_at_ms: HashMap<String, u64>,
     candidate: HookCandidate,
@@ -617,6 +708,131 @@ fn hook_done_key(record: &HookCollectorRecord) -> Option<HookDoneKey> {
         pid: record.pid,
         process_incarnation,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentGenerationSelection {
+    Absent,
+    Unique(usize),
+    Ambiguous,
+}
+
+fn classify_current_generation(
+    candidates: impl IntoIterator<Item = usize>,
+) -> CurrentGenerationSelection {
+    let mut candidates = candidates.into_iter();
+    let Some(first) = candidates.next() else {
+        return CurrentGenerationSelection::Absent;
+    };
+    if candidates.next().is_some() {
+        CurrentGenerationSelection::Ambiguous
+    } else {
+        CurrentGenerationSelection::Unique(first)
+    }
+}
+
+fn agreed_current_generation(
+    rollout: CurrentGenerationSelection,
+    herdr: CurrentGenerationSelection,
+) -> Option<usize> {
+    use CurrentGenerationSelection::{Absent, Ambiguous, Unique};
+
+    match (rollout, herdr) {
+        (Unique(left), Unique(right)) if left == right => Some(left),
+        (Unique(index), Absent) | (Absent, Unique(index)) => Some(index),
+        (Absent, Absent) | (Ambiguous, _) | (_, Ambiguous) | (Unique(_), Unique(_)) => None,
+    }
+}
+
+/// Select the one current thread hosted by an exact native Codex process.
+///
+/// Codex can switch threads in place without ending the prior hook generation,
+/// leaving several live-looking records on one PID/incarnation. A unique
+/// process-owned rollout or exact Herdr identity may choose the display record;
+/// disagreement remains fail-closed. This selection is status-only: it never
+/// grants process actions or resource ownership.
+fn reconcile_current_hook_generations(
+    records: &mut Vec<HookCollectorRecord>,
+    sessions: &mut Vec<AgentSession>,
+    rollout_lifecycle: &HashMap<String, RolloutLifecycle>,
+    herdr_observations: &HashMap<(String, u32), HerdrObservation>,
+    process_info: &HashMap<u32, ProcInfo>,
+    eligible_pids: &HashSet<u32>,
+) {
+    let mut groups = HashMap::<(u32, String), Vec<usize>>::new();
+    for (index, record) in records.iter().enumerate() {
+        if !hook_record_is_active_generation(record) {
+            continue;
+        }
+        if let Some(key) = hook_record_process_key(record) {
+            groups.entry(key).or_default().push(index);
+        }
+    }
+
+    let mut suppressed = HashSet::new();
+    for indices in groups.values().filter(|indices| indices.len() > 1) {
+        let rollout_selection =
+            classify_current_generation(indices.iter().copied().filter(|index| {
+                let record = &records[*index];
+                if !record.native_process_verified || !eligible_pids.contains(&record.pid) {
+                    return false;
+                }
+                let mut matching = sessions.iter().filter(|session| {
+                    session.session_id == record.session_id
+                        && session.pid == record.pid
+                        && session.cwd == record.cwd
+                        && process_info.contains_key(&session.pid)
+                        && rollout_lifecycle
+                            .get(&record.session_id)
+                            .is_some_and(|lifecycle| {
+                                lifecycle.lifecycle_valid
+                                    && session.version == lifecycle.root_cli_version
+                            })
+                });
+                matching.next().is_some() && matching.next().is_none()
+            }));
+        let herdr_selection =
+            classify_current_generation(indices.iter().copied().filter(|index| {
+                let record = &records[*index];
+                record.native_process_verified
+                    && eligible_pids.contains(&record.pid)
+                    && herdr_observations.contains_key(&(record.session_id.clone(), record.pid))
+            }));
+        let Some(selected) = agreed_current_generation(rollout_selection, herdr_selection) else {
+            continue;
+        };
+
+        // Multiple persisted records still claim this process. The selected
+        // record can describe status, but Herdr/current-thread selection never
+        // resolves destructive-action or resource ownership.
+        records[selected].actionable = false;
+        records[selected].owns_resources = false;
+        suppressed.extend(indices.iter().copied().filter(|index| *index != selected));
+    }
+
+    if suppressed.is_empty() {
+        return;
+    }
+    let suppressed_claims = suppressed
+        .iter()
+        .map(|index| {
+            let record = &records[*index];
+            (record.session_id.clone(), record.pid, record.cwd.clone())
+        })
+        .collect::<Vec<_>>();
+    sessions.retain(|session| {
+        !suppressed_claims.iter().any(|(session_id, pid, cwd)| {
+            session.session_id == *session_id
+                && session.cwd == *cwd
+                && (session.pid == 0 || session.pid == *pid)
+        })
+    });
+    let mut index = 0_usize;
+    records.retain(|_| {
+        let keep = !suppressed.contains(&index);
+        index += 1;
+        keep
+    });
 }
 
 fn cwd_has_unattested_codex_config(cwd: &str, codex_home: &Path) -> bool {
@@ -772,7 +988,7 @@ fn is_native_codex_executable(path: &Path) -> bool {
 
 /// Bind hook state to one exact native Codex process observation. Incarnation
 /// reads bracket argv/executable classification so PID reuse fails closed.
-fn native_codex_process_is_exact(pid: u32, expected_incarnation: &str) -> bool {
+pub(super) fn native_codex_process_is_exact(pid: u32, expected_incarnation: &str) -> bool {
     let Some(before) = process::get_process_incarnation(pid) else {
         return false;
     };
@@ -814,6 +1030,11 @@ fn hook_record_from_state(state: HookSessionState) -> HookCollectorRecord {
         .tool_opened_at_ms
         .iter()
         .map(|(id, timestamp)| (id.clone(), *timestamp))
+        .collect::<HashMap<_, _>>();
+    let tool_classes = state
+        .open_tools
+        .iter()
+        .map(|(id, class)| (id.clone(), *class))
         .collect::<HashMap<_, _>>();
     let subagent_opened_at_ms = state
         .subagent_opened_at_ms
@@ -943,6 +1164,7 @@ fn hook_record_from_state(state: HookSessionState) -> HookCollectorRecord {
         prompt_observed_at_ms,
         stop_observed_at_ms,
         tool_opened_at_ms,
+        tool_classes,
         subagent_opened_at_ms,
         subagent_stopped_at_ms,
         candidate,
@@ -1124,6 +1346,366 @@ fn hook_id_timestamps_are_exact(
         })
 }
 
+fn hook_open_tools_are_exact_ordinary(
+    ids: &HashSet<String>,
+    classes: &HashMap<String, HookToolClass>,
+) -> bool {
+    classes.len() == ids.len()
+        && ids.iter().all(|id| {
+            classes
+                .get(id)
+                .is_some_and(|class| *class == HookToolClass::Ordinary)
+        })
+}
+
+fn rollout_open_tools_are_exact_ordinary(
+    ids: &HashSet<String>,
+    classes: &HashMap<String, RolloutToolClass>,
+) -> bool {
+    classes.len() == ids.len()
+        && ids.iter().all(|id| {
+            classes
+                .get(id)
+                .is_some_and(|class| *class == RolloutToolClass::Ordinary)
+        })
+}
+
+fn code_mode_nested_call_id_is_exact(id: &str) -> bool {
+    let Some(uuid) = id.strip_prefix("exec-") else {
+        return false;
+    };
+    let bytes = uuid.as_bytes();
+    if bytes.len() != 36
+        || ![8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        || bytes[14] != b'4'
+        || !matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+    {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(index, byte)| {
+        matches!(index, 8 | 13 | 18 | 23) || byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+    })
+}
+
+fn uuid_v7_timestamp_ms(id: &str) -> Option<u64> {
+    let bytes = id.as_bytes();
+    if bytes.len() != 36
+        || ![8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        || bytes[14] != b'7'
+        || !matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+        || !bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23)
+                || byte.is_ascii_digit()
+                || matches!(byte, b'a'..=b'f')
+        })
+    {
+        return None;
+    }
+
+    let timestamp_hex = [&id[..8], &id[9..13]].concat();
+    u64::from_str_radix(&timestamp_hex, 16).ok()
+}
+
+fn rollout_call_id_is_exact(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix("call_") else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix.len() <= 128
+        && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn completed_rollout_call_is_exact(
+    call_id: &str,
+    completion: &CompletedRolloutCall,
+    turn_started_at_ms: u64,
+    latest_lifecycle_at_ms: u64,
+) -> bool {
+    rollout_call_id_is_exact(call_id)
+        && turn_started_at_ms <= completion.started_at_ms
+        && completion.started_at_ms <= completion.completed_at_ms
+        && completion.completed_at_ms <= latest_lifecycle_at_ms
+        && match completion.class {
+            RolloutToolClass::CodeModeExec { exec_started_at_ms } => {
+                exec_started_at_ms == completion.started_at_ms
+            }
+            RolloutToolClass::Ordinary
+            | RolloutToolClass::RequestUserInput
+            | RolloutToolClass::CodeModeWait { .. }
+            | RolloutToolClass::CodeModeUncorrelatable => !completion.code_mode_terminal,
+        }
+}
+
+fn code_mode_open_tool_shape_is_exact(
+    hook_ids: &HashSet<String>,
+    hook_classes: &HashMap<String, HookToolClass>,
+    hook_opened_at_ms: &HashMap<String, u64>,
+    state: &RolloutLifecycle,
+) -> bool {
+    if !plugin::codex_version_has_verified_code_mode_shape(&state.root_cli_version)
+        || hook_ids.len() != 1
+        || state.open_tool_ids.len() != 1
+        || !hook_open_tools_are_exact_ordinary(hook_ids, hook_classes)
+        || state.open_tool_classes.len() != 1
+        || state.code_mode_correlation_ambiguous
+    {
+        return false;
+    }
+    let Some(hook_id) = hook_ids.iter().next() else {
+        return false;
+    };
+    let Some(rollout_id) = state.open_tool_ids.iter().next() else {
+        return false;
+    };
+    let Some(rollout_started_at_ms) = state.open_tool_started_at_ms.get(rollout_id).copied() else {
+        return false;
+    };
+    let Some(class) = state.open_tool_classes.get(rollout_id) else {
+        return false;
+    };
+    let Some(hook_opened_at_ms) = hook_opened_at_ms.get(hook_id).copied() else {
+        return false;
+    };
+    if !code_mode_nested_call_id_is_exact(hook_id) || !rollout_call_id_is_exact(rollout_id) {
+        return false;
+    }
+    match class {
+        RolloutToolClass::CodeModeExec { exec_started_at_ms } => {
+            state.live_code_mode_cells == 0
+                && *exec_started_at_ms == rollout_started_at_ms
+                && state.turn_started_at_ms <= *exec_started_at_ms
+                && *exec_started_at_ms <= hook_opened_at_ms
+        }
+        RolloutToolClass::CodeModeWait {
+            exec_started_at_ms,
+            exec_yielded_at_ms,
+        } => {
+            state.live_code_mode_cells == 1
+                && *exec_started_at_ms <= *exec_yielded_at_ms
+                && *exec_yielded_at_ms <= rollout_started_at_ms
+                && *exec_started_at_ms <= hook_opened_at_ms
+                && hook_opened_at_ms <= *exec_yielded_at_ms
+        }
+        RolloutToolClass::Ordinary
+        | RolloutToolClass::RequestUserInput
+        | RolloutToolClass::CodeModeUncorrelatable => false,
+    }
+}
+
+fn exactly_completed_root_hook_ids(
+    record: &HookCollectorRecord,
+    hook_ids: &HashSet<String>,
+    state: &RolloutLifecycle,
+    now_ms: u64,
+) -> Option<HashSet<String>> {
+    if !hook_id_timestamps_are_exact(record, hook_ids, &record.tool_opened_at_ms)
+        || !hook_open_tools_are_exact_ordinary(hook_ids, &record.tool_classes)
+        || !state.root_is_exact_active(now_ms)
+        || state.active_turn_id != record.turn_id
+        || record.turn_id.is_none()
+        || state.code_mode_correlation_ambiguous
+    {
+        return None;
+    }
+
+    let mut nested_end_timestamps = state
+        .nested_code_mode_end_at_ms
+        .values()
+        .copied()
+        .collect::<Vec<_>>();
+    nested_end_timestamps.sort_unstable();
+    let completions_with_nested_identity = state
+        .completed_tool_calls
+        .iter()
+        .filter_map(|(outer_id, call)| {
+            let first =
+                nested_end_timestamps.partition_point(|timestamp| *timestamp < call.started_at_ms);
+            nested_end_timestamps
+                .get(first)
+                .is_some_and(|timestamp| *timestamp <= call.completed_at_ms)
+                .then_some(outer_id.as_str())
+        })
+        .collect::<HashSet<_>>();
+
+    let mut completed = HashSet::new();
+    let mut nested_candidates = Vec::<(String, String)>::new();
+    for hook_id in hook_ids {
+        let hook_opened_at_ms = record.tool_opened_at_ms.get(hook_id).copied()?;
+        if rollout_call_id_is_exact(hook_id) {
+            if state.completed_tool_calls.get(hook_id).is_some_and(|call| {
+                call.class == RolloutToolClass::Ordinary
+                    && !state.open_tool_ids.contains(hook_id)
+                    && call.started_at_ms <= hook_opened_at_ms
+                    && hook_opened_at_ms <= call.completed_at_ms
+                    && call.completed_at_ms <= record.observed_at_ms
+            }) {
+                completed.insert(hook_id.clone());
+            }
+            continue;
+        }
+        if !plugin::codex_version_has_verified_code_mode_shape(&state.root_cli_version)
+            || !code_mode_nested_call_id_is_exact(hook_id)
+        {
+            continue;
+        }
+        let mut matching_outer_calls =
+            state
+                .completed_tool_calls
+                .iter()
+                .filter_map(|(outer_id, call)| {
+                    matches!(
+                        call.class,
+                        RolloutToolClass::CodeModeExec { exec_started_at_ms }
+                            if exec_started_at_ms == call.started_at_ms
+                    )
+                    .then_some((outer_id, call))
+                    .filter(|(outer_id, call)| {
+                        let nested_identity_observed =
+                            completions_with_nested_identity.contains(outer_id.as_str());
+                        let nested_identity_matches = !nested_identity_observed
+                            || state.nested_code_mode_end_at_ms.get(hook_id).is_some_and(
+                                |ended_at_ms| {
+                                    call.started_at_ms <= *ended_at_ms
+                                        && hook_opened_at_ms <= *ended_at_ms
+                                        && *ended_at_ms <= call.completed_at_ms
+                                },
+                            );
+                        call.code_mode_terminal
+                            && !state.open_tool_ids.contains(*outer_id)
+                            && call.started_at_ms <= hook_opened_at_ms
+                            && hook_opened_at_ms <= call.completed_at_ms
+                            && call.completed_at_ms <= record.observed_at_ms
+                            && nested_identity_matches
+                    })
+                });
+        let Some((outer_id, _)) = matching_outer_calls.next() else {
+            continue;
+        };
+        if matching_outer_calls.next().is_none() {
+            nested_candidates.push((hook_id.clone(), outer_id.clone()));
+        }
+    }
+
+    let mut outer_counts = HashMap::<String, usize>::new();
+    for (_, outer_id) in &nested_candidates {
+        *outer_counts.entry(outer_id.clone()).or_default() += 1;
+    }
+    completed.extend(
+        nested_candidates
+            .into_iter()
+            .filter_map(|(hook_id, outer_id)| {
+                (outer_counts.get(&outer_id) == Some(&1)).then_some(hook_id)
+            }),
+    );
+    Some(completed)
+}
+
+fn reconciled_herdr_hook_record(
+    record: &HookCollectorRecord,
+    state: &RolloutLifecycle,
+    now_ms: u64,
+) -> Option<HookCollectorRecord> {
+    let root_hook_ids = match &record.candidate {
+        HookCandidate::ToolOpen(ids) => ids,
+        HookCandidate::SubagentOpen {
+            root: HookRootCandidate::ToolOpen(ids),
+            ..
+        } => ids,
+        _ => return Some(record.clone()),
+    };
+    let completed = exactly_completed_root_hook_ids(record, root_hook_ids, state, now_ms)?;
+    if completed.is_empty() {
+        return Some(record.clone());
+    }
+    let remaining = root_hook_ids
+        .difference(&completed)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut reconciled = record.clone();
+    reconciled
+        .tool_opened_at_ms
+        .retain(|id, _| remaining.contains(id));
+    reconciled
+        .tool_classes
+        .retain(|id, _| remaining.contains(id));
+    reconciled.candidate = match &record.candidate {
+        HookCandidate::ToolOpen(_) if remaining.is_empty() => HookCandidate::TurnOpen,
+        HookCandidate::ToolOpen(_) => HookCandidate::ToolOpen(remaining.clone()),
+        HookCandidate::SubagentOpen {
+            active,
+            provisional,
+            root: HookRootCandidate::ToolOpen(_),
+        } => HookCandidate::SubagentOpen {
+            active: active.clone(),
+            provisional: provisional.clone(),
+            root: if remaining.is_empty() {
+                HookRootCandidate::TurnOpen
+            } else {
+                HookRootCandidate::ToolOpen(remaining.clone())
+            },
+        },
+        _ => return Some(record.clone()),
+    };
+    if matches!(reconciled.candidate, HookCandidate::TurnOpen) {
+        reconciled.status_since_ms = reconciled.prompt_observed_at_ms;
+    } else if matches!(reconciled.candidate, HookCandidate::ToolOpen(_)) {
+        reconciled.status_since_ms = remaining
+            .iter()
+            .filter_map(|id| reconciled.tool_opened_at_ms.get(id).copied())
+            .min()
+            .unwrap_or(0);
+    }
+    Some(reconciled)
+}
+
+fn subagent_root_tool_refinement_is_exact(
+    record: &HookCollectorRecord,
+    state: &RolloutLifecycle,
+    now_ms: u64,
+) -> bool {
+    let HookCandidate::SubagentOpen {
+        active,
+        provisional,
+        root: HookRootCandidate::ToolOpen(_),
+    } = &record.candidate
+    else {
+        return matches!(record.candidate, HookCandidate::ToolOpen(_));
+    };
+    if !record.subagent_set_complete
+        || !active.is_empty()
+        || provisional.is_empty()
+        || !active.is_disjoint(provisional)
+        || !hook_id_timestamps_are_exact(record, provisional, &record.subagent_opened_at_ms)
+        || !hook_id_timestamps_are_exact(record, provisional, &record.subagent_stopped_at_ms)
+        || provisional.iter().any(|id| {
+            record
+                .subagent_opened_at_ms
+                .get(id)
+                .zip(record.subagent_stopped_at_ms.get(id))
+                .is_none_or(|(opened, stopped)| stopped < opened)
+        })
+        || !state.descendants_are_exact_terminal(now_ms)
+    {
+        return false;
+    }
+    let terminal_ids = state
+        .descendants
+        .iter()
+        .map(|child| child.session_id.clone())
+        .collect::<HashSet<_>>();
+    terminal_ids == *provisional
+        && state.descendants.iter().all(|child| {
+            record
+                .subagent_stopped_at_ms
+                .get(&child.session_id)
+                .is_some_and(|stopped| child.task_completed_at_ms >= *stopped)
+        })
+}
+
 fn project_hook_root_status(
     candidate: &HookRootCandidate,
     record: &HookCollectorRecord,
@@ -1141,6 +1723,8 @@ fn project_hook_root_status(
                     && state.active_turn_id == record.turn_id
                     && record.turn_id.is_some()
                     && state.open_tool_ids.is_empty()
+                    && state.live_code_mode_cells == 0
+                    && !state.code_mode_correlation_ambiguous
                     && state.descendants_are_exact_terminal(now_ms)
                     && !state.relevant_process_descendant
             }) {
@@ -1177,6 +1761,10 @@ fn project_hook_root_status(
                     && !state.turn_active
                     && state.active_turn_id.is_none()
                     && state.open_tool_ids.is_empty()
+                    && state.open_tool_started_at_ms.is_empty()
+                    && state.open_tool_classes.is_empty()
+                    && state.live_code_mode_cells == 0
+                    && !state.code_mode_correlation_ambiguous
                     && state.descendants_are_exact_terminal(now_ms)
                     && !state.relevant_process_descendant
             }) {
@@ -1249,9 +1837,8 @@ fn project_hook_status(
         };
     }
     if !matches!(record.candidate, HookCandidate::Unknown(_))
-        && (!record.effective_hook_engine_attested
-            || !record.supported_release_attested
-            || rollout.is_none_or(|state| !state.has_exact_supported_release()))
+        && (!record.supported_release_attested
+            || rollout.is_none_or(|state| !state.has_compatible_release_tree()))
     {
         return unavailable(StatusReason::HookIntegrationUnverified);
     }
@@ -1288,7 +1875,11 @@ fn project_hook_status(
             }
             if matches!(root, HookRootCandidate::ToolOpen(_))
                 || rollout.is_some_and(|state| {
-                    !state.open_tool_ids.is_empty() || !state.open_tool_started_at_ms.is_empty()
+                    !state.open_tool_ids.is_empty()
+                        || !state.open_tool_started_at_ms.is_empty()
+                        || !state.open_tool_classes.is_empty()
+                        || state.live_code_mode_cells > 0
+                        || state.code_mode_correlation_ambiguous
                 })
             {
                 // Root interaction ambiguity has higher precedence than
@@ -1393,14 +1984,219 @@ fn project_hook_status(
     }
 }
 
+fn hook_record_has_exact_public_done(record: &HookCollectorRecord, now_ms: u64) -> bool {
+    matches!(
+        project_hook_status(record, None, now_ms),
+        (
+            SessionStatus::Done,
+            StatusAuthority::Heuristic,
+            StatusReason::ProcessExited
+        )
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HerdrWorkingProjection {
+    status: SessionStatus,
+    status_since_ms: u64,
+    consecutive_matching: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HerdrWorkingContinuityKey {
+    session_id: String,
+    pid: u32,
+    executing: bool,
+    status_since_ms: u64,
+}
+
+fn project_herdr_working_status(
+    record: &HookCollectorRecord,
+    rollout: Option<&RolloutLifecycle>,
+    now_ms: u64,
+) -> Option<HerdrWorkingProjection> {
+    let (status, authority, reason) = project_hook_status(record, rollout, now_ms);
+    if authority == StatusAuthority::Heuristic
+        && matches!(status, SessionStatus::Thinking | SessionStatus::Executing)
+    {
+        return Some(HerdrWorkingProjection {
+            status,
+            status_since_ms: record.status_since_ms,
+            consecutive_matching: 0,
+        });
+    }
+    if status != SessionStatus::Unknown
+        || authority != StatusAuthority::Unavailable
+        || reason != StatusReason::HookInteractionResolutionUnavailable
+    {
+        return None;
+    }
+    let state = rollout?;
+    let reconciled = reconciled_herdr_hook_record(record, state, now_ms)?;
+    let (status, authority, reason) = project_hook_status(&reconciled, Some(state), now_ms);
+    if authority == StatusAuthority::Heuristic
+        && matches!(status, SessionStatus::Thinking | SessionStatus::Executing)
+    {
+        return Some(HerdrWorkingProjection {
+            status,
+            status_since_ms: reconciled.status_since_ms,
+            consecutive_matching: 0,
+        });
+    }
+    if status != SessionStatus::Unknown
+        || authority != StatusAuthority::Unavailable
+        || reason != StatusReason::HookInteractionResolutionUnavailable
+    {
+        return None;
+    }
+    let hook_ids = match &reconciled.candidate {
+        HookCandidate::ToolOpen(ids) => ids,
+        HookCandidate::SubagentOpen {
+            root: HookRootCandidate::ToolOpen(ids),
+            ..
+        } => ids,
+        _ => return None,
+    };
+    let direct_tool_shape = !hook_ids.is_empty()
+        && state.open_tool_ids == *hook_ids
+        && state.live_code_mode_cells == 0
+        && !state.code_mode_correlation_ambiguous
+        && hook_open_tools_are_exact_ordinary(hook_ids, &reconciled.tool_classes)
+        && rollout_open_tools_are_exact_ordinary(&state.open_tool_ids, &state.open_tool_classes);
+    let code_mode_tool_shape = code_mode_open_tool_shape_is_exact(
+        hook_ids,
+        &reconciled.tool_classes,
+        &reconciled.tool_opened_at_ms,
+        state,
+    );
+    if reconciled.process_state != HookProcessState::Live
+        || !reconciled.native_process_verified
+        || reconciled.local_config_ambiguous
+        || reconciled.interaction_ambiguous
+        || !reconciled.supported_release_attested
+        || !state.has_compatible_release_tree()
+        || !state.root_is_exact_active(now_ms)
+        || state.active_turn_id != reconciled.turn_id
+        || reconciled.turn_id.is_none()
+        || !subagent_root_tool_refinement_is_exact(&reconciled, state, now_ms)
+        // Direct tools retain exact shared IDs. In audited Code Mode
+        // releases, Codex intentionally wraps one nested `exec-<UUIDv4>` hook
+        // inside one outer rollout `exec` / linked `wait` call with a separate
+        // `call_*` ID. No generic cardinality or timestamp guess is accepted.
+        || (!direct_tool_shape && !code_mode_tool_shape)
+        || !hook_id_timestamps_are_exact(
+            &reconciled,
+            hook_ids,
+            &reconciled.tool_opened_at_ms,
+        )
+        || !state.descendants_are_exact_terminal(now_ms)
+    {
+        return None;
+    }
+    let rollout_since_ms = state
+        .open_tool_started_at_ms
+        .values()
+        .copied()
+        .min()
+        .unwrap_or(0);
+    Some(HerdrWorkingProjection {
+        status: SessionStatus::Executing,
+        // The later source-local edge starts the currently corroborated
+        // execution interval. This also resets continuity when a long-running
+        // `exec` is followed by a distinct provider `wait` call.
+        status_since_ms: reconciled.status_since_ms.max(rollout_since_ms),
+        consecutive_matching: 0,
+    })
+}
+
+fn apply_herdr_observation(
+    session: &mut AgentSession,
+    observation: HerdrObservation,
+    working_projection: Option<HerdrWorkingProjection>,
+    rollout_preview: Option<&String>,
+) {
+    if session.status == SessionStatus::Done
+        || session.status_evidence.authority == StatusAuthority::Provider
+    {
+        return;
+    }
+    let (status, authority, reason, status_since_ms, consecutive_matching) =
+        match observation.status {
+            HerdrStatus::Blocked => (
+                SessionStatus::Waiting,
+                StatusAuthority::Heuristic,
+                StatusReason::HerdrScreenBlocked,
+                observation.status_since_ms,
+                observation.consecutive_matching,
+            ),
+            HerdrStatus::Idle => (
+                SessionStatus::Idle,
+                StatusAuthority::Heuristic,
+                StatusReason::HerdrScreenIdle,
+                observation.status_since_ms,
+                observation.consecutive_matching,
+            ),
+            HerdrStatus::Working => match working_projection {
+                Some(projection) => (
+                    projection.status,
+                    StatusAuthority::Heuristic,
+                    StatusReason::HerdrScreenWorking,
+                    projection.status_since_ms,
+                    projection.consecutive_matching.max(1),
+                ),
+                None => (
+                    SessionStatus::Working,
+                    StatusAuthority::Heuristic,
+                    StatusReason::HerdrWorkingUnrefined,
+                    observation.status_since_ms,
+                    observation.consecutive_matching,
+                ),
+            },
+        };
+    session.status_evidence.observe(StatusObservation::new(
+        status,
+        authority,
+        reason,
+        observation.observed_at_ms,
+        0,
+    ));
+    session.status_evidence.status_since_ms = status_since_ms;
+    session.status_evidence.consecutive_matching = consecutive_matching;
+    session.status = status;
+    session.action_process_incarnation = None;
+    session.current_tasks = vec![match status {
+        SessionStatus::Executing => rollout_preview
+            .cloned()
+            .unwrap_or_else(|| "executing".to_string()),
+        SessionStatus::Working => "working".to_string(),
+        SessionStatus::Thinking => "thinking".to_string(),
+        SessionStatus::Waiting => "waiting for user input".to_string(),
+        SessionStatus::Idle => "idle".to_string(),
+        SessionStatus::Unknown => "status evidence unavailable".to_string(),
+        _ => unreachable!("Herdr projects only live Codex states"),
+    }];
+    session.pending_since_ms = if status == SessionStatus::Executing {
+        status_since_ms
+    } else {
+        0
+    };
+    session.thinking_since_ms = if status == SessionStatus::Thinking {
+        status_since_ms
+    } else {
+        0
+    };
+    session.enforce_status_contract();
+}
+
 fn hook_task_label(status: SessionStatus, rollout_preview: Option<String>) -> String {
     match status {
         SessionStatus::Thinking => "thinking".to_string(),
         SessionStatus::Executing => rollout_preview.unwrap_or_else(|| "executing".to_string()),
+        SessionStatus::Working => "working".to_string(),
         SessionStatus::Idle => "idle".to_string(),
         SessionStatus::Done => "finished".to_string(),
         SessionStatus::Unknown => "status evidence unavailable".to_string(),
-        // Codex 0.146 hook evidence never emits these live states.
+        // Supported Codex hook evidence never emits these live states.
         SessionStatus::Waiting => "status evidence unavailable".to_string(),
         SessionStatus::RateLimited => "status evidence unavailable".to_string(),
         SessionStatus::Error => "status evidence unavailable".to_string(),
@@ -1426,6 +2222,8 @@ impl CodexCollector {
             hook_process_rollout_bindings: RefCell::new(HashMap::new()),
             hook_live_session_snapshots: RefCell::new(HashMap::new()),
             hook_done_tombstones: RefCell::new(HashMap::new()),
+            herdr_status_resolver: RefCell::new(HerdrStatusResolver::default()),
+            herdr_working_continuity: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1870,7 +2668,6 @@ impl CodexCollector {
             .unwrap_or("?")
             .to_string();
         snapshot.started_at = record.started_at_ms;
-        snapshot.version = plugin::SUPPORTED_CODEX_VERSION.to_string();
         self.hook_done_tombstones.borrow_mut().insert(
             key,
             HookDoneTombstone {
@@ -1895,18 +2692,176 @@ impl CodexCollector {
     fn finalize_hook_records_with_scan(
         &self,
         sessions: Vec<AgentSession>,
+        records: Vec<HookCollectorRecord>,
+        shared: &super::SharedProcessData,
+        now_ms: u64,
+        hook_scan_available: bool,
+    ) -> Vec<AgentSession> {
+        self.finalize_hook_records_with_scan_and_herdr(
+            sessions,
+            records,
+            shared,
+            now_ms,
+            hook_scan_available,
+            None,
+        )
+    }
+
+    fn reconcile_herdr_working_continuity(
+        &self,
+        projections: &mut HashMap<(String, u32), HerdrWorkingProjection>,
+        observations: &HashMap<(String, u32), HerdrObservation>,
+    ) {
+        let mut continuity = self.herdr_working_continuity.borrow_mut();
+        let mut current = HashSet::new();
+        for (target, projection) in projections {
+            let Some(observation) = observations
+                .get(target)
+                .filter(|observation| observation.status == HerdrStatus::Working)
+            else {
+                continue;
+            };
+            let phase_since_ms = projection.status_since_ms;
+            let status_since_ms = observation.status_since_ms.max(phase_since_ms);
+            let key = HerdrWorkingContinuityKey {
+                session_id: target.0.clone(),
+                pid: target.1,
+                executing: projection.status == SessionStatus::Executing,
+                status_since_ms,
+            };
+            let initial_count = if phase_since_ms <= observation.status_since_ms {
+                observation.consecutive_matching.max(1)
+            } else {
+                1
+            };
+            let consecutive_matching = continuity
+                .entry(key.clone())
+                .and_modify(|count| *count = count.saturating_add(1).max(initial_count))
+                .or_insert(initial_count);
+            projection.status_since_ms = status_since_ms;
+            projection.consecutive_matching = *consecutive_matching;
+            current.insert(key);
+        }
+        continuity.retain(|key, _| current.contains(key));
+    }
+
+    #[cfg(test)]
+    fn finalize_hook_records_with_herdr(
+        &self,
+        sessions: Vec<AgentSession>,
+        records: Vec<HookCollectorRecord>,
+        shared: &super::SharedProcessData,
+        now_ms: u64,
+        herdr_observations: HashMap<(String, u32), HerdrObservation>,
+    ) -> Vec<AgentSession> {
+        self.finalize_hook_records_with_scan_and_herdr(
+            sessions,
+            records,
+            shared,
+            now_ms,
+            true,
+            Some(herdr_observations),
+        )
+    }
+
+    fn finalize_hook_records_with_scan_and_herdr(
+        &self,
+        mut sessions: Vec<AgentSession>,
         mut records: Vec<HookCollectorRecord>,
         shared: &super::SharedProcessData,
         now_ms: u64,
         hook_scan_available: bool,
+        herdr_override: Option<HashMap<(String, u32), HerdrObservation>>,
     ) -> Vec<AgentSession> {
         let eligible_pids =
             Self::find_codex_pids_from_shared(&shared.process_info, &shared.mcp_server_pids)
                 .into_iter()
                 .map(|(pid, _)| pid)
                 .collect::<HashSet<_>>();
+        let herdr_observations = herdr_override.unwrap_or_else(|| {
+            let mut targets = Vec::new();
+            let mut seen = HashSet::<(String, u32, String)>::new();
+            let mut push_target = |session_id: String, pid: u32, incarnation: String| {
+                if seen.insert((session_id.clone(), pid, incarnation.clone())) {
+                    targets.push(HerdrTarget {
+                        session_id,
+                        pid,
+                        expected_incarnation: Some(incarnation),
+                    });
+                }
+            };
+
+            for record in &records {
+                if !hook_record_is_active_generation(record)
+                    || !record.native_process_verified
+                    || !eligible_pids.contains(&record.pid)
+                {
+                    continue;
+                }
+                if let Some(incarnation) = record
+                    .process_incarnation
+                    .as_ref()
+                    .filter(|incarnation| !incarnation.is_empty())
+                {
+                    push_target(record.session_id.clone(), record.pid, incarnation.clone());
+                }
+            }
+            for session in &sessions {
+                if session.pid == 0
+                    || session.status == SessionStatus::Done
+                    || !eligible_pids.contains(&session.pid)
+                    || !shared.process_info.contains_key(&session.pid)
+                {
+                    continue;
+                }
+                let Some(incarnation) = process::get_process_incarnation(session.pid) else {
+                    continue;
+                };
+                if native_codex_process_is_exact(session.pid, &incarnation) {
+                    push_target(session.session_id.clone(), session.pid, incarnation);
+                }
+            }
+            self.herdr_status_resolver
+                .borrow_mut()
+                .resolve(&targets, now_ms)
+        });
+        {
+            let rollout_lifecycle = self.rollout_lifecycle.borrow();
+            reconcile_current_hook_generations(
+                &mut records,
+                &mut sessions,
+                &rollout_lifecycle,
+                &herdr_observations,
+                &shared.process_info,
+                &eligible_pids,
+            );
+        }
         self.observe_hook_process_transitions(&mut records, now_ms, hook_scan_available);
         self.prune_hook_done_tombstones(now_ms);
+
+        // Persisted hook state can outlive the exact Codex process for hours.
+        // A collector that first observes that incarnation as already gone
+        // must neither fabricate a Done transition nor keep a PID=0 Unknown
+        // placeholder in the live Sessions list. Observe transitions first so
+        // an exact Live->Gone edge can still become the bounded Done row, then
+        // suppress only generations that have no public live or exit state.
+        let publicly_retained_record_ids = records
+            .iter()
+            .filter(|record| {
+                record.process_state != HookProcessState::Gone
+                    || hook_record_has_exact_public_done(record, now_ms)
+            })
+            .map(|record| record.session_id.clone())
+            .collect::<HashSet<_>>();
+        let suppressed_gone_session_ids = records
+            .iter()
+            .filter(|record| {
+                record.process_state == HookProcessState::Gone
+                    && !hook_record_has_exact_public_done(record, now_ms)
+                    && !publicly_retained_record_ids.contains(&record.session_id)
+            })
+            .map(|record| record.session_id.clone())
+            .collect::<HashSet<_>>();
 
         let rollout_only_done_ids = sessions
             .iter()
@@ -1922,12 +2877,15 @@ impl CodexCollector {
                     .map(|preview| (session.session_id.clone(), preview))
             })
             .collect::<HashMap<_, _>>();
+        let mut herdr_working_status = HashMap::<(String, u32), HerdrWorkingProjection>::new();
         for session in remaining.iter_mut().flatten() {
             mark_codex_status_unavailable(session, now_ms, StatusReason::HookIntegrationUnverified);
         }
 
         records.retain(|record| {
             !record.session_id.is_empty()
+                && (record.process_state != HookProcessState::Gone
+                    || hook_record_has_exact_public_done(record, now_ms))
                 && if matches!(record.candidate, HookCandidate::Ended) {
                     match record.process_state {
                         HookProcessState::Gone => {
@@ -2089,7 +3047,7 @@ impl CodexCollector {
             let rollout_binding_conflict = record.process_state == HookProcessState::Live
                 && matching_rollouts.iter().any(|index| {
                     remaining[*index].as_ref().is_some_and(|session| {
-                        session.pid == 0 || session.pid != record.pid || session.cwd != record.cwd
+                        (session.pid != 0 && session.pid != record.pid) || session.cwd != record.cwd
                     })
                 });
             let rollout_pid_session_conflict = record.process_state == HookProcessState::Live
@@ -2129,12 +3087,21 @@ impl CodexCollector {
                 .borrow()
                 .get(&record.session_id)
                 .cloned();
+            let pidless_rollout_recovered = matching_rollouts.len() == 1
+                && selected.is_some_and(|index| {
+                    remaining[index].as_ref().is_some_and(|session| {
+                        session.pid == 0
+                            && session.cwd == record.cwd
+                            && process_visible
+                            && !rollout_pid_session_conflict
+                    })
+                });
             let rollout_binding_exact = matching_rollouts.len() == 1
                 && selected.is_some_and(|index| {
                     remaining[index].as_ref().is_some_and(|session| {
-                        session.pid == record.pid
+                        (session.pid == record.pid || pidless_rollout_recovered)
                             && session.cwd == record.cwd
-                            && shared.process_info.contains_key(&session.pid)
+                            && shared.process_info.contains_key(&record.pid)
                             && rollout.as_ref().is_some_and(|lifecycle| {
                                 session.version == lifecycle.root_cli_version
                             })
@@ -2146,12 +3113,19 @@ impl CodexCollector {
             let supported_release = rollout_binding_exact
                 && rollout
                     .as_ref()
-                    .is_some_and(RolloutLifecycle::has_exact_supported_release);
+                    .is_some_and(RolloutLifecycle::has_compatible_release_tree);
             record.supported_release_attested = active_generation
                 && process_visible
                 && !ownership_conflict
                 && !record.local_config_ambiguous
                 && supported_release;
+            if pidless_rollout_recovered {
+                // The hook/process binding can recover display status for an
+                // otherwise unowned rollout, but that recovery is not action
+                // or resource-ownership proof.
+                record.actionable = false;
+                record.owns_resources = false;
+            }
             if active_generation
                 && (!record.supported_release_attested || !record.effective_hook_engine_attested)
             {
@@ -2163,6 +3137,7 @@ impl CodexCollector {
                     bindings.remove(&done_key);
                     if process_visible
                         && !ownership_conflict
+                        && !pidless_rollout_recovered
                         && !record.local_config_ambiguous
                         && rollout_binding_exact
                     {
@@ -2174,6 +3149,14 @@ impl CodexCollector {
                             },
                         );
                     }
+                }
+            }
+            if active_generation && process_visible && !ownership_conflict {
+                let key = (record.session_id.clone(), record.pid);
+                if let Some(status) =
+                    project_herdr_working_status(&record, rollout.as_ref(), now_ms)
+                {
+                    herdr_working_status.insert(key, status);
                 }
             }
             let rollout_preview = rollout_previews.get(&record.session_id).cloned();
@@ -2280,8 +3263,27 @@ impl CodexCollector {
                 .flatten()
                 // Rollout completion is never process-exit proof. A matching
                 // exact hook tombstone above may still retain its metrics.
-                .filter(|session| !rollout_only_done_ids.contains(&session.session_id)),
+                .filter(|session| !rollout_only_done_ids.contains(&session.session_id))
+                // A matching unowned rollout is only metadata for a hook
+                // generation whose exact process is already gone. Preserve
+                // an independently live rollout with the same session ID.
+                .filter(|session| {
+                    session.pid != 0 || !suppressed_gone_session_ids.contains(&session.session_id)
+                }),
         );
+        self.reconcile_herdr_working_continuity(&mut herdr_working_status, &herdr_observations);
+        for session in &mut result {
+            let key = (session.session_id.clone(), session.pid);
+            let Some(observation) = herdr_observations.get(&key).copied() else {
+                continue;
+            };
+            apply_herdr_observation(
+                session,
+                observation,
+                herdr_working_status.get(&key).copied(),
+                rollout_previews.get(&session.session_id),
+            );
+        }
         result.sort_by_key(|session| std::cmp::Reverse(session.started_at));
         result
     }
@@ -2406,6 +3408,9 @@ impl CodexCollector {
                     &shared.children_map,
                     &shared.ports,
                 );
+            } else {
+                session.mem_mb = 0;
+                session.children.clear();
             }
         } else {
             session.pid = 0;
@@ -2937,6 +3942,11 @@ impl CodexCollector {
                 // SubagentStop hook set after exact child-to-root mapping.
                 open_tool_ids: result.open_tool_ids.clone(),
                 open_tool_started_at_ms: result.open_tool_started_at_ms.clone(),
+                open_tool_classes: result.open_tool_classes.clone(),
+                completed_tool_calls: result.completed_tool_calls.clone(),
+                nested_code_mode_end_at_ms: result.nested_code_mode_end_at_ms.clone(),
+                live_code_mode_cells: result.live_code_mode_cells,
+                code_mode_correlation_ambiguous: result.code_mode_correlation_ambiguous,
                 descendants: related_rollouts
                     .iter()
                     .map(|child| DescendantRolloutLifecycle {
@@ -2954,6 +3964,9 @@ impl CodexCollector {
                         task_completed_at_ms: child.task_completed_at_ms,
                         open_tool_ids: child.open_tool_ids.clone(),
                         open_tool_started_at_ms: child.open_tool_started_at_ms.clone(),
+                        open_tool_classes: child.open_tool_classes.clone(),
+                        live_code_mode_cells: child.live_code_mode_cells,
+                        code_mode_correlation_ambiguous: child.code_mode_correlation_ambiguous,
                     })
                     .collect(),
                 relevant_process_descendant: process_ctx.owns_process_tree
@@ -3275,6 +4288,16 @@ struct CodexJSONLResult {
     open_tool_ids: HashSet<String>,
     /// Provider observation time for every exact currently open call ID.
     open_tool_started_at_ms: HashMap<String, u64>,
+    /// Content-free interaction class for every exact currently open call ID.
+    open_tool_classes: HashMap<String, RolloutToolClass>,
+    /// Exact canonical completions from the currently selected root turn.
+    completed_tool_calls: HashMap<String, CompletedRolloutCall>,
+    /// Exact nested Code Mode end identities exposed by the selected root turn.
+    nested_code_mode_end_at_ms: HashMap<String, u64>,
+    /// Bounded yielded Code Mode cells that remain live beyond an outer call.
+    live_code_mode_cells: usize,
+    /// Multiple/cross-turn Code Mode shapes with no exact hook-call bijection.
+    code_mode_correlation_ambiguous: bool,
     /// Earliest start timestamp among open `request_user_input` calls.
     awaiting_input_since_ms: u64,
     /// Timestamp of the latest user prompt not yet followed by assistant output.
@@ -3305,6 +4328,9 @@ impl CodexJSONLResult {
             && self.task_completed_at_ms > 0
             && self.open_tool_ids.is_empty()
             && self.open_tool_started_at_ms.is_empty()
+            && self.open_tool_classes.is_empty()
+            && self.live_code_mode_cells == 0
+            && !self.code_mode_correlation_ambiguous
     }
 }
 
@@ -3479,6 +4505,111 @@ fn advance_rollout_lifecycle(result: &mut CodexJSONLResult, timestamp_ms: u64) {
     result.latest_lifecycle_at_ms = timestamp_ms;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CopiedRolloutMeta {
+    parent_thread_id: Option<String>,
+    cli_version: String,
+}
+
+fn copied_rollout_epoch_thresholds(
+    session_id: &str,
+    parent_thread_id: &str,
+    cli_version: &str,
+    replayed_meta: &HashMap<String, CopiedRolloutMeta>,
+) -> Option<Vec<u64>> {
+    if cli_version != "0.146.0" {
+        return None;
+    }
+    let child_timestamp_ms = uuid_v7_timestamp_ms(session_id)?;
+    let mut current = parent_thread_id.to_string();
+    let mut visited = HashSet::new();
+    let mut thresholds = Vec::new();
+
+    loop {
+        if !visited.insert(current.clone()) {
+            return None;
+        }
+        let meta = replayed_meta.get(&current)?;
+        if meta.cli_version != cli_version {
+            return None;
+        }
+        let current_timestamp_ms = uuid_v7_timestamp_ms(&current)?;
+        if current_timestamp_ms >= child_timestamp_ms {
+            return None;
+        }
+        let Some(parent_thread_id) = meta.parent_thread_id.as_ref() else {
+            break;
+        };
+        if uuid_v7_timestamp_ms(parent_thread_id)? >= current_timestamp_ms {
+            return None;
+        }
+        // Only a replayed subagent (never the root metadata) authorizes an
+        // inherited copied-epoch boundary.
+        thresholds.push(current_timestamp_ms);
+        current = parent_thread_id.clone();
+    }
+
+    if visited.len() != replayed_meta.len() {
+        return None;
+    }
+    thresholds.reverse();
+    if !thresholds.windows(2).all(|pair| pair[0] < pair[1]) {
+        return None;
+    }
+    thresholds.push(child_timestamp_ms);
+    Some(thresholds)
+}
+
+fn copied_prefix_record_has_irreversible_failure(val: &Value) -> bool {
+    match val["type"].as_str() {
+        Some("error") => true,
+        Some("event_msg") => match val["payload"]["type"].as_str() {
+            Some("stream_error" | "error") => true,
+            Some("task_complete") => !val["payload"]["error"].is_null(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn reset_copied_subagent_rollout_epoch(result: &mut CodexJSONLResult, boundary_ms: u64) {
+    // Full-history subagents persist a copied parent prefix before their own
+    // first turn. Keep the child file identity, but discard inherited metrics
+    // and lifecycle state once the exact child-local delimiter is observed.
+    result.model = String::from("-");
+    result.effort.clear();
+    result.context_window = 0;
+    result.turn_count = 0;
+    result.current_task.clear();
+    result.task_complete = false;
+    result.active_turn_id = None;
+    result.completed_turn_id = None;
+    result.turn_started_at_ms = 0;
+    result.latest_lifecycle_at_ms = 0;
+    result.task_completed_at_ms = 0;
+    result.turn_active = false;
+    result.last_activity = std::time::UNIX_EPOCH + std::time::Duration::from_millis(boundary_ms);
+    result.initial_prompt.clear();
+    result.chat_messages.clear();
+    result.total_input = 0;
+    result.total_output = 0;
+    result.total_cache_read = 0;
+    result.last_context_tokens = 0;
+    result.token_history.clear();
+    result.rate_limit = None;
+    result.tool_calls.clear();
+    result.pending_since_ms = 0;
+    result.open_tool_ids.clear();
+    result.open_tool_started_at_ms.clear();
+    result.open_tool_classes.clear();
+    result.completed_tool_calls.clear();
+    result.nested_code_mode_end_at_ms.clear();
+    result.live_code_mode_cells = 0;
+    result.code_mode_correlation_ambiguous = false;
+    result.awaiting_input_since_ms = 0;
+    result.thinking_since_ms = 0;
+}
+
 fn sanitize_tool_arg(arg: &str) -> String {
     let terminal_safe = super::sanitize_terminal_text(arg);
     let redacted = super::redact_secrets(&terminal_safe);
@@ -3537,9 +4668,166 @@ fn parse_codex_tool_session_id(arguments: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(arguments).ok()?;
     let raw = &value["session_id"];
     if let Some(s) = raw.as_str() {
-        return Some(s.to_string());
+        return bounded_rollout_session_id(s);
     }
-    raw.as_u64().map(|n| n.to_string())
+    raw.as_u64()
+        .map(|n| n.to_string())
+        .and_then(|id| bounded_rollout_session_id(&id))
+}
+
+fn bounded_rollout_session_id(raw: &str) -> Option<String> {
+    (!raw.is_empty()
+        && raw.len() <= 128
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+    .then(|| raw.to_string())
+}
+
+fn bounded_rollout_lifecycle_id(raw: &str) -> Option<String> {
+    (!raw.is_empty()
+        && raw.len() <= MAX_ROLLOUT_LIFECYCLE_ID_BYTES
+        && raw.bytes().all(|byte| byte.is_ascii_graphic()))
+    .then(|| raw.to_string())
+}
+
+fn bounded_rollout_tool_name(raw: &str) -> Option<&str> {
+    (!raw.is_empty()
+        && raw.len() <= MAX_ROLLOUT_TOOL_NAME_BYTES
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')))
+    .then_some(raw)
+}
+
+fn known_rollout_end_matches_tool(
+    event_type: &str,
+    namespace: Option<&str>,
+    tool_name: &str,
+) -> bool {
+    match event_type {
+        "exec_command_end" => namespace.is_none() && tool_name == "exec_command",
+        "patch_apply_end" => namespace.is_none() && tool_name == "apply_patch",
+        "web_search_end" => namespace == Some("web") && tool_name == "run",
+        "image_generation_end" => namespace == Some("image_gen") && tool_name == "imagegen",
+        "mcp_tool_call_end" => namespace.is_some_and(|namespace| namespace.starts_with("mcp__")),
+        _ => false,
+    }
+}
+
+fn bounded_code_mode_cell_id(raw: &str) -> Option<String> {
+    fn canonical_positive_decimal(raw: &str) -> Option<u64> {
+        let value = raw.parse::<u64>().ok().filter(|value| *value > 0)?;
+        (value.to_string() == raw).then_some(value)
+    }
+
+    if raw.is_empty() || raw.len() > 128 {
+        return None;
+    }
+    if canonical_positive_decimal(raw).is_some() {
+        return Some(raw.to_string());
+    }
+    let (generation, cell) = raw.strip_prefix('g')?.split_once(':')?;
+    (canonical_positive_decimal(generation).is_some_and(|generation| generation >= 2)
+        && canonical_positive_decimal(cell).is_some())
+    .then(|| raw.to_string())
+}
+
+fn default_code_mode_wait_yield_time_ms() -> u64 {
+    10_000
+}
+
+#[derive(Debug, Deserialize)]
+struct CodeModeWaitArgs {
+    cell_id: String,
+    #[serde(
+        rename = "yield_time_ms",
+        default = "default_code_mode_wait_yield_time_ms"
+    )]
+    _yield_time_ms: u64,
+    #[serde(rename = "max_tokens", default)]
+    _max_tokens: Option<usize>,
+    #[serde(default)]
+    terminate: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedCodeModeWaitArgs {
+    cell_id: String,
+    terminate: bool,
+}
+
+fn parse_code_mode_wait_args(arguments: &str) -> Option<ParsedCodeModeWaitArgs> {
+    let CodeModeWaitArgs {
+        cell_id, terminate, ..
+    } = serde_json::from_str(arguments).ok()?;
+    Some(ParsedCodeModeWaitArgs {
+        cell_id: bounded_code_mode_cell_id(&cell_id)?,
+        terminate,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CodeModeOutputState {
+    Running(String),
+    Terminal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct YieldedCodeModeCell {
+    turn_id: String,
+    origin_call_id: String,
+    exec_started_at_ms: u64,
+    exec_yielded_at_ms: u64,
+}
+
+fn code_mode_output_text(output: &Value) -> Option<&str> {
+    // Rollouts preserve a single text-only status item as a string, while a
+    // status plus runtime output is represented as a content-item array.
+    if let Some(text) = output.as_str() {
+        return Some(text);
+    }
+    let first = output.as_array()?.first()?.as_object()?;
+    if first.len() != 2 {
+        return None;
+    }
+    (first.get("type").and_then(Value::as_str) == Some("input_text"))
+        .then(|| first.get("text")?.as_str())
+        .flatten()
+}
+
+fn code_mode_output_state(output: &Value) -> Option<CodeModeOutputState> {
+    const RUNNING_PREFIX: &str = "Script running with cell ID ";
+    let frame = code_mode_output_text(output)?;
+    if frame.len() > MAX_CODE_MODE_STATUS_FRAME_BYTES {
+        return None;
+    }
+    let mut lines = frame.split('\n');
+    let status = lines.next()?;
+    let wall_time = lines
+        .next()?
+        .strip_prefix("Wall time ")?
+        .strip_suffix(" seconds")?;
+    let (whole_seconds, fractional_seconds) = wall_time.split_once('.')?;
+    if whole_seconds.is_empty()
+        || !whole_seconds.bytes().all(|byte| byte.is_ascii_digit())
+        || (whole_seconds.len() > 1 && whole_seconds.starts_with('0'))
+        || fractional_seconds.len() != 1
+        || !fractional_seconds.bytes().all(|byte| byte.is_ascii_digit())
+        || lines.next()? != "Output:"
+        || !lines.next()?.is_empty()
+        || lines.next().is_some()
+    {
+        return None;
+    }
+    if let Some(raw_cell_id) = status.strip_prefix(RUNNING_PREFIX) {
+        return bounded_code_mode_cell_id(raw_cell_id).map(CodeModeOutputState::Running);
+    }
+    matches!(
+        status,
+        "Script completed" | "Script failed" | "Script terminated"
+    )
+    .then_some(CodeModeOutputState::Terminal)
 }
 
 fn running_process_session_id(output: &str) -> Option<String> {
@@ -3548,14 +4836,7 @@ fn running_process_session_id(output: &str) -> Option<String> {
         .lines()
         .find_map(|line| line.trim_start().strip_prefix(marker))?;
     let id = after.split_whitespace().next()?;
-    if id.is_empty() {
-        None
-    } else {
-        Some(
-            id.trim_matches(|c: char| !c.is_ascii_alphanumeric())
-                .to_string(),
-        )
-    }
+    bounded_rollout_session_id(id.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
 }
 
 fn output_reports_process_exit(output: &str) -> bool {
@@ -3564,29 +4845,127 @@ fn output_reports_process_exit(output: &str) -> bool {
         .any(|line| line.trim_start().starts_with("Process exited"))
 }
 
+#[derive(Clone, Debug)]
+struct OpenRolloutCall {
+    started_at_ms: u64,
+    name: String,
+    custom: bool,
+    class: RolloutToolClass,
+    tool_index: Option<usize>,
+    write_stdin_target: Option<String>,
+    code_mode_wait_target: Option<String>,
+    code_mode_wait_terminate: bool,
+    known_end_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct SeenRolloutCall {
+    namespace: Option<String>,
+    name: String,
+}
+
 fn close_codex_tool_call(
     call_id: &str,
     end_ms: u64,
     tool_calls: &mut [ToolCall],
-    call_indices: &HashMap<String, usize>,
-    call_starts: &mut HashMap<String, u64>,
+    open_calls: &mut HashMap<String, OpenRolloutCall>,
     pending_tasks: &mut Vec<(String, String)>,
-) {
-    if let Some(start_ms) = call_starts.remove(call_id) {
-        if let Some(idx) = call_indices.get(call_id).copied() {
-            if let Some(tool_call) = tool_calls.get_mut(idx) {
-                tool_call.duration_ms = end_ms.saturating_sub(start_ms);
-            }
+) -> Option<OpenRolloutCall> {
+    let call = open_calls.remove(call_id)?;
+    if let Some(idx) = call.tool_index {
+        if let Some(tool_call) = tool_calls.get_mut(idx) {
+            tool_call.duration_ms = call
+                .known_end_at_ms
+                .unwrap_or(end_ms)
+                .saturating_sub(call.started_at_ms);
         }
     }
     pending_tasks.retain(|(id, _)| id != call_id);
+    Some(call)
+}
+
+fn remember_completed_rollout_call(
+    completed: &mut HashMap<String, CompletedRolloutCall>,
+    call_id: &str,
+    call: &OpenRolloutCall,
+    completed_at_ms: u64,
+    code_mode_terminal: bool,
+) {
+    if !rollout_call_id_is_exact(call_id)
+        || call.started_at_ms == 0
+        || completed_at_ms < call.started_at_ms
+        || completed.len() >= MAX_TRACKED_ROLLOUT_CALL_IDS
+        || completed.contains_key(call_id)
+    {
+        return;
+    }
+    completed.insert(
+        call_id.to_string(),
+        CompletedRolloutCall {
+            started_at_ms: call.started_at_ms,
+            completed_at_ms,
+            class: call.class,
+            code_mode_terminal,
+        },
+    );
+}
+
+fn complete_yielded_code_mode_exec(
+    completed: &mut HashMap<String, CompletedRolloutCall>,
+    open_calls: &HashMap<String, OpenRolloutCall>,
+    provenance: &YieldedCodeModeCell,
+    wait_call: &OpenRolloutCall,
+    active_turn_id: Option<&str>,
+    completed_at_ms: u64,
+) -> bool {
+    if active_turn_id != Some(provenance.turn_id.as_str())
+        || !rollout_call_id_is_exact(&provenance.origin_call_id)
+        || open_calls.contains_key(&provenance.origin_call_id)
+        || provenance.exec_started_at_ms == 0
+        || provenance.exec_yielded_at_ms < provenance.exec_started_at_ms
+        || wait_call.started_at_ms < provenance.exec_yielded_at_ms
+        || completed_at_ms < wait_call.started_at_ms
+        || wait_call.code_mode_wait_terminate
+    {
+        return false;
+    }
+    let RolloutToolClass::CodeModeWait {
+        exec_started_at_ms,
+        exec_yielded_at_ms,
+    } = wait_call.class
+    else {
+        return false;
+    };
+    if exec_started_at_ms != provenance.exec_started_at_ms
+        || exec_yielded_at_ms != provenance.exec_yielded_at_ms
+    {
+        return false;
+    }
+
+    let Some(origin) = completed.get_mut(&provenance.origin_call_id) else {
+        return false;
+    };
+    if origin.started_at_ms != provenance.exec_started_at_ms
+        || origin.completed_at_ms < origin.started_at_ms
+        || origin.completed_at_ms > provenance.exec_yielded_at_ms
+        || origin.code_mode_terminal
+        || origin.class
+            != (RolloutToolClass::CodeModeExec {
+                exec_started_at_ms: provenance.exec_started_at_ms,
+            })
+    {
+        return false;
+    }
+
+    origin.completed_at_ms = completed_at_ms;
+    origin.code_mode_terminal = true;
+    true
 }
 
 fn close_codex_turn_calls(
     end_ms: u64,
     tool_calls: &mut [ToolCall],
-    call_indices: &HashMap<String, usize>,
-    call_starts: &mut HashMap<String, u64>,
+    open_calls: &mut HashMap<String, OpenRolloutCall>,
     pending_tasks: &mut Vec<(String, String)>,
     running_exec_by_session: &HashMap<String, String>,
 ) {
@@ -3594,20 +4973,13 @@ fn close_codex_turn_calls(
         .values()
         .map(String::as_str)
         .collect();
-    let call_ids: Vec<String> = call_starts
+    let call_ids: Vec<String> = open_calls
         .keys()
         .filter(|call_id| !background_execs.contains(call_id.as_str()))
         .cloned()
         .collect();
     for call_id in call_ids {
-        close_codex_tool_call(
-            &call_id,
-            end_ms,
-            tool_calls,
-            call_indices,
-            call_starts,
-            pending_tasks,
-        );
+        close_codex_tool_call(&call_id, end_ms, tool_calls, open_calls, pending_tasks);
     }
 }
 
@@ -3670,15 +5042,28 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
         pending_since_ms: 0,
         open_tool_ids: HashSet::new(),
         open_tool_started_at_ms: HashMap::new(),
+        open_tool_classes: HashMap::new(),
+        completed_tool_calls: HashMap::new(),
+        nested_code_mode_end_at_ms: HashMap::new(),
+        live_code_mode_cells: 0,
+        code_mode_correlation_ambiguous: false,
         awaiting_input_since_ms: 0,
         thinking_since_ms: 0,
     };
-    let mut call_indices: HashMap<String, usize> = HashMap::new();
-    let mut call_starts: HashMap<String, u64> = HashMap::new();
-    let mut call_names: HashMap<String, String> = HashMap::new();
-    let mut write_stdin_targets: HashMap<String, String> = HashMap::new();
+    let mut open_calls: HashMap<String, OpenRolloutCall> = HashMap::new();
+    let mut seen_calls: HashMap<String, SeenRolloutCall> = HashMap::new();
+    let mut seen_known_end_ids: HashSet<String> = HashSet::new();
     let mut running_exec_by_session: HashMap<String, String> = HashMap::new();
+    let mut yielded_code_mode_cells: HashMap<String, YieldedCodeModeCell> = HashMap::new();
+    let mut code_mode_correlation_ambiguous = false;
     let mut pending_tasks: Vec<(String, String)> = Vec::new();
+    let mut fork_metadata_attested = false;
+    let mut saw_exact_inherited_parent_meta = false;
+    let mut replayed_meta: HashMap<String, CopiedRolloutMeta> = HashMap::new();
+    let mut copied_epoch_thresholds: Option<Vec<u64>> = None;
+    let mut copied_epoch_index = 0_usize;
+    let mut copied_epoch_chain_initialized = false;
+    let mut previous_record_was_thread_settings_applied = false;
 
     // Match Claude transcript cap: a malformed/hostile line beyond this size
     // aborts the scan to prevent OOM. take(MAX+1) physically bounds the read.
@@ -3739,6 +5124,43 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
             }
         }
 
+        let follows_thread_settings_applied = previous_record_was_thread_settings_applied;
+        previous_record_was_thread_settings_applied = val["type"].as_str() == Some("event_msg")
+            && val["payload"]["type"].as_str() == Some("thread_settings_applied");
+
+        let direct_fork_prefix_pending = fork_metadata_attested
+            && replayed_meta.is_empty()
+            && copied_epoch_index == 0
+            && val["type"].as_str() != Some("session_meta");
+        if direct_fork_prefix_pending {
+            let local_epoch_candidate = if val["type"].as_str() == Some("event_msg")
+                && val["payload"]["type"].as_str() == Some("task_started")
+            {
+                let child_timestamp_ms = uuid_v7_timestamp_ms(&result.session_id);
+                let turn_timestamp_ms = val["payload"]["turn_id"]
+                    .as_str()
+                    .and_then(bounded_rollout_lifecycle_id)
+                    .as_deref()
+                    .and_then(uuid_v7_timestamp_ms);
+                match (child_timestamp_ms, turn_timestamp_ms) {
+                    (Some(child_timestamp_ms), Some(turn_timestamp_ms)) => {
+                        turn_timestamp_ms >= child_timestamp_ms
+                    }
+                    _ => {
+                        result.lifecycle_valid = false;
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if !local_epoch_candidate {
+                if copied_prefix_record_has_irreversible_failure(&val) {
+                    result.lifecycle_valid = false;
+                }
+                continue;
+            }
+        }
         match val["type"].as_str() {
             Some("session_meta") => {
                 // A forked subagent rollout starts with its own metadata, then
@@ -3747,18 +5169,83 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                 // replacing it with a later parent collapses the rollout graph
                 // and hides active child work from the root session.
                 if !result.session_id.is_empty() {
+                    let payload = &val["payload"];
+                    let replayed_id = payload["id"]
+                        .as_str()
+                        .and_then(bounded_rollout_lifecycle_id);
+                    let raw_parent_thread_id = payload["parent_thread_id"].as_str().or_else(|| {
+                        payload["source"]["subagent"]["thread_spawn"]["parent_thread_id"].as_str()
+                    });
+                    let replayed_parent_thread_id =
+                        raw_parent_thread_id.and_then(bounded_rollout_lifecycle_id);
+                    let replayed_version = payload["cli_version"].as_str().filter(|version| {
+                        !version.is_empty()
+                            && version.len() <= 64
+                            && version.bytes().all(|byte| byte.is_ascii_graphic())
+                    });
+                    if copied_epoch_chain_initialized
+                        || replayed_meta.len() >= MAX_COPIED_ROLLOUT_SESSION_META
+                        || replayed_id.is_none()
+                        || replayed_version.is_none()
+                        || (raw_parent_thread_id.is_some() && replayed_parent_thread_id.is_none())
+                    {
+                        result.lifecycle_valid = false;
+                        continue;
+                    }
+                    let replayed_id = replayed_id.unwrap_or_default();
+                    if result.parent_thread_id.as_deref() == Some(replayed_id.as_str()) {
+                        saw_exact_inherited_parent_meta = true;
+                    }
+                    if replayed_meta
+                        .insert(
+                            replayed_id,
+                            CopiedRolloutMeta {
+                                parent_thread_id: replayed_parent_thread_id,
+                                cli_version: replayed_version.unwrap_or_default().to_string(),
+                            },
+                        )
+                        .is_some()
+                    {
+                        result.lifecycle_valid = false;
+                    }
                     continue;
                 }
                 let payload = &val["payload"];
                 if let Some(id) = payload["id"].as_str() {
                     result.session_id = id.to_string();
                 }
-                result.parent_thread_id = payload["parent_thread_id"]
-                    .as_str()
-                    .or_else(|| {
-                        payload["source"]["subagent"]["thread_spawn"]["parent_thread_id"].as_str()
-                    })
-                    .map(str::to_string);
+                let direct_parent_value = &payload["parent_thread_id"];
+                let raw_direct_parent_id = direct_parent_value.as_str();
+                let direct_parent_id = raw_direct_parent_id.and_then(bounded_rollout_lifecycle_id);
+                let forked_from_value = &payload["forked_from_id"];
+                let raw_forked_from_id = forked_from_value.as_str();
+                let forked_from_id = raw_forked_from_id.and_then(bounded_rollout_lifecycle_id);
+                let source_parent_value =
+                    &payload["source"]["subagent"]["thread_spawn"]["parent_thread_id"];
+                let raw_source_parent_id = source_parent_value.as_str();
+                let source_parent_id = raw_source_parent_id.and_then(bounded_rollout_lifecycle_id);
+                let parent_thread_id = direct_parent_id
+                    .clone()
+                    .or_else(|| source_parent_id.clone());
+                if (!direct_parent_value.is_null() && raw_direct_parent_id.is_none())
+                    || (!forked_from_value.is_null() && raw_forked_from_id.is_none())
+                    || (!source_parent_value.is_null() && raw_source_parent_id.is_none())
+                    || (raw_direct_parent_id.is_some() && direct_parent_id.is_none())
+                    || (raw_forked_from_id.is_some() && forked_from_id.is_none())
+                    || (raw_source_parent_id.is_some() && source_parent_id.is_none())
+                    || (direct_parent_id.is_some()
+                        && source_parent_id.is_some()
+                        && direct_parent_id != source_parent_id)
+                {
+                    result.lifecycle_valid = false;
+                }
+                fork_metadata_attested = direct_parent_id.is_some()
+                    && forked_from_id == direct_parent_id
+                    && source_parent_id == direct_parent_id;
+                if !forked_from_value.is_null() && !fork_metadata_attested {
+                    result.lifecycle_valid = false;
+                }
+                result.parent_thread_id = parent_thread_id;
                 if let Some(name) = payload["agent_nickname"]
                     .as_str()
                     .or_else(|| {
@@ -3803,16 +5290,94 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                         let boundary_ms = event_timestamp_ms(&val, parse_now_ms).unwrap_or(0);
                         let turn_id = payload["turn_id"]
                             .as_str()
-                            .filter(|turn_id| !turn_id.is_empty())
-                            .map(str::to_string);
+                            .and_then(bounded_rollout_lifecycle_id);
+                        let copied_history_attested =
+                            saw_exact_inherited_parent_meta || fork_metadata_attested;
+                        if copied_history_attested && !copied_epoch_chain_initialized {
+                            copied_epoch_chain_initialized = true;
+                            copied_epoch_thresholds =
+                                result
+                                    .parent_thread_id
+                                    .as_deref()
+                                    .and_then(|parent_thread_id| {
+                                        if replayed_meta.is_empty() && fork_metadata_attested {
+                                            if result.version != "0.146.0" {
+                                                return None;
+                                            }
+                                            let child_timestamp_ms =
+                                                uuid_v7_timestamp_ms(&result.session_id)?;
+                                            let parent_timestamp_ms =
+                                                uuid_v7_timestamp_ms(parent_thread_id)?;
+                                            return (parent_timestamp_ms < child_timestamp_ms)
+                                                .then_some(vec![child_timestamp_ms]);
+                                        }
+                                        if saw_exact_inherited_parent_meta {
+                                            copied_rollout_epoch_thresholds(
+                                                &result.session_id,
+                                                parent_thread_id,
+                                                &result.version,
+                                                &replayed_meta,
+                                            )
+                                        } else {
+                                            None
+                                        }
+                                    });
+                            if copied_epoch_thresholds.is_none() {
+                                result.lifecycle_valid = false;
+                            }
+                        }
+                        let turn_timestamp_ms = turn_id.as_deref().and_then(uuid_v7_timestamp_ms);
+                        let copied_epoch_candidate = copied_epoch_thresholds
+                            .as_ref()
+                            .and_then(|thresholds| {
+                                thresholds
+                                    .get(copied_epoch_index)
+                                    .copied()
+                                    .map(|threshold_ms| (thresholds, threshold_ms))
+                            })
+                            .zip(turn_timestamp_ms)
+                            .filter(|((_, threshold_ms), turn_timestamp_ms)| {
+                                *turn_timestamp_ms >= *threshold_ms
+                            });
+                        if let Some(((thresholds, threshold_ms), turn_timestamp_ms)) =
+                            copied_epoch_candidate
+                        {
+                            let upper_threshold_ms =
+                                thresholds.get(copied_epoch_index + 1).copied();
+                            // Consume the first candidate for this exact fork
+                            // threshold even when it is malformed. A later
+                            // delimiter can therefore never repair invalidity.
+                            copied_epoch_index += 1;
+                            let exact_copied_epoch_boundary = result.lifecycle_valid
+                                && follows_thread_settings_applied
+                                && boundary_ms > 0
+                                && turn_timestamp_ms > threshold_ms
+                                && turn_timestamp_ms <= boundary_ms
+                                && upper_threshold_ms
+                                    .is_none_or(|upper_ms| turn_timestamp_ms < upper_ms);
+                            if exact_copied_epoch_boundary {
+                                reset_copied_subagent_rollout_epoch(&mut result, boundary_ms);
+                                open_calls.clear();
+                                seen_calls.clear();
+                                seen_known_end_ids.clear();
+                                running_exec_by_session.clear();
+                                yielded_code_mode_cells.clear();
+                                code_mode_correlation_ambiguous = false;
+                                pending_tasks.clear();
+                            } else {
+                                result.lifecycle_valid = false;
+                            }
+                        }
                         close_codex_turn_calls(
                             boundary_ms,
                             &mut result.tool_calls,
-                            &call_indices,
-                            &mut call_starts,
+                            &mut open_calls,
                             &mut pending_tasks,
                             &running_exec_by_session,
                         );
+                        seen_calls.retain(|call_id, _| open_calls.contains_key(call_id));
+                        result.completed_tool_calls.clear();
+                        result.nested_code_mode_end_at_ms.clear();
                         if result.turn_active {
                             result.lifecycle_valid = false;
                         }
@@ -3825,6 +5390,11 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                         result.task_completed_at_ms = 0;
                         result.turn_active = true;
                         result.thinking_since_ms = boundary_ms;
+                        if yielded_code_mode_cells.values().any(|cell| {
+                            result.active_turn_id.as_deref() != Some(cell.turn_id.as_str())
+                        }) {
+                            code_mode_correlation_ambiguous = true;
+                        }
                         if let Some(cw) = payload["model_context_window"].as_u64() {
                             result.context_window = cw;
                         }
@@ -3883,9 +5453,10 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                         if let Some(cw) = info["model_context_window"].as_u64() {
                             result.context_window = cw;
                         }
-                        // Rate limits: assign to short/long slots based on window_minutes.
-                        // Plus plans: primary=5h(300min), secondary=7d(10080min).
-                        // Free plans: primary can be a longer window, such as 30d(43200min).
+                        // Preserve Codex's exact primary/secondary identities,
+                        // then populate the legacy short/long compatibility
+                        // fields based on duration. A free-plan primary can be
+                        // a longer window such as 30d (43200 minutes).
                         let rl = &payload["rate_limits"];
                         if rl.is_object() && is_account_level_codex_rate_limit(rl) {
                             let event_secs = val["timestamp"]
@@ -3902,20 +5473,24 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                                 if !w.is_object() {
                                     continue;
                                 }
-                                let mins = w["window_minutes"].as_u64().unwrap_or(0);
-                                let pct = w["used_percent"].as_f64();
-                                let resets = w["resets_at"].as_u64();
+                                let Some(window) = native_codex_rate_limit_window(slot, w) else {
+                                    continue;
+                                };
+                                let mins = window.window_minutes.unwrap_or(0);
                                 if mins <= 300 {
-                                    info.five_hour_pct = pct;
-                                    info.five_hour_resets_at = resets;
-                                    info.five_hour_window_minutes = Some(mins);
+                                    info.five_hour_pct = Some(window.used_pct);
+                                    info.five_hour_resets_at = window.resets_at;
+                                    info.five_hour_window_minutes = window.window_minutes;
                                 } else {
-                                    info.seven_day_pct = pct;
-                                    info.seven_day_resets_at = resets;
-                                    info.seven_day_window_minutes = Some(mins);
+                                    info.seven_day_pct = Some(window.used_pct);
+                                    info.seven_day_resets_at = window.resets_at;
+                                    info.seven_day_window_minutes = window.window_minutes;
                                 }
+                                info.windows.push(window);
                             }
-                            result.rate_limit = Some(info);
+                            if !info.windows.is_empty() {
+                                result.rate_limit = Some(info);
+                            }
                         }
                     }
                     Some("agent_message") => {
@@ -3934,8 +5509,7 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                         let boundary_ms = event_timestamp_ms(&val, parse_now_ms).unwrap_or(0);
                         let completed_turn_id = payload["turn_id"]
                             .as_str()
-                            .filter(|turn_id| !turn_id.is_empty())
-                            .map(str::to_string);
+                            .and_then(bounded_rollout_lifecycle_id);
                         let exact_boundary = payload["error"].is_null()
                             && boundary_ms > 0
                             && completed_turn_id.is_some()
@@ -3943,12 +5517,11 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                             && result.turn_started_at_ms > 0
                             && result.turn_started_at_ms <= result.latest_lifecycle_at_ms
                             && result.latest_lifecycle_at_ms <= boundary_ms
-                            && call_starts.is_empty();
+                            && open_calls.is_empty();
                         close_codex_turn_calls(
                             boundary_ms,
                             &mut result.tool_calls,
-                            &call_indices,
-                            &mut call_starts,
+                            &mut open_calls,
                             &mut pending_tasks,
                             &running_exec_by_session,
                         );
@@ -3963,16 +5536,37 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                     }
                     Some("turn_aborted") => {
                         let boundary_ms = event_timestamp_ms(&val, parse_now_ms).unwrap_or(0);
-                        advance_rollout_lifecycle(&mut result, boundary_ms);
+                        let aborted_turn_id = payload["turn_id"]
+                            .as_str()
+                            .and_then(bounded_rollout_lifecycle_id);
+                        let exact_boundary = boundary_ms > 0
+                            && aborted_turn_id.is_some()
+                            && aborted_turn_id == result.active_turn_id
+                            && result.turn_active
+                            && !result.task_complete
+                            && result.completed_turn_id.is_none()
+                            && result.turn_started_at_ms > 0
+                            && result.turn_started_at_ms <= result.latest_lifecycle_at_ms
+                            && result.latest_lifecycle_at_ms <= boundary_ms;
                         close_codex_turn_calls(
                             boundary_ms,
                             &mut result.tool_calls,
-                            &call_indices,
-                            &mut call_starts,
+                            &mut open_calls,
                             &mut pending_tasks,
                             &running_exec_by_session,
                         );
-                        result.lifecycle_valid = false;
+                        // A yielded Code Mode cell is session-scoped and can
+                        // continue after the turn task is aborted. Preserve
+                        // its exact provenance and require a later matching
+                        // wait/termination edge before lifecycle promotion.
+                        code_mode_correlation_ambiguous = !yielded_code_mode_cells.is_empty();
+                        // An exact abort makes this turn unavailable, but it is
+                        // also a complete boundary: a later exact task_started
+                        // begins a new lifecycle epoch in the same rollout.
+                        // Structural ambiguity remains sticky because `&=` can
+                        // never restore a lifecycle invalidated earlier.
+                        result.lifecycle_valid &= exact_boundary;
+                        advance_rollout_lifecycle(&mut result, boundary_ms);
                         result.task_complete = false;
                         result.active_turn_id = None;
                         result.completed_turn_id = None;
@@ -3987,30 +5581,149 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                         // lifecycle promotion for this parsed generation.
                         result.lifecycle_valid = false;
                         result.task_complete = false;
+                        yielded_code_mode_cells.clear();
+                        code_mode_correlation_ambiguous = false;
                     }
                     Some(
-                        "exec_command_end"
+                        event_type @ ("exec_command_end"
                         | "image_generation_end"
                         | "mcp_tool_call_end"
                         | "patch_apply_end"
-                        | "web_search_end",
+                        | "web_search_end"),
                     ) => {
-                        if let Some(call_id) = payload["call_id"].as_str() {
-                            if !call_starts.contains_key(call_id) {
-                                result.lifecycle_valid = false;
+                        let end_ms = event_timestamp_ms(&val, parse_now_ms).unwrap_or(0);
+                        advance_rollout_lifecycle(&mut result, end_ms);
+                        let call_id = payload["call_id"]
+                            .as_str()
+                            .and_then(bounded_rollout_lifecycle_id);
+                        let unique_end = call_id.as_ref().is_some_and(|call_id| {
+                            if seen_known_end_ids.contains(call_id)
+                                || seen_known_end_ids.len() >= MAX_TRACKED_ROLLOUT_CALL_IDS
+                            {
+                                false
+                            } else {
+                                seen_known_end_ids.insert(call_id.clone());
+                                true
                             }
-                            let end_ms = event_timestamp_ms(&val, parse_now_ms).unwrap_or(0);
-                            advance_rollout_lifecycle(&mut result, end_ms);
-                            close_codex_tool_call(
-                                call_id,
-                                end_ms,
-                                &mut result.tool_calls,
-                                &call_indices,
-                                &mut call_starts,
-                                &mut pending_tasks,
-                            );
+                        });
+                        let seen_call =
+                            call_id.as_ref().and_then(|call_id| seen_calls.get(call_id));
+                        let direct_call = seen_call.is_some_and(|call| {
+                            known_rollout_end_matches_tool(
+                                event_type,
+                                call.namespace.as_deref(),
+                                &call.name,
+                            )
+                        });
+                        let direct_open_timestamp_valid = call_id.as_ref().is_some_and(|call_id| {
+                            open_calls
+                                .get(call_id)
+                                .is_some_and(|call| end_ms >= call.started_at_ms)
+                        });
+                        let nested_code_mode_started_at_ms = if seen_call.is_none() {
+                            let mut candidates = open_calls.values().filter_map(|call| {
+                                matches!(
+                                    call.class,
+                                    RolloutToolClass::CodeModeExec { .. }
+                                        | RolloutToolClass::CodeModeWait { .. }
+                                        | RolloutToolClass::CodeModeUncorrelatable
+                                )
+                                .then_some(call.started_at_ms)
+                            });
+                            let first = candidates.next();
+                            if candidates.next().is_none() {
+                                first
+                            } else {
+                                None
+                            }
                         } else {
-                            result.lifecycle_valid = false;
+                            None
+                        };
+                        let inherited_copied_prefix = copied_epoch_thresholds
+                            .as_ref()
+                            .is_some_and(|thresholds| copied_epoch_index < thresholds.len());
+                        let nested_code_mode_call = call_id.as_ref().is_some_and(|call_id| {
+                            plugin::codex_version_has_verified_code_mode_shape(&result.version)
+                                && code_mode_nested_call_id_is_exact(call_id)
+                                && (nested_code_mode_started_at_ms
+                                    .is_some_and(|started_at_ms| end_ms >= started_at_ms)
+                                    || (inherited_copied_prefix
+                                        && result.turn_started_at_ms > 0
+                                        && end_ms >= result.turn_started_at_ms))
+                        });
+                        // These provider events precede the canonical response
+                        // output for direct tools, so they validate correlation
+                        // but do not normally close the top-level descriptor.
+                        // Code Mode additionally emits them for one exact
+                        // nested exec-UUIDv4 call with no rollout open record.
+                        let event_shape_valid = end_ms > 0
+                            && result.turn_active
+                            && result.active_turn_id.is_some()
+                            && unique_end
+                            && ((direct_call && direct_open_timestamp_valid)
+                                || nested_code_mode_call);
+                        result.lifecycle_valid &= event_shape_valid;
+
+                        if event_shape_valid && nested_code_mode_call {
+                            if let Some(call_id) = call_id.as_ref() {
+                                if result.nested_code_mode_end_at_ms.len()
+                                    >= MAX_TRACKED_ROLLOUT_CALL_IDS
+                                {
+                                    result.lifecycle_valid = false;
+                                } else {
+                                    result
+                                        .nested_code_mode_end_at_ms
+                                        .insert(call_id.clone(), end_ms);
+                                }
+                            }
+                        }
+
+                        if event_shape_valid && direct_call {
+                            if let Some(call_id) = call_id.as_deref() {
+                                let mut direct_tool_timing = None;
+                                if let Some(call) = open_calls.get_mut(call_id) {
+                                    if call.known_end_at_ms.is_some() {
+                                        result.lifecycle_valid = false;
+                                    } else {
+                                        call.known_end_at_ms = Some(end_ms);
+                                        direct_tool_timing =
+                                            Some((call.tool_index, call.started_at_ms));
+                                    }
+                                }
+                                if let Some((Some(tool_index), started_at_ms)) = direct_tool_timing
+                                {
+                                    if let Some(tool_call) = result.tool_calls.get_mut(tool_index) {
+                                        tool_call.duration_ms =
+                                            end_ms.saturating_sub(started_at_ms);
+                                    }
+                                }
+                                let background_sessions = running_exec_by_session
+                                    .iter()
+                                    .filter_map(|(session_id, exec_call_id)| {
+                                        (exec_call_id == call_id).then_some(session_id.clone())
+                                    })
+                                    .collect::<Vec<_>>();
+                                if !background_sessions.is_empty() {
+                                    for session_id in background_sessions {
+                                        running_exec_by_session.remove(&session_id);
+                                    }
+                                    if let Some(closed) = close_codex_tool_call(
+                                        call_id,
+                                        end_ms,
+                                        &mut result.tool_calls,
+                                        &mut open_calls,
+                                        &mut pending_tasks,
+                                    ) {
+                                        remember_completed_rollout_call(
+                                            &mut result.completed_tool_calls,
+                                            call_id,
+                                            &closed,
+                                            end_ms,
+                                            false,
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                     Some(event_type) if event_type.ends_with("_end") => {
@@ -4031,7 +5744,26 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                     if result.active_turn_id.is_none() {
                         result.lifecycle_valid = false;
                     }
-                    if let Some(name) = payload["name"].as_str() {
+                    if let Some(raw_name) = payload["name"].as_str() {
+                        let Some(name) = bounded_rollout_tool_name(raw_name) else {
+                            result.lifecycle_valid = false;
+                            continue;
+                        };
+                        let namespace = match &payload["namespace"] {
+                            Value::Null => None,
+                            Value::String(raw_namespace) => {
+                                let Some(namespace) = bounded_rollout_tool_name(raw_namespace)
+                                else {
+                                    result.lifecycle_valid = false;
+                                    continue;
+                                };
+                                Some(namespace.to_string())
+                            }
+                            _ => {
+                                result.lifecycle_valid = false;
+                                continue;
+                            }
+                        };
                         // Extract first arg (typically file path or command)
                         let raw_input = if item_type == Some("function_call") {
                             &payload["arguments"]
@@ -4063,31 +5795,149 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                         if let Some(call_id) = payload["call_id"].as_str() {
                             let start_ms = event_timestamp_ms(&val, parse_now_ms).unwrap_or(0);
                             advance_rollout_lifecycle(&mut result, start_ms);
-                            if call_id.is_empty()
+                            if bounded_rollout_lifecycle_id(call_id).is_none()
                                 || start_ms == 0
-                                || call_starts.contains_key(call_id)
+                                || open_calls.contains_key(call_id)
+                                || seen_calls.contains_key(call_id)
+                                || open_calls.len() >= MAX_OPEN_ROLLOUT_CALLS
+                                || seen_calls.len() >= MAX_TRACKED_ROLLOUT_CALL_IDS
                             {
                                 result.lifecycle_valid = false;
-                            }
-                            call_names.insert(call_id.to_string(), name.to_string());
-                            if name == "write_stdin" {
-                                if let Some(session_id) =
-                                    raw_input.as_str().and_then(parse_codex_tool_session_id)
-                                {
-                                    write_stdin_targets.insert(call_id.to_string(), session_id);
+                            } else {
+                                seen_calls.insert(
+                                    call_id.to_string(),
+                                    SeenRolloutCall {
+                                        namespace: namespace.clone(),
+                                        name: name.to_string(),
+                                    },
+                                );
+                                let is_code_mode_wait =
+                                    item_type == Some("function_call") && name == "wait";
+                                let wait_args = is_code_mode_wait
+                                    .then(|| raw_input.as_str().and_then(parse_code_mode_wait_args))
+                                    .flatten();
+                                if is_code_mode_wait && wait_args.is_none() {
+                                    result.lifecycle_valid = false;
                                 }
-                            }
-                            call_starts.insert(call_id.to_string(), start_ms);
-                            pending_tasks.retain(|(id, _)| id != call_id);
-                            pending_tasks.push((call_id.to_string(), task));
-                            if result.tool_calls.len() < 500 {
-                                let idx = result.tool_calls.len();
-                                result.tool_calls.push(ToolCall {
-                                    name: name.to_string(),
-                                    arg,
-                                    duration_ms: 0,
+                                let wait_cell_id =
+                                    wait_args.as_ref().map(|args| args.cell_id.clone());
+                                let wait_terminate =
+                                    wait_args.as_ref().is_some_and(|args| args.terminate);
+                                let code_mode_call_open = open_calls.values().any(|call| {
+                                    matches!(
+                                        call.class,
+                                        RolloutToolClass::CodeModeExec { .. }
+                                            | RolloutToolClass::CodeModeWait { .. }
+                                            | RolloutToolClass::CodeModeUncorrelatable
+                                    )
                                 });
-                                call_indices.insert(call_id.to_string(), idx);
+                                let known_wait_cell = wait_cell_id
+                                    .as_ref()
+                                    .and_then(|cell_id| yielded_code_mode_cells.get(cell_id))
+                                    .cloned();
+                                let exact_wait_cell = known_wait_cell.as_ref().filter(|cell| {
+                                    !code_mode_correlation_ambiguous
+                                        && yielded_code_mode_cells.len() == 1
+                                        && !code_mode_call_open
+                                        && result.active_turn_id.as_deref()
+                                            == Some(cell.turn_id.as_str())
+                                });
+                                let opens_code_mode_exec =
+                                    item_type == Some("custom_tool_call") && name == "exec";
+                                let introduces_ambiguity = (opens_code_mode_exec
+                                    && (code_mode_call_open
+                                        || !yielded_code_mode_cells.is_empty()
+                                        || code_mode_correlation_ambiguous))
+                                    || (is_code_mode_wait
+                                        && (known_wait_cell.is_none()
+                                            || exact_wait_cell.is_none()));
+                                if introduces_ambiguity {
+                                    code_mode_correlation_ambiguous = true;
+                                    for call in open_calls.values_mut() {
+                                        if matches!(
+                                            call.class,
+                                            RolloutToolClass::CodeModeExec { .. }
+                                                | RolloutToolClass::CodeModeWait { .. }
+                                        ) {
+                                            call.class = RolloutToolClass::CodeModeUncorrelatable;
+                                        }
+                                    }
+                                }
+                                let exact_wait_cell = wait_cell_id.as_ref().and_then(|cell_id| {
+                                    (!code_mode_correlation_ambiguous
+                                        && yielded_code_mode_cells.len() == 1
+                                        && !code_mode_call_open)
+                                        .then(|| yielded_code_mode_cells.get(cell_id))
+                                        .flatten()
+                                        .filter(|cell| {
+                                            result.active_turn_id.as_deref()
+                                                == Some(cell.turn_id.as_str())
+                                        })
+                                });
+                                let class = match (item_type, name, exact_wait_cell) {
+                                    (Some("custom_tool_call"), "exec", _) => {
+                                        if code_mode_correlation_ambiguous {
+                                            RolloutToolClass::CodeModeUncorrelatable
+                                        } else {
+                                            RolloutToolClass::CodeModeExec {
+                                                exec_started_at_ms: start_ms,
+                                            }
+                                        }
+                                    }
+                                    (Some("function_call"), "wait", _) if wait_terminate => {
+                                        RolloutToolClass::CodeModeUncorrelatable
+                                    }
+                                    (Some("function_call"), "wait", Some(cell)) => {
+                                        RolloutToolClass::CodeModeWait {
+                                            exec_started_at_ms: cell.exec_started_at_ms,
+                                            exec_yielded_at_ms: cell.exec_yielded_at_ms,
+                                        }
+                                    }
+                                    (Some("function_call"), "wait", _) => {
+                                        RolloutToolClass::CodeModeUncorrelatable
+                                    }
+                                    (_, "request_user_input", _) => {
+                                        RolloutToolClass::RequestUserInput
+                                    }
+                                    _ => RolloutToolClass::Ordinary,
+                                };
+                                let code_mode_wait_target = wait_cell_id;
+                                let write_stdin_target = (name == "write_stdin")
+                                    .then(|| {
+                                        raw_input.as_str().and_then(parse_codex_tool_session_id)
+                                    })
+                                    .flatten();
+                                let tool_index = if result.tool_calls.len() < 500 {
+                                    let idx = result.tool_calls.len();
+                                    result.tool_calls.push(ToolCall {
+                                        name: name.to_string(),
+                                        arg,
+                                        duration_ms: 0,
+                                    });
+                                    Some(idx)
+                                } else {
+                                    None
+                                };
+                                open_calls.insert(
+                                    call_id.to_string(),
+                                    OpenRolloutCall {
+                                        started_at_ms: start_ms,
+                                        name: name.to_string(),
+                                        custom: item_type == Some("custom_tool_call"),
+                                        class,
+                                        tool_index,
+                                        write_stdin_target,
+                                        code_mode_wait_target,
+                                        code_mode_wait_terminate: wait_terminate,
+                                        known_end_at_ms: None,
+                                    },
+                                );
+                                pending_tasks.retain(|(id, _)| id != call_id);
+                                pending_tasks.push((call_id.to_string(), task));
+                                if pending_tasks.len() > MAX_OPEN_ROLLOUT_CALLS {
+                                    result.lifecycle_valid = false;
+                                    pending_tasks.truncate(MAX_OPEN_ROLLOUT_CALLS);
+                                }
                             }
                         } else {
                             result.lifecycle_valid = false;
@@ -4100,53 +5950,189 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                     Some("function_call_output" | "custom_tool_call_output")
                 ) {
                     if let Some(call_id) = payload["call_id"].as_str() {
-                        if !call_starts.contains_key(call_id) {
+                        let Some(call) = open_calls.get(call_id).cloned() else {
                             result.lifecycle_valid = false;
-                        }
+                            continue;
+                        };
                         let end_ms = event_timestamp_ms(&val, parse_now_ms).unwrap_or(0);
                         advance_rollout_lifecycle(&mut result, end_ms);
-                        if end_ms == 0 {
+                        if end_ms == 0
+                            || call
+                                .known_end_at_ms
+                                .is_some_and(|known_end_at_ms| end_ms < known_end_at_ms)
+                        {
                             result.lifecycle_valid = false;
                         }
-                        let output = payload["output"].as_str().unwrap_or_default();
-                        match call_names.get(call_id).map(String::as_str) {
-                            Some("exec_command") => {
+                        let custom_output = item_type == Some("custom_tool_call_output");
+                        if call.custom != custom_output {
+                            result.lifecycle_valid = false;
+                            close_codex_tool_call(
+                                call_id,
+                                end_ms,
+                                &mut result.tool_calls,
+                                &mut open_calls,
+                                &mut pending_tasks,
+                            );
+                            continue;
+                        }
+                        let output_value = &payload["output"];
+                        let output = output_value.as_str().unwrap_or_default();
+                        let mut code_mode_terminal = false;
+                        match call.name.as_str() {
+                            "exec" if item_type == Some("custom_tool_call_output") => {
+                                match code_mode_output_state(output_value) {
+                                    Some(CodeModeOutputState::Running(cell_id)) => {
+                                        if yielded_code_mode_cells.contains_key(&cell_id)
+                                            || result.active_turn_id.is_none()
+                                            || yielded_code_mode_cells.len()
+                                                >= MAX_TRACKED_CODE_MODE_CELLS
+                                        {
+                                            result.lifecycle_valid = false;
+                                        } else {
+                                            if !yielded_code_mode_cells.is_empty()
+                                                || matches!(
+                                                    call.class,
+                                                    RolloutToolClass::CodeModeUncorrelatable
+                                                )
+                                            {
+                                                code_mode_correlation_ambiguous = true;
+                                            }
+                                            yielded_code_mode_cells.insert(
+                                                cell_id,
+                                                YieldedCodeModeCell {
+                                                    turn_id: result
+                                                        .active_turn_id
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                    origin_call_id: call_id.to_string(),
+                                                    exec_started_at_ms: call.started_at_ms,
+                                                    exec_yielded_at_ms: end_ms,
+                                                },
+                                            );
+                                        }
+                                    }
+                                    Some(CodeModeOutputState::Terminal) => {
+                                        code_mode_terminal = true;
+                                    }
+                                    None => result.lifecycle_valid = false,
+                                }
+                                close_codex_tool_call(
+                                    call_id,
+                                    end_ms,
+                                    &mut result.tool_calls,
+                                    &mut open_calls,
+                                    &mut pending_tasks,
+                                );
+                            }
+                            "wait" => {
+                                close_codex_tool_call(
+                                    call_id,
+                                    end_ms,
+                                    &mut result.tool_calls,
+                                    &mut open_calls,
+                                    &mut pending_tasks,
+                                );
+                                if let Some(target) = call.code_mode_wait_target.as_ref() {
+                                    let unique_yielded_cell = yielded_code_mode_cells.len() == 1;
+                                    let provenance = yielded_code_mode_cells.remove(target);
+                                    match (
+                                        provenance,
+                                        code_mode_output_state(output_value),
+                                        call.code_mode_wait_terminate,
+                                    ) {
+                                        (
+                                            Some(mut provenance),
+                                            Some(CodeModeOutputState::Running(cell_id)),
+                                            false,
+                                        ) if cell_id == *target => {
+                                            provenance.exec_yielded_at_ms = end_ms;
+                                            yielded_code_mode_cells
+                                                .insert(target.clone(), provenance);
+                                        }
+                                        (
+                                            Some(provenance),
+                                            Some(CodeModeOutputState::Terminal),
+                                            _,
+                                        ) => {
+                                            if matches!(
+                                                call.class,
+                                                RolloutToolClass::CodeModeWait { .. }
+                                            ) && (!unique_yielded_cell
+                                                || code_mode_correlation_ambiguous
+                                                || !complete_yielded_code_mode_exec(
+                                                    &mut result.completed_tool_calls,
+                                                    &open_calls,
+                                                    &provenance,
+                                                    &call,
+                                                    result.active_turn_id.as_deref(),
+                                                    end_ms,
+                                                ))
+                                            {
+                                                result.lifecycle_valid = false;
+                                            }
+                                        }
+                                        _ => result.lifecycle_valid = false,
+                                    }
+                                }
+                            }
+                            "exec_command" => {
                                 if let Some(session_id) = running_process_session_id(output) {
-                                    running_exec_by_session.insert(session_id, call_id.to_string());
+                                    if session_id.len() > MAX_ROLLOUT_LIFECYCLE_ID_BYTES
+                                        || (!running_exec_by_session.contains_key(&session_id)
+                                            && running_exec_by_session.len()
+                                                >= MAX_OPEN_ROLLOUT_CALLS)
+                                    {
+                                        result.lifecycle_valid = false;
+                                        close_codex_tool_call(
+                                            call_id,
+                                            end_ms,
+                                            &mut result.tool_calls,
+                                            &mut open_calls,
+                                            &mut pending_tasks,
+                                        );
+                                    } else {
+                                        running_exec_by_session
+                                            .insert(session_id, call_id.to_string());
+                                    }
                                 } else {
                                     close_codex_tool_call(
                                         call_id,
                                         end_ms,
                                         &mut result.tool_calls,
-                                        &call_indices,
-                                        &mut call_starts,
+                                        &mut open_calls,
                                         &mut pending_tasks,
                                     );
                                 }
                             }
-                            Some("write_stdin") => {
+                            "write_stdin" => {
                                 close_codex_tool_call(
                                     call_id,
                                     end_ms,
                                     &mut result.tool_calls,
-                                    &call_indices,
-                                    &mut call_starts,
+                                    &mut open_calls,
                                     &mut pending_tasks,
                                 );
                                 if output_reports_process_exit(output) {
                                     if let Some(exec_call_id) =
-                                        write_stdin_targets.get(call_id).and_then(|session_id| {
+                                        call.write_stdin_target.as_ref().and_then(|session_id| {
                                             running_exec_by_session.remove(session_id)
                                         })
                                     {
-                                        close_codex_tool_call(
+                                        if let Some(closed) = close_codex_tool_call(
                                             &exec_call_id,
                                             end_ms,
                                             &mut result.tool_calls,
-                                            &call_indices,
-                                            &mut call_starts,
+                                            &mut open_calls,
                                             &mut pending_tasks,
-                                        );
+                                        ) {
+                                            remember_completed_rollout_call(
+                                                &mut result.completed_tool_calls,
+                                                &exec_call_id,
+                                                &closed,
+                                                end_ms,
+                                                false,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -4155,11 +6141,31 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                                     call_id,
                                     end_ms,
                                     &mut result.tool_calls,
-                                    &call_indices,
-                                    &mut call_starts,
+                                    &mut open_calls,
                                     &mut pending_tasks,
                                 );
                             }
+                        }
+                        if result.lifecycle_valid && !open_calls.contains_key(call_id) {
+                            remember_completed_rollout_call(
+                                &mut result.completed_tool_calls,
+                                call_id,
+                                &call,
+                                end_ms,
+                                code_mode_terminal,
+                            );
+                        }
+                        if yielded_code_mode_cells.is_empty()
+                            && !open_calls.values().any(|open| {
+                                matches!(
+                                    open.class,
+                                    RolloutToolClass::CodeModeExec { .. }
+                                        | RolloutToolClass::CodeModeWait { .. }
+                                        | RolloutToolClass::CodeModeUncorrelatable
+                                )
+                            })
+                        {
+                            code_mode_correlation_ambiguous = false;
                         }
                     } else {
                         result.lifecycle_valid = false;
@@ -4191,6 +6197,8 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
                 // positive projection after observing one.
                 result.lifecycle_valid = false;
                 result.task_complete = false;
+                yielded_code_mode_cells.clear();
+                code_mode_correlation_ambiguous = false;
             }
 
             _ => {}
@@ -4201,21 +6209,45 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
         return None;
     }
 
+    if !replayed_meta.is_empty() && !saw_exact_inherited_parent_meta {
+        result.lifecycle_valid = false;
+    }
+    if (saw_exact_inherited_parent_meta || fork_metadata_attested)
+        && (!copied_epoch_chain_initialized
+            || copied_epoch_thresholds.is_none()
+            || copied_epoch_thresholds
+                .as_ref()
+                .is_some_and(|thresholds| copied_epoch_index != thresholds.len()))
+    {
+        // A copied prefix without every exact ancestor/current fork boundary
+        // can only describe inherited state, never this child rollout's live
+        // lifecycle.
+        result.lifecycle_valid = false;
+    }
+
     result.current_task = pending_tasks
         .last()
         .map(|(_, task)| task.clone())
         .unwrap_or_default();
-    result.pending_since_ms = call_starts.values().copied().min().unwrap_or(0);
-    result.open_tool_ids = call_starts.keys().cloned().collect();
-    result.open_tool_started_at_ms = call_starts.clone();
-    result.awaiting_input_since_ms = call_starts
+    result.pending_since_ms = open_calls
+        .values()
+        .map(|call| call.started_at_ms)
+        .min()
+        .unwrap_or(0);
+    result.open_tool_ids = open_calls.keys().cloned().collect();
+    result.open_tool_started_at_ms = open_calls
         .iter()
-        .filter_map(|(call_id, started_at)| {
-            call_names
-                .get(call_id)
-                .is_some_and(|name| codex_tool_waits_for_user(name))
-                .then_some(*started_at)
-        })
+        .map(|(call_id, call)| (call_id.clone(), call.started_at_ms))
+        .collect();
+    result.open_tool_classes = open_calls
+        .iter()
+        .map(|(call_id, call)| (call_id.clone(), call.class))
+        .collect();
+    result.live_code_mode_cells = yielded_code_mode_cells.len();
+    result.code_mode_correlation_ambiguous = code_mode_correlation_ambiguous;
+    result.awaiting_input_since_ms = open_calls
+        .values()
+        .filter_map(|call| codex_tool_waits_for_user(&call.name).then_some(call.started_at_ms))
         .min()
         .unwrap_or(0);
     if !result.turn_active || result.pending_since_ms > 0 {
@@ -4231,6 +6263,42 @@ fn parse_codex_open_file(file: &fs::File) -> Option<CodexJSONLResult> {
     }
 
     Some(result)
+}
+
+fn native_codex_rate_limit_window(slot: &str, value: &Value) -> Option<RateLimitWindow> {
+    let fallback_label = match slot {
+        "primary" => "Primary",
+        "secondary" => "Secondary",
+        _ => return None,
+    };
+    let used_pct = value["used_percent"].as_f64()?;
+    if !used_pct.is_finite() || !(0.0..=100.0).contains(&used_pct) {
+        return None;
+    }
+    let window_minutes = value["window_minutes"].as_u64();
+    if window_minutes
+        .is_some_and(|minutes| minutes == 0 || minutes > MAX_NATIVE_RATE_LIMIT_WINDOW_MINUTES)
+    {
+        return None;
+    }
+    let label = native_rate_limit_window_label(window_minutes, fallback_label);
+    RateLimitWindow::try_new(
+        slot,
+        label,
+        used_pct,
+        value["resets_at"].as_u64(),
+        window_minutes,
+        RateLimitProvenance::Native,
+    )
+}
+
+fn native_rate_limit_window_label(window_minutes: Option<u64>, fallback: &str) -> String {
+    match window_minutes {
+        Some(minutes) if minutes % (24 * 60) == 0 => format!("{}d", minutes / (24 * 60)),
+        Some(minutes) if minutes % 60 == 0 => format!("{}h", minutes / 60),
+        Some(minutes) => format!("{minutes}m"),
+        None => fallback.to_string(),
+    }
 }
 
 fn is_account_level_codex_rate_limit(rate_limits: &Value) -> bool {
@@ -4333,6 +6401,7 @@ mod tests {
             prompt_observed_at_ms: edge_ms,
             stop_observed_at_ms: edge_ms,
             tool_opened_at_ms: HashMap::new(),
+            tool_classes: HashMap::new(),
             subagent_opened_at_ms: HashMap::new(),
             subagent_stopped_at_ms: HashMap::new(),
             candidate,
@@ -4341,6 +6410,10 @@ mod tests {
         match &record.candidate {
             HookCandidate::ToolOpen(ids) => {
                 record.tool_opened_at_ms = ids.iter().map(|id| (id.clone(), edge_ms)).collect();
+                record.tool_classes = ids
+                    .iter()
+                    .map(|id| (id.clone(), HookToolClass::Ordinary))
+                    .collect();
             }
             HookCandidate::SubagentOpen {
                 active,
@@ -4356,6 +6429,10 @@ mod tests {
                     provisional.iter().map(|id| (id.clone(), edge_ms)).collect();
                 if let HookRootCandidate::ToolOpen(ids) = root {
                     record.tool_opened_at_ms = ids.iter().map(|id| (id.clone(), edge_ms)).collect();
+                    record.tool_classes = ids
+                        .iter()
+                        .map(|id| (id.clone(), HookToolClass::Ordinary))
+                        .collect();
                 }
             }
             HookCandidate::Unknown(_)
@@ -4404,17 +6481,21 @@ mod tests {
             open_tools: BTreeMap::new(),
             tool_opened_at_ms: BTreeMap::new(),
             closed_tools: BTreeSet::new(),
+            completed_tool_order: Vec::new(),
             open_child_tools: BTreeMap::new(),
             child_tool_opened_at_ms: BTreeMap::new(),
             closed_child_tools: BTreeMap::new(),
+            completed_child_tool_order: Vec::new(),
             open_subagents: BTreeSet::new(),
             subagent_opened_at_ms: BTreeMap::new(),
             provisional_stopped_subagents: BTreeSet::new(),
             subagent_stopped_at_ms: BTreeMap::new(),
             closed_subagents: BTreeSet::new(),
+            completed_subagent_order: Vec::new(),
             open_questions: BTreeSet::new(),
             question_opened_at_ms: BTreeMap::new(),
             closed_questions: BTreeSet::new(),
+            completed_question_order: Vec::new(),
             question_agents: BTreeMap::new(),
             permission_ambiguity: false,
             permission_observed_at_ms: 0,
@@ -4422,6 +6503,7 @@ mod tests {
             child_permission_observed_at_ms: BTreeMap::new(),
             compaction_open: false,
             sticky_fault: None,
+            completed_history_truncated: false,
             completed_ingests: Vec::new(),
             samples: Vec::new(),
         }
@@ -4429,7 +6511,7 @@ mod tests {
 
     fn active_root_rollout(now_ms: u64) -> RolloutLifecycle {
         RolloutLifecycle {
-            root_cli_version: plugin::SUPPORTED_CODEX_VERSION.to_string(),
+            root_cli_version: plugin::MIN_SUPPORTED_CODEX_VERSION.to_string(),
             turn_active: true,
             active_turn_id: Some("turn-1".to_string()),
             turn_started_at_ms: now_ms.saturating_sub(2_000),
@@ -4440,7 +6522,7 @@ mod tests {
 
     fn completed_root_rollout(now_ms: u64) -> RolloutLifecycle {
         RolloutLifecycle {
-            root_cli_version: plugin::SUPPORTED_CODEX_VERSION.to_string(),
+            root_cli_version: plugin::MIN_SUPPORTED_CODEX_VERSION.to_string(),
             task_complete: true,
             completed_turn_id: Some("turn-1".to_string()),
             turn_started_at_ms: now_ms.saturating_sub(2_000),
@@ -4457,7 +6539,7 @@ mod tests {
     ) -> DescendantRolloutLifecycle {
         DescendantRolloutLifecycle {
             session_id: session_id.to_string(),
-            cli_version: plugin::SUPPORTED_CODEX_VERSION.to_string(),
+            cli_version: plugin::MIN_SUPPORTED_CODEX_VERSION.to_string(),
             direct_child,
             lifecycle_valid: true,
             turn_active: true,
@@ -4469,6 +6551,9 @@ mod tests {
             task_completed_at_ms: 0,
             open_tool_ids: HashSet::new(),
             open_tool_started_at_ms: HashMap::new(),
+            open_tool_classes: HashMap::new(),
+            live_code_mode_cells: 0,
+            code_mode_correlation_ambiguous: false,
         }
     }
 
@@ -4479,7 +6564,7 @@ mod tests {
     ) -> DescendantRolloutLifecycle {
         DescendantRolloutLifecycle {
             session_id: session_id.to_string(),
-            cli_version: plugin::SUPPORTED_CODEX_VERSION.to_string(),
+            cli_version: plugin::MIN_SUPPORTED_CODEX_VERSION.to_string(),
             direct_child,
             lifecycle_valid: true,
             turn_active: false,
@@ -4491,6 +6576,9 @@ mod tests {
             task_completed_at_ms: now_ms.saturating_sub(100),
             open_tool_ids: HashSet::new(),
             open_tool_started_at_ms: HashMap::new(),
+            open_tool_classes: HashMap::new(),
+            live_code_mode_cells: 0,
+            code_mode_correlation_ambiguous: false,
         }
     }
 
@@ -4556,6 +6644,14 @@ mod tests {
 
     fn write_jsonl(path: &Path, lines: &[&str]) {
         let mut file = File::create(path).unwrap();
+        for line in lines {
+            writeln!(file, "{}", line).unwrap();
+        }
+        file.flush().unwrap();
+    }
+
+    fn append_jsonl(path: &Path, lines: &[&str]) {
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
         for line in lines {
             writeln!(file, "{}", line).unwrap();
         }
@@ -4854,6 +6950,8 @@ mod tests {
             hook_process_rollout_bindings: RefCell::new(HashMap::new()),
             hook_live_session_snapshots: RefCell::new(HashMap::new()),
             hook_done_tombstones: RefCell::new(HashMap::new()),
+            herdr_status_resolver: RefCell::new(HerdrStatusResolver::default()),
+            herdr_working_continuity: RefCell::new(HashMap::new()),
         };
         let mut shared = super::super::SharedProcessData {
             process_info: HashMap::new(),
@@ -4965,6 +7063,15 @@ mod tests {
         assert_eq!(rl.five_hour_window_minutes, Some(300));
         assert_eq!(rl.seven_day_pct, Some(14.0));
         assert_eq!(rl.seven_day_window_minutes, Some(10_080));
+        assert_eq!(rl.windows.len(), 2);
+        assert_eq!(rl.windows[0].id, "primary");
+        assert_eq!(rl.windows[0].label, "5h");
+        assert_eq!(rl.windows[0].used_pct, 9.0);
+        assert_eq!(rl.windows[0].provenance, RateLimitProvenance::Native);
+        assert_eq!(rl.windows[1].id, "secondary");
+        assert_eq!(rl.windows[1].label, "7d");
+        assert_eq!(rl.windows[1].used_pct, 14.0);
+        assert_eq!(rl.windows[1].provenance, RateLimitProvenance::Native);
     }
 
     #[test]
@@ -4982,6 +7089,26 @@ mod tests {
         assert_eq!(rl.five_hour_pct, None);
         assert_eq!(rl.seven_day_pct, Some(48.0));
         assert_eq!(rl.seven_day_window_minutes, Some(43_200));
+        assert_eq!(rl.windows.len(), 1);
+        assert_eq!(rl.windows[0].id, "primary");
+        assert_eq!(rl.windows[0].label, "30d");
+        assert_eq!(rl.windows[0].used_pct, 48.0);
+        assert_eq!(rl.windows[0].window_minutes, Some(43_200));
+        assert_eq!(rl.windows[0].provenance, RateLimitProvenance::Native);
+    }
+
+    #[test]
+    fn test_parse_codex_rate_limit_rejects_unbounded_native_duration() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-06-17T15:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"output_tokens":1},"last_token_usage":{"input_tokens":1,"output_tokens":1}},"rate_limits":{"limit_id":"codex","primary":{"used_percent":48.0,"window_minutes":525601,"resets_at":1780000000},"secondary":null,"plan_type":"free"}}}"#,
+            ],
+        );
+        let result = parse_codex_jsonl(file.path()).unwrap();
+        assert!(result.rate_limit.is_none());
     }
 
     #[test]
@@ -5137,6 +7264,9 @@ mod tests {
                 r#"{"type":"response_item","timestamp":"2026-03-28T15:01:06Z","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}","call_id":"call_1"}}"#,
             ],
         );
+        let parsed = parse_codex_jsonl(file.path()).unwrap();
+        assert_eq!(parsed.open_tool_ids, HashSet::from(["call_1".to_string()]));
+        assert!(parsed.pending_since_ms > 0);
 
         let collector = CodexCollector::new();
         let mut process_info = HashMap::new();
@@ -5281,16 +7411,20 @@ mod tests {
     }
 
     #[test]
-    fn rollout_exec_end_records_duration_but_not_live_status() {
+    fn rollout_exec_end_records_duration_but_stays_open_until_output() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write_lines(
             &mut file,
             &[
                 SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:05Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
                 r#"{"type":"response_item","timestamp":"2026-03-28T15:01:06Z","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}","call_id":"call_1"}}"#,
                 r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:09Z","payload":{"type":"exec_command_end","call_id":"call_1"}}"#,
             ],
         );
+        let parsed = parse_codex_jsonl(file.path()).unwrap();
+        assert_eq!(parsed.open_tool_ids, HashSet::from(["call_1".to_string()]));
+        assert!(parsed.pending_since_ms > 0);
 
         let collector = CodexCollector::new();
         let mut process_info = HashMap::new();
@@ -5415,6 +7549,35 @@ mod tests {
     }
 
     #[test]
+    fn exact_exec_end_closes_a_background_process_after_its_running_output() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call_1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"function_call_output","call_id":"call_1","output":"Process running with session ID 12345"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"exec_command_end","call_id":"call_1"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
+            ],
+        );
+
+        let parsed = parse_codex_jsonl(file.path()).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert!(parsed.is_exact_terminal_lifecycle());
+        assert!(parsed.open_tool_ids.is_empty());
+        assert_eq!(parsed.tool_calls[0].duration_ms, 2_000);
+        assert_eq!(
+            parsed
+                .completed_tool_calls
+                .get("call_1")
+                .map(|call| call.class),
+            Some(RolloutToolClass::Ordinary)
+        );
+    }
+
+    #[test]
     fn test_codex_turn_boundaries_preserve_running_exec_sessions() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write_lines(
@@ -5444,7 +7607,7 @@ mod tests {
             &mut file,
             &[
                 SESSION_META,
-                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
                 r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}","call_id":"call_1"}}"#,
                 r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"function_call_output","call_id":"call_1","output":"Process running with session ID 12345"}}"#,
                 r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"task_complete"}}"#,
@@ -5627,7 +7790,7 @@ mod tests {
             &mut open,
             &[
                 SESSION_META,
-                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
                 r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"do not expose this raw freeform input","status":"completed","call_id":"custom_1"}}"#,
             ],
         );
@@ -5636,18 +7799,882 @@ mod tests {
         assert_eq!(result.current_task, "exec");
         assert_eq!(result.tool_calls.len(), 1);
         assert!(result.tool_calls[0].arg.is_empty());
+        assert_eq!(
+            result.open_tool_classes,
+            HashMap::from([(
+                "custom_1".to_string(),
+                RolloutToolClass::CodeModeExec {
+                    exec_started_at_ms: 1_774_710_061_000,
+                },
+            )])
+        );
 
         write_lines(
             &mut open,
             &[
-                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"custom_tool_call_output","call_id":"custom_1","output":[]}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"custom_tool_call_output","call_id":"custom_1","output":[{"type":"input_text","text":"Script completed\nWall time 3.0 seconds\nOutput:\n"}]}}"#,
             ],
         );
         let result = parse_codex_jsonl(open.path()).unwrap();
+        assert!(result.lifecycle_valid);
         assert_eq!(result.pending_since_ms, 0);
         assert!(result.current_task.is_empty());
+        assert!(result.open_tool_classes.is_empty());
         assert_eq!(result.tool_calls[0].duration_ms, 3_000);
         assert!(result.turn_active);
+    }
+
+    #[test]
+    fn code_mode_wait_class_requires_an_exact_yielded_cell_link() {
+        let mut linked = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut linked,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private code","call_id":"call_exec"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"custom_tool_call_output","call_id":"call_exec","output":[{"type":"input_text","text":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}]}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\",\"yield_time_ms\":10000}","call_id":"call_wait"}}"#,
+            ],
+        );
+        let open = parse_codex_jsonl(linked.path()).unwrap();
+        assert_eq!(open.open_tool_ids, HashSet::from(["call_wait".to_string()]));
+        assert!(open
+            .completed_tool_calls
+            .get("call_exec")
+            .is_some_and(
+                |call| !call.code_mode_terminal && call.completed_at_ms == 1_774_710_062_000
+            ));
+        assert_eq!(
+            open.open_tool_classes,
+            HashMap::from([(
+                "call_wait".to_string(),
+                RolloutToolClass::CodeModeWait {
+                    exec_started_at_ms: 1_774_710_061_000,
+                    exec_yielded_at_ms: 1_774_710_062_000,
+                },
+            )])
+        );
+
+        write_lines(
+            &mut linked,
+            &[
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"function_call_output","call_id":"call_wait","output":[{"type":"input_text","text":"Script completed\nWall time 3.0 seconds\nOutput:\n"}]}}"#,
+            ],
+        );
+        let closed = parse_codex_jsonl(linked.path()).unwrap();
+        assert!(closed.open_tool_ids.is_empty());
+        assert!(closed.open_tool_classes.is_empty());
+        assert!(closed
+            .completed_tool_calls
+            .get("call_exec")
+            .is_some_and(|call| call.code_mode_terminal
+                && call.started_at_ms == 1_774_710_061_000
+                && call.completed_at_ms == 1_774_710_064_000));
+        assert!(closed
+            .completed_tool_calls
+            .get("call_wait")
+            .is_some_and(|call| !call.code_mode_terminal
+                && matches!(call.class, RolloutToolClass::CodeModeWait { .. })));
+
+        let mut unlinked = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut unlinked,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"2\"}","call_id":"call_wait"}}"#,
+            ],
+        );
+        let unlinked = parse_codex_jsonl(unlinked.path()).unwrap();
+        assert_eq!(
+            unlinked.open_tool_classes,
+            HashMap::from([(
+                "call_wait".to_string(),
+                RolloutToolClass::CodeModeUncorrelatable,
+            )])
+        );
+        assert!(unlinked.code_mode_correlation_ambiguous);
+    }
+
+    #[test]
+    fn linked_terminal_wait_completes_only_the_exact_origin_exec() {
+        let temp = tempfile::tempdir().unwrap();
+        let linked = temp.path().join("rollout-linked-waits.jsonl");
+        write_jsonl(
+            &linked,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_exec"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"custom_tool_call_output","call_id":"call_exec","output":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\"}","call_id":"call_wait_1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"function_call_output","call_id":"call_wait_1","output":"Script running with cell ID 1\nWall time 3.0 seconds\nOutput:\n"}}"#,
+            ],
+        );
+        let running = parse_codex_jsonl(&linked).unwrap();
+        assert!(running.lifecycle_valid);
+        assert_eq!(running.live_code_mode_cells, 1);
+        assert!(running
+            .completed_tool_calls
+            .get("call_exec")
+            .is_some_and(
+                |call| !call.code_mode_terminal && call.completed_at_ms == 1_774_710_062_000
+            ));
+
+        append_jsonl(
+            &linked,
+            &[
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:05Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\"}","call_id":"call_wait_2"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:06Z","payload":{"type":"function_call_output","call_id":"call_wait_2","output":"Script completed\nWall time 5.0 seconds\nOutput:\n"}}"#,
+            ],
+        );
+        let terminal = parse_codex_jsonl(&linked).unwrap();
+        assert!(terminal.lifecycle_valid);
+        assert_eq!(terminal.live_code_mode_cells, 0);
+        assert!(terminal
+            .completed_tool_calls
+            .get("call_exec")
+            .is_some_and(
+                |call| call.code_mode_terminal && call.completed_at_ms == 1_774_710_066_000
+            ));
+
+        let terminated = temp.path().join("rollout-terminated-wait.jsonl");
+        write_jsonl(
+            &terminated,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_exec"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"custom_tool_call_output","call_id":"call_exec","output":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\",\"terminate\":true}","call_id":"call_wait"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"function_call_output","call_id":"call_wait","output":"Script terminated\nWall time 3.0 seconds\nOutput:\n"}}"#,
+            ],
+        );
+        let terminated = parse_codex_jsonl(&terminated).unwrap();
+        assert!(terminated.lifecycle_valid);
+        assert!(terminated
+            .completed_tool_calls
+            .get("call_exec")
+            .is_some_and(|call| !call.code_mode_terminal));
+    }
+
+    #[test]
+    fn linked_terminal_wait_reconciles_the_stale_hook_before_current_code_mode_work() {
+        let rollout_path = tempfile::NamedTempFile::new().unwrap();
+        write_jsonl(
+            rollout_path.path(),
+            &[
+                r#"{"type":"session_meta","timestamp":"2026-03-28T15:00:00Z","payload":{"id":"sess-123","cwd":"/home/user/project","cli_version":"0.146.0","timestamp":"2026-03-28T15:00:00Z"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_stale"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"custom_tool_call_output","call_id":"call_stale","output":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\"}","call_id":"call_wait"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"function_call_output","call_id":"call_wait","output":"Script completed\nWall time 3.0 seconds\nOutput:\n"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:05Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_current"}}"#,
+            ],
+        );
+        let parsed = parse_codex_jsonl(rollout_path.path()).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert!(parsed
+            .completed_tool_calls
+            .get("call_stale")
+            .is_some_and(|call| call.code_mode_terminal));
+
+        let now_ms = 1_774_710_066_000;
+        let stale_hook = "exec-01234567-89ab-4def-8abc-0123456789ab".to_string();
+        let current_hook = "exec-11111111-2222-4333-8444-555555555555".to_string();
+        let mut record = hook_record(
+            HookCandidate::ToolOpen(HashSet::from([stale_hook.clone(), current_hook.clone()])),
+            now_ms,
+        );
+        record
+            .tool_opened_at_ms
+            .insert(stale_hook, 1_774_710_061_050);
+        record
+            .tool_opened_at_ms
+            .insert(current_hook, 1_774_710_065_050);
+
+        let rollout = RolloutLifecycle {
+            root_cli_version: parsed.version,
+            turn_active: parsed.turn_active,
+            task_complete: parsed.task_complete,
+            lifecycle_valid: parsed.lifecycle_valid,
+            active_turn_id: parsed.active_turn_id,
+            completed_turn_id: parsed.completed_turn_id,
+            turn_started_at_ms: parsed.turn_started_at_ms,
+            latest_lifecycle_at_ms: parsed.latest_lifecycle_at_ms,
+            task_completed_at_ms: parsed.task_completed_at_ms,
+            open_tool_ids: parsed.open_tool_ids,
+            open_tool_started_at_ms: parsed.open_tool_started_at_ms,
+            open_tool_classes: parsed.open_tool_classes,
+            completed_tool_calls: parsed.completed_tool_calls,
+            nested_code_mode_end_at_ms: parsed.nested_code_mode_end_at_ms,
+            live_code_mode_cells: parsed.live_code_mode_cells,
+            code_mode_correlation_ambiguous: parsed.code_mode_correlation_ambiguous,
+            descendants: Vec::new(),
+            relevant_process_descendant: false,
+        };
+
+        assert_eq!(
+            project_hook_status(&record, Some(&rollout), now_ms),
+            (
+                SessionStatus::Unknown,
+                StatusAuthority::Unavailable,
+                StatusReason::HookInteractionResolutionUnavailable,
+            ),
+            "rollout completion remains non-authoritative without exact Herdr working evidence"
+        );
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            Some(HerdrWorkingProjection {
+                status: SessionStatus::Executing,
+                status_since_ms: 1_774_710_065_050,
+                consecutive_matching: 0,
+            }),
+            "the linked terminal wait must close only the stale nested hook and retain current work"
+        );
+
+        let collector = CodexCollector::new();
+        let binding_key = hook_done_key(&record).unwrap();
+        collector
+            .rollout_lifecycle
+            .borrow_mut()
+            .insert(record.session_id.clone(), rollout);
+        let mut pidless = collector.hook_placeholder(&record);
+        pidless.version = "0.146.0".to_string();
+        let sessions = collector.finalize_hook_records_with_herdr(
+            vec![pidless],
+            vec![record.clone()],
+            &hook_shared(),
+            now_ms,
+            HashMap::from([(
+                (record.session_id.clone(), record.pid),
+                HerdrObservation {
+                    status: HerdrStatus::Working,
+                    observed_at_ms: now_ms,
+                    status_since_ms: now_ms - 1_000,
+                    consecutive_matching: 2,
+                },
+            )]),
+        );
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Executing);
+        assert_eq!(
+            sessions[0].status_evidence.authority,
+            StatusAuthority::Heuristic
+        );
+        assert_eq!(
+            sessions[0].status_evidence.reason,
+            StatusReason::HerdrScreenWorking
+        );
+        assert!(sessions[0].action_process_incarnation.is_none());
+        assert!(!collector
+            .hook_process_rollout_bindings
+            .borrow()
+            .contains_key(&binding_key));
+        assert!(!collector
+            .hook_done_tombstones
+            .borrow()
+            .contains_key(&binding_key));
+    }
+
+    #[test]
+    fn code_mode_cell_ids_and_status_headers_match_the_audited_provider_shape() {
+        assert_eq!(bounded_code_mode_cell_id("1").as_deref(), Some("1"));
+        assert_eq!(bounded_code_mode_cell_id("g2:1").as_deref(), Some("g2:1"));
+        for invalid in ["", "0", "01", "g1:1", "g2:0", "cell1", "g2:01"] {
+            assert_eq!(bounded_code_mode_cell_id(invalid), None, "{invalid}");
+        }
+        assert_eq!(
+            code_mode_output_state(&serde_json::json!([{
+                "type": "input_text",
+                "text": "Script running with cell ID g2:1\nWall time 1.0 seconds\nOutput:\n",
+            }])),
+            Some(CodeModeOutputState::Running("g2:1".to_string()))
+        );
+        assert_eq!(
+            code_mode_output_state(&serde_json::json!(
+                "Script running with cell ID 1\nWall time 0.0 seconds\nOutput:\n"
+            )),
+            Some(CodeModeOutputState::Running("1".to_string()))
+        );
+        assert_eq!(
+            code_mode_output_state(&serde_json::json!(
+                "Script completed\nWall time 0.0 seconds\nOutput:\n"
+            )),
+            Some(CodeModeOutputState::Terminal)
+        );
+        for terminal in ["Script completed", "Script failed", "Script terminated"] {
+            assert_eq!(
+                code_mode_output_state(&serde_json::json!([{
+                    "type": "input_text",
+                    "text": format!("{terminal}\nWall time 1.0 seconds\nOutput:\n"),
+                }, {
+                    "type": "input_text",
+                    "text": "subsequent provider output is not part of the status frame",
+                }])),
+                Some(CodeModeOutputState::Terminal)
+            );
+        }
+        for invalid in [
+            serde_json::json!([{
+                "type": "input_text",
+                "text": "Script completed",
+            }]),
+            serde_json::json!([{
+                "type": "input_text",
+                "text": "Script completed\nWall time 1.00 seconds\nOutput:\n",
+            }]),
+            serde_json::json!([{
+                "type": "input_text",
+                "text": "Script completed\nWall time 01.0 seconds\nOutput:\n",
+            }]),
+            serde_json::json!([{
+                "type": "input_text",
+                "text": "Script completed\nWall time 1.0 seconds\nOutput:\nforged",
+            }]),
+            serde_json::json!([{
+                "type": "input_text",
+                "text": "Script paused\nWall time 1.0 seconds\nOutput:\n",
+            }]),
+            serde_json::json!([{
+                "type": "input_text",
+                "text": "Script completed\nWall time 1.0 seconds\nOutput:\n",
+                "extra": true,
+            }]),
+        ] {
+            assert_eq!(code_mode_output_state(&invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn code_mode_wait_arguments_match_the_audited_provider_deserializer() {
+        for (raw, cell_id, terminate) in [
+            (r#"{"cell_id":"1"}"#, "1", false),
+            (
+                r#"{"cell_id":"g2:1","yield_time_ms":0,"max_tokens":0,"terminate":false}"#,
+                "g2:1",
+                false,
+            ),
+            (
+                r#"{"cell_id":"1","max_tokens":null,"extra":{"ignored":true}}"#,
+                "1",
+                false,
+            ),
+            (r#"{"cell_id":"1","terminate":true}"#, "1", true),
+        ] {
+            assert_eq!(
+                parse_code_mode_wait_args(raw),
+                Some(ParsedCodeModeWaitArgs {
+                    cell_id: cell_id.to_string(),
+                    terminate,
+                }),
+                "{raw}"
+            );
+        }
+
+        for raw in [
+            r#"{}"#,
+            r#"{"cell_id":"1","cell_id":"2"}"#,
+            r#"{"cell_id":1}"#,
+            r#"{"cell_id":"01"}"#,
+            r#"{"cell_id":"1","yield_time_ms":"10"}"#,
+            r#"{"cell_id":"1","yield_time_ms":null}"#,
+            r#"{"cell_id":"1","max_tokens":-1}"#,
+            r#"{"cell_id":"1","terminate":0}"#,
+            r#"{"cell_id":"1","terminate":null}"#,
+        ] {
+            assert_eq!(parse_code_mode_wait_args(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn terminating_code_mode_wait_never_projects_as_a_resumptive_wait() {
+        let mut terminal = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut terminal,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_exec"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"custom_tool_call_output","call_id":"call_exec","output":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\",\"terminate\":true}","call_id":"call_wait"}}"#,
+            ],
+        );
+        let open = parse_codex_jsonl(terminal.path()).unwrap();
+        assert!(open.lifecycle_valid);
+        assert_eq!(open.live_code_mode_cells, 1);
+        assert_eq!(
+            open.open_tool_classes.get("call_wait"),
+            Some(&RolloutToolClass::CodeModeUncorrelatable)
+        );
+
+        write_lines(
+            &mut terminal,
+            &[
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"function_call_output","call_id":"call_wait","output":[{"type":"input_text","text":"Script terminated\nWall time 1.0 seconds\nOutput:\n"}]}}"#,
+            ],
+        );
+        let closed = parse_codex_jsonl(terminal.path()).unwrap();
+        assert!(closed.lifecycle_valid);
+        assert_eq!(closed.live_code_mode_cells, 0);
+        assert!(closed.open_tool_classes.is_empty());
+
+        let mut impossible_running = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut impossible_running,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_exec"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"custom_tool_call_output","call_id":"call_exec","output":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\",\"terminate\":true}","call_id":"call_wait"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"function_call_output","call_id":"call_wait","output":[{"type":"input_text","text":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}]}}"#,
+            ],
+        );
+        let rejected = parse_codex_jsonl(impossible_running.path()).unwrap();
+        assert!(!rejected.lifecycle_valid);
+        assert!(!rejected.is_exact_terminal_lifecycle());
+    }
+
+    #[test]
+    fn rollout_open_call_metadata_is_bounded_and_closed_calls_do_not_accumulate() {
+        let mut overflow = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut overflow,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            ],
+        );
+        for index in 0..=MAX_OPEN_ROLLOUT_CALLS {
+            writeln!(
+                overflow,
+                "{}",
+                serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": "2026-03-28T15:01:01Z",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "read_file",
+                        "arguments": "{}",
+                        "call_id": format!("call_{index}"),
+                    }
+                })
+            )
+            .unwrap();
+        }
+        overflow.flush().unwrap();
+        let parsed = parse_codex_jsonl(overflow.path()).unwrap();
+        assert!(!parsed.lifecycle_valid);
+        assert_eq!(parsed.open_tool_ids.len(), MAX_OPEN_ROLLOUT_CALLS);
+        assert_eq!(parsed.open_tool_started_at_ms.len(), MAX_OPEN_ROLLOUT_CALLS);
+        assert_eq!(parsed.open_tool_classes.len(), MAX_OPEN_ROLLOUT_CALLS);
+
+        let mut sequential = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut sequential,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            ],
+        );
+        for index in 0..(MAX_OPEN_ROLLOUT_CALLS + 64) {
+            let call_id = format!("call_{index}");
+            writeln!(
+                sequential,
+                "{}",
+                serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": "2026-03-28T15:01:01Z",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "read_file",
+                        "arguments": "{}",
+                        "call_id": call_id,
+                    }
+                })
+            )
+            .unwrap();
+            writeln!(
+                sequential,
+                "{}",
+                serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": "2026-03-28T15:01:01Z",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": "ok",
+                    }
+                })
+            )
+            .unwrap();
+        }
+        sequential.flush().unwrap();
+        let parsed = parse_codex_jsonl(sequential.path()).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert!(parsed.open_tool_ids.is_empty());
+        assert!(parsed.open_tool_started_at_ms.is_empty());
+        assert!(parsed.open_tool_classes.is_empty());
+
+        write_lines(
+            &mut sequential,
+            &[
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","name":"read_file","arguments":"{}","call_id":"call_0"}}"#,
+            ],
+        );
+        let duplicate = parse_codex_jsonl(sequential.path()).unwrap();
+        assert!(!duplicate.lifecycle_valid);
+        assert!(duplicate.open_tool_ids.is_empty());
+    }
+
+    #[test]
+    fn rollout_call_history_resets_at_each_clean_turn_boundary() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut file, &[SESSION_META]);
+        for index in 0..=MAX_TRACKED_ROLLOUT_CALL_IDS {
+            let turn_id = format!("turn-{index}");
+            let call_id = format!("call_{index}");
+            for value in [
+                serde_json::json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-03-28T15:01:01Z",
+                    "payload": {"type": "task_started", "turn_id": turn_id},
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": "2026-03-28T15:01:01Z",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "read_file",
+                        "arguments": "{}",
+                        "call_id": call_id,
+                    },
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": "2026-03-28T15:01:01Z",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": "ok",
+                    },
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-03-28T15:01:01Z",
+                    "payload": {"type": "task_complete", "turn_id": turn_id},
+                }),
+            ] {
+                writeln!(file, "{value}").unwrap();
+            }
+        }
+        file.flush().unwrap();
+
+        let parsed = parse_codex_jsonl(file.path()).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert!(parsed.task_complete);
+        assert_eq!(
+            parsed.completed_turn_id.as_deref(),
+            Some(format!("turn-{MAX_TRACKED_ROLLOUT_CALL_IDS}").as_str())
+        );
+        assert!(parsed.open_tool_ids.is_empty());
+    }
+
+    #[test]
+    fn rollout_lifecycle_ids_and_tool_names_are_bounded_before_retention() {
+        let mut oversized_turn = tempfile::NamedTempFile::new().unwrap();
+        write_lines(&mut oversized_turn, &[SESSION_META]);
+        writeln!(
+            oversized_turn,
+            "{}",
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-03-28T15:01:00Z",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "x".repeat(MAX_ROLLOUT_LIFECYCLE_ID_BYTES + 1),
+                },
+            })
+        )
+        .unwrap();
+        for index in 1..=MAX_TRACKED_CODE_MODE_CELLS {
+            let call_id = format!("call_exec_{index}");
+            writeln!(
+                oversized_turn,
+                "{}",
+                serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": "2026-03-28T15:01:01Z",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "input": "private",
+                        "call_id": call_id,
+                    },
+                })
+            )
+            .unwrap();
+            writeln!(
+                oversized_turn,
+                "{}",
+                serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": "2026-03-28T15:01:01Z",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": call_id,
+                        "output": [{
+                            "type": "input_text",
+                            "text": format!(
+                                "Script running with cell ID {index}\nWall time 1.0 seconds\nOutput:\n"
+                            ),
+                        }],
+                    },
+                })
+            )
+            .unwrap();
+        }
+        oversized_turn.flush().unwrap();
+        let parsed = parse_codex_jsonl(oversized_turn.path()).unwrap();
+        assert!(!parsed.lifecycle_valid);
+        assert!(parsed.active_turn_id.is_none());
+        assert_eq!(parsed.live_code_mode_cells, 0);
+
+        let mut unsafe_names = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut unsafe_names,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            ],
+        );
+        for (index, name) in [
+            "read\u{1b}[31m".to_string(),
+            "x".repeat(MAX_ROLLOUT_TOOL_NAME_BYTES + 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            writeln!(
+                unsafe_names,
+                "{}",
+                serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": "2026-03-28T15:01:01Z",
+                    "payload": {
+                        "type": "function_call",
+                        "name": name,
+                        "arguments": "{}",
+                        "call_id": format!("call_{index}"),
+                    },
+                })
+            )
+            .unwrap();
+        }
+        unsafe_names.flush().unwrap();
+        let parsed = parse_codex_jsonl(unsafe_names.path()).unwrap();
+        assert!(!parsed.lifecycle_valid);
+        assert!(parsed.current_task.is_empty());
+        assert!(parsed.tool_calls.is_empty());
+        assert!(parsed.open_tool_ids.is_empty());
+    }
+
+    #[test]
+    fn multiple_or_cross_turn_code_mode_cells_remain_valid_but_uncorrelatable() {
+        let mut multiple = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut multiple,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_exec_1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"custom_tool_call_output","call_id":"call_exec_1","output":[{"type":"input_text","text":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}]}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_exec_2"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"custom_tool_call_output","call_id":"call_exec_2","output":[{"type":"input_text","text":"Script running with cell ID 2\nWall time 1.0 seconds\nOutput:\n"}]}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:05Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\"}","call_id":"call_wait"}}"#,
+            ],
+        );
+        let parsed = parse_codex_jsonl(multiple.path()).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert_eq!(parsed.live_code_mode_cells, 2);
+        assert!(parsed.code_mode_correlation_ambiguous);
+        assert_eq!(
+            parsed.open_tool_classes.get("call_wait"),
+            Some(&RolloutToolClass::CodeModeUncorrelatable)
+        );
+
+        let mut cross_turn = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut cross_turn,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_exec"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"custom_tool_call_output","call_id":"call_exec","output":[{"type":"input_text","text":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}]}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:05Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\"}","call_id":"call_wait"}}"#,
+            ],
+        );
+        let parsed = parse_codex_jsonl(cross_turn.path()).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert_eq!(parsed.live_code_mode_cells, 1);
+        assert!(parsed.code_mode_correlation_ambiguous);
+        assert_eq!(
+            parsed.open_tool_classes.get("call_wait"),
+            Some(&RolloutToolClass::CodeModeUncorrelatable)
+        );
+    }
+
+    #[test]
+    fn concurrent_code_mode_waits_and_unknown_outputs_fail_closed() {
+        let mut concurrent = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut concurrent,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_exec"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"custom_tool_call_output","call_id":"call_exec","output":[{"type":"input_text","text":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}]}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\"}","call_id":"call_wait_1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\"}","call_id":"call_wait_2"}}"#,
+            ],
+        );
+        let parsed = parse_codex_jsonl(concurrent.path()).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert!(parsed.code_mode_correlation_ambiguous);
+        assert!(parsed
+            .open_tool_classes
+            .values()
+            .all(|class| { *class == RolloutToolClass::CodeModeUncorrelatable }));
+
+        write_lines(
+            &mut concurrent,
+            &[
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:05Z","payload":{"type":"function_call_output","call_id":"call_wait_2","output":[{"type":"input_text","text":"Script completed\nWall time 1.0 seconds\nOutput:\n"}]}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:06Z","payload":{"type":"function_call_output","call_id":"call_wait_1","output":[{"type":"input_text","text":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}]}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:07Z","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
+            ],
+        );
+        let raced = parse_codex_jsonl(concurrent.path()).unwrap();
+        assert!(!raced.lifecycle_valid);
+        assert!(!raced.is_exact_terminal_lifecycle());
+
+        let mut resolved_ambiguity = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut resolved_ambiguity,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_exec_1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"custom_tool_call_output","call_id":"call_exec_1","output":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_exec_2"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"custom_tool_call_output","call_id":"call_exec_2","output":"Script running with cell ID 2\nWall time 1.0 seconds\nOutput:\n"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:05Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\"}","call_id":"call_wait_1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:06Z","payload":{"type":"function_call_output","call_id":"call_wait_1","output":[{"type":"input_text","text":"Script completed\nWall time 1.0 seconds\nOutput:\n"}]}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:07Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"2\"}","call_id":"call_wait_2"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:08Z","payload":{"type":"function_call_output","call_id":"call_wait_2","output":[{"type":"input_text","text":"Script completed\nWall time 1.0 seconds\nOutput:\n"}]}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:09Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_exec_3"}}"#,
+            ],
+        );
+        let recovered = parse_codex_jsonl(resolved_ambiguity.path()).unwrap();
+        assert!(recovered.lifecycle_valid);
+        assert_eq!(recovered.live_code_mode_cells, 0);
+        assert!(!recovered.code_mode_correlation_ambiguous);
+        assert!(matches!(
+            recovered.open_tool_classes.get("call_exec_3"),
+            Some(RolloutToolClass::CodeModeExec { .. })
+        ));
+
+        let mut unknown_output = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut unknown_output,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_exec"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"custom_tool_call_output","call_id":"call_exec","output":[{"type":"input_text","text":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}]}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\"}","call_id":"call_wait"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"function_call_output","call_id":"call_wait","output":"Script paused\nOutput:\n"}}"#,
+            ],
+        );
+        let parsed = parse_codex_jsonl(unknown_output.path()).unwrap();
+        assert!(!parsed.lifecycle_valid);
+        assert_eq!(parsed.live_code_mode_cells, 0);
+        assert!(parsed.open_tool_ids.is_empty());
+    }
+
+    #[test]
+    fn code_mode_cell_provenance_is_bounded_and_blocks_terminal_promotion() {
+        let mut overflow = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut overflow,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            ],
+        );
+        for index in 1..=(MAX_TRACKED_CODE_MODE_CELLS + 1) {
+            let call_id = format!("call_exec_{index}");
+            writeln!(
+                overflow,
+                "{}",
+                serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": "2026-03-28T15:01:01Z",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "input": "private",
+                        "call_id": call_id,
+                    }
+                })
+            )
+            .unwrap();
+            writeln!(
+                overflow,
+                "{}",
+                serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": "2026-03-28T15:01:01Z",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": call_id,
+                        "output": [{
+                            "type": "input_text",
+                            "text": format!(
+                                "Script running with cell ID {index}\nWall time 1.0 seconds\nOutput:\n"
+                            ),
+                        }],
+                    }
+                })
+            )
+            .unwrap();
+        }
+        overflow.flush().unwrap();
+        let parsed = parse_codex_jsonl(overflow.path()).unwrap();
+        assert!(!parsed.lifecycle_valid);
+        assert_eq!(parsed.live_code_mode_cells, MAX_TRACKED_CODE_MODE_CELLS);
+
+        let mut live_at_completion = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut live_at_completion,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_exec"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"custom_tool_call_output","call_id":"call_exec","output":[{"type":"input_text","text":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}]}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
+            ],
+        );
+        let parsed = parse_codex_jsonl(live_at_completion.path()).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert!(parsed.task_complete);
+        assert_eq!(parsed.live_code_mode_cells, 1);
+        assert!(!parsed.is_exact_terminal_lifecycle());
     }
 
     #[test]
@@ -5915,7 +8942,7 @@ mod tests {
             now_ms,
         );
         let mismatch = RolloutLifecycle {
-            root_cli_version: plugin::SUPPORTED_CODEX_VERSION.to_string(),
+            root_cli_version: plugin::MIN_SUPPORTED_CODEX_VERSION.to_string(),
             turn_active: true,
             active_turn_id: Some("turn-1".to_string()),
             open_tool_ids: HashSet::from(["call-2".to_string()]),
@@ -5968,7 +8995,7 @@ mod tests {
         );
         record.interaction_ambiguous = true;
         let rollout = RolloutLifecycle {
-            root_cli_version: plugin::SUPPORTED_CODEX_VERSION.to_string(),
+            root_cli_version: plugin::MIN_SUPPORTED_CODEX_VERSION.to_string(),
             turn_active: true,
             open_tool_ids: HashSet::from(["call-1".to_string()]),
             ..Default::default()
@@ -6204,21 +9231,84 @@ mod tests {
     }
 
     #[test]
-    fn only_known_codex_end_events_close_their_matching_call() {
+    fn known_codex_end_events_require_exact_correlation_and_canonical_output() {
+        const AUDITED_META: &str = r#"{"type":"session_meta","timestamp":"2026-03-28T15:00:00Z","payload":{"id":"sess-audited","cwd":"/work","cli_version":"0.146.0","timestamp":"2026-03-28T15:00:00Z"}}"#;
         let temp = tempfile::tempdir().unwrap();
-        let known = temp.path().join("rollout-known-end.jsonl");
+        let half_closed = temp.path().join("rollout-known-end-half-closed.jsonl");
         write_jsonl(
-            &known,
+            &half_closed,
             &[
                 SESSION_META,
                 r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call-1"}}"#,
-                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"exec_command_end","call_id":"call-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call_1"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"exec_command_end","call_id":"call_1"}}"#,
             ],
         );
-        let parsed = parse_codex_jsonl(&known).unwrap();
+        let parsed = parse_codex_jsonl(&half_closed).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert_eq!(parsed.open_tool_ids, HashSet::from(["call_1".to_string()]));
+        assert_eq!(parsed.tool_calls[0].duration_ms, 1_000);
+
+        let completed = temp.path().join("rollout-known-end-completed.jsonl");
+        write_jsonl(
+            &completed,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call_1"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"exec_command_end","call_id":"call_1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"function_call_output","call_id":"call_1","output":"ok"}}"#,
+            ],
+        );
+        let parsed = parse_codex_jsonl(&completed).unwrap();
         assert!(parsed.lifecycle_valid);
         assert!(parsed.open_tool_ids.is_empty());
+        assert_eq!(parsed.tool_calls[0].duration_ms, 1_000);
+        let completed = parsed.completed_tool_calls.get("call_1").unwrap();
+        assert_eq!(completed.class, RolloutToolClass::Ordinary);
+        assert_eq!(completed.completed_at_ms - completed.started_at_ms, 2_000);
+        assert!(!completed.code_mode_terminal);
+
+        let output_before_end = temp.path().join("rollout-output-before-known-end.jsonl");
+        write_jsonl(
+            &output_before_end,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call_1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"function_call_output","call_id":"call_1","output":"ok"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"exec_command_end","call_id":"call_1"}}"#,
+            ],
+        );
+        let parsed = parse_codex_jsonl(&output_before_end).unwrap();
+        assert!(!parsed.lifecycle_valid);
+        assert!(parsed.open_tool_ids.is_empty());
+
+        let nested = temp.path().join("rollout-known-nested-end.jsonl");
+        write_jsonl(
+            &nested,
+            &[
+                AUDITED_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call_outer"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"web_search_end","call_id":"exec-01234567-89ab-4def-8abc-0123456789ab"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"custom_tool_call_output","call_id":"call_outer","output":"Script completed\nWall time 2.0 seconds\nOutput:\n"}}"#,
+            ],
+        );
+        let parsed = parse_codex_jsonl(&nested).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert!(parsed.open_tool_ids.is_empty());
+        assert!(parsed
+            .completed_tool_calls
+            .get("call_outer")
+            .is_some_and(|call| call.code_mode_terminal));
+        assert_eq!(
+            parsed.nested_code_mode_end_at_ms,
+            HashMap::from([(
+                "exec-01234567-89ab-4def-8abc-0123456789ab".to_string(),
+                1_774_710_062_000,
+            )])
+        );
 
         let unknown = temp.path().join("rollout-unknown-end.jsonl");
         write_jsonl(
@@ -6233,6 +9323,104 @@ mod tests {
         let parsed = parse_codex_jsonl(&unknown).unwrap();
         assert!(!parsed.lifecycle_valid);
         assert_eq!(parsed.open_tool_ids, HashSet::from(["call-1".to_string()]));
+
+        for (name, end) in [
+            (
+                "mismatched-kind",
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"patch_apply_end","call_id":"call-1"}}"#,
+            ),
+            (
+                "unmatched-id",
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"exec_command_end","call_id":"unmatched"}}"#,
+            ),
+        ] {
+            let path = temp.path().join(format!("rollout-{name}.jsonl"));
+            write_jsonl(
+                &path,
+                &[
+                    SESSION_META,
+                    r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                    r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call-1"}}"#,
+                    end,
+                ],
+            );
+            let parsed = parse_codex_jsonl(&path).unwrap();
+            assert!(!parsed.lifecycle_valid, "{name} must fail closed");
+            assert_eq!(parsed.open_tool_ids, HashSet::from(["call-1".to_string()]));
+        }
+
+        let duplicate = temp.path().join("rollout-duplicate-known-end.jsonl");
+        write_jsonl(
+            &duplicate,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call-1"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"exec_command_end","call_id":"call-1"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"exec_command_end","call_id":"call-1"}}"#,
+            ],
+        );
+        let parsed = parse_codex_jsonl(&duplicate).unwrap();
+        assert!(!parsed.lifecycle_valid);
+        assert_eq!(parsed.open_tool_ids, HashSet::from(["call-1".to_string()]));
+    }
+
+    #[test]
+    fn known_codex_end_kinds_match_the_audited_direct_tool_namespaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "exec-command",
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call-1"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"exec_command_end","call_id":"call-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"function_call_output","call_id":"call-1","output":"ok"}}"#,
+            ),
+            (
+                "apply-patch",
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"apply_patch","input":"private","call_id":"call-1"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"patch_apply_end","call_id":"call-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":"ok"}}"#,
+            ),
+            (
+                "web-run",
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","namespace":"web","name":"run","arguments":"{}","call_id":"call-1"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"web_search_end","call_id":"call-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"function_call_output","call_id":"call-1","output":"ok"}}"#,
+            ),
+            (
+                "image-generation",
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","namespace":"image_gen","name":"imagegen","arguments":"{}","call_id":"call-1"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"image_generation_end","call_id":"call-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"function_call_output","call_id":"call-1","output":"ok"}}"#,
+            ),
+            (
+                "mcp-tool",
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","namespace":"mcp__server","name":"tool","arguments":"{}","call_id":"call-1"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"mcp_tool_call_end","call_id":"call-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"function_call_output","call_id":"call-1","output":"ok"}}"#,
+            ),
+        ];
+
+        for (name, call, end, output) in cases {
+            let path = temp.path().join(format!("rollout-{name}.jsonl"));
+            write_jsonl(
+                &path,
+                &[
+                    SESSION_META,
+                    r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                    call,
+                    end,
+                    output,
+                ],
+            );
+            let parsed = parse_codex_jsonl(&path).unwrap();
+            assert!(parsed.lifecycle_valid, "{name} should remain exact");
+            assert!(
+                parsed.open_tool_ids.is_empty(),
+                "{name} should close on output"
+            );
+            assert_eq!(parsed.tool_calls[0].duration_ms, 1_000);
+        }
     }
 
     #[test]
@@ -6297,7 +9485,7 @@ mod tests {
 
         let parsed = parse_codex_jsonl(&temp.path().join("rollout-stream-error.jsonl")).unwrap();
         let rollout = RolloutLifecycle {
-            root_cli_version: plugin::SUPPORTED_CODEX_VERSION.to_string(),
+            root_cli_version: plugin::MIN_SUPPORTED_CODEX_VERSION.to_string(),
             turn_active: parsed.turn_active,
             task_complete: parsed.task_complete,
             lifecycle_valid: parsed.lifecycle_valid,
@@ -6429,9 +9617,512 @@ mod tests {
             ],
         );
         let parsed = parse_codex_jsonl(&aborted).unwrap();
-        assert!(!parsed.lifecycle_valid);
+        assert!(parsed.lifecycle_valid);
+        assert!(!parsed.turn_active);
         assert!(!parsed.task_complete);
+        assert!(parsed.active_turn_id.is_none());
         assert!(parsed.completed_turn_id.is_none());
+    }
+
+    #[test]
+    fn exact_abort_allows_only_a_later_clean_turn_to_recover() {
+        let temp = tempfile::tempdir().unwrap();
+        let recovered = temp.path().join("rollout-abort-recovered.jsonl");
+        write_jsonl(
+            &recovered,
+            &[
+                SESSION_META,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call-1"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"turn_aborted","turn_id":"turn-1"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"custom_tool_call","name":"exec","input":"const result = await tools.exec_command({cmd: \"cargo test\"});\ntext(result.output);","call_id":"call-2"}}"#,
+            ],
+        );
+        let parsed = parse_codex_jsonl(&recovered).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert!(parsed.turn_active);
+        assert_eq!(parsed.active_turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(parsed.open_tool_ids, HashSet::from(["call-2".to_string()]));
+        assert!(matches!(
+            parsed.open_tool_classes.get("call-2"),
+            Some(RolloutToolClass::CodeModeExec { .. })
+        ));
+
+        for (name, fault) in [
+            (
+                "mismatched-abort",
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"turn_aborted","turn_id":"other-turn"}}"#,
+            ),
+            (
+                "stream-error",
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"stream_error"}}"#,
+            ),
+        ] {
+            let path = temp.path().join(format!("rollout-{name}.jsonl"));
+            write_jsonl(
+                &path,
+                &[
+                    SESSION_META,
+                    r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                    fault,
+                    r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+                ],
+            );
+            let parsed = parse_codex_jsonl(&path).unwrap();
+            assert!(!parsed.lifecycle_valid, "{name} must remain fail-closed");
+        }
+    }
+
+    #[test]
+    fn abort_preserves_yielded_code_mode_cells_until_exact_termination() {
+        let temp = tempfile::tempdir().unwrap();
+        let unresolved = temp.path().join("rollout-aborted-yielded-cell.jsonl");
+        let prefix = [
+            SESSION_META,
+            r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"type":"response_item","timestamp":"2026-03-28T15:01:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"private","call_id":"call-exec"}}"#,
+            r#"{"type":"response_item","timestamp":"2026-03-28T15:01:02Z","payload":{"type":"custom_tool_call_output","call_id":"call-exec","output":"Script running with cell ID 1\nWall time 1.0 seconds\nOutput:\n"}}"#,
+            r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:03Z","payload":{"type":"turn_aborted","turn_id":"turn-1"}}"#,
+            r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:04Z","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+        ];
+        write_jsonl(&unresolved, &prefix);
+
+        let parsed = parse_codex_jsonl(&unresolved).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert_eq!(parsed.live_code_mode_cells, 1);
+        assert!(parsed.code_mode_correlation_ambiguous);
+        assert!(!parsed.is_exact_terminal_lifecycle());
+
+        let completed_without_cell = temp.path().join("rollout-aborted-live-cell-complete.jsonl");
+        let mut lines = prefix.to_vec();
+        lines.push(
+            r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:05Z","payload":{"type":"task_complete","turn_id":"turn-2"}}"#,
+        );
+        write_jsonl(&completed_without_cell, &lines);
+        let parsed = parse_codex_jsonl(&completed_without_cell).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert!(parsed.task_complete);
+        assert_eq!(parsed.live_code_mode_cells, 1);
+        assert!(parsed.code_mode_correlation_ambiguous);
+        assert!(!parsed.is_exact_terminal_lifecycle());
+
+        let terminated = temp.path().join("rollout-aborted-cell-terminated.jsonl");
+        let mut lines = prefix.to_vec();
+        lines.extend([
+            r#"{"type":"response_item","timestamp":"2026-03-28T15:01:05Z","payload":{"type":"function_call","name":"wait","arguments":"{\"cell_id\":\"1\",\"terminate\":true}","call_id":"call-wait"}}"#,
+            r#"{"type":"response_item","timestamp":"2026-03-28T15:01:06Z","payload":{"type":"function_call_output","call_id":"call-wait","output":"Script terminated\nWall time 1.0 seconds\nOutput:\n"}}"#,
+            r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:07Z","payload":{"type":"task_complete","turn_id":"turn-2"}}"#,
+        ]);
+        write_jsonl(&terminated, &lines);
+        let parsed = parse_codex_jsonl(&terminated).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert_eq!(parsed.live_code_mode_cells, 0);
+        assert!(!parsed.code_mode_correlation_ambiguous);
+        assert!(parsed.is_exact_terminal_lifecycle());
+    }
+
+    #[test]
+    fn copied_subagent_history_starts_a_distinct_exact_lifecycle_epoch() {
+        const CHILD_ID: &str = "019fc46e-53c0-7861-95ad-b379c660fb69";
+        const PARENT_ID: &str = "019fc2c5-df6e-78f0-8773-9ab7a5fb6d84";
+        const CHILD_META: &str = r#"{"type":"session_meta","timestamp":"2026-08-02T21:43:12.695Z","payload":{"id":"019fc46e-53c0-7861-95ad-b379c660fb69","parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T21:43:12.695Z"}}"#;
+        const PARENT_META: &str = r#"{"type":"session_meta","timestamp":"2026-08-02T21:43:12.695Z","payload":{"id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T13:59:35.564Z"}}"#;
+
+        let temp = tempfile::tempdir().unwrap();
+        let copied = temp.path().join("rollout-copied-child.jsonl");
+        write_jsonl(
+            &copied,
+            &[
+                CHILD_META,
+                PARENT_META,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T21:43:12.700Z","payload":{"type":"task_started","turn_id":"019fc46d-6979-7711-86f3-823997623d47"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-08-02T21:43:12.710Z","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"parent-call"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T21:43:12.730Z","payload":{"type":"thread_settings_applied"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T21:43:12.736Z","payload":{"type":"task_started","turn_id":"019fc46e-545f-73f3-a201-88b6a34e78f0"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T21:45:17.200Z","payload":{"type":"turn_aborted","turn_id":"019fc46e-545f-73f3-a201-88b6a34e78f0"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T21:45:35.627Z","payload":{"type":"task_started","turn_id":"019fc470-828a-79a0-9903-d5f02a8c437d"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T21:45:40.000Z","payload":{"type":"agent_message","message":"done"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T21:45:57.017Z","payload":{"type":"task_complete","turn_id":"019fc470-828a-79a0-9903-d5f02a8c437d"}}"#,
+            ],
+        );
+
+        let parsed = parse_codex_jsonl(&copied).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert!(parsed.task_complete);
+        assert!(!parsed.turn_active);
+        assert_eq!(parsed.session_id, CHILD_ID);
+        assert_eq!(parsed.parent_thread_id.as_deref(), Some(PARENT_ID));
+        assert_eq!(
+            parsed.completed_turn_id.as_deref(),
+            Some("019fc470-828a-79a0-9903-d5f02a8c437d")
+        );
+        assert_eq!(parsed.turn_count, 1);
+        assert!(parsed.open_tool_ids.is_empty());
+        assert!(parsed.tool_calls.is_empty());
+
+        let legacy = temp.path().join("rollout-copied-child-0.145.jsonl");
+        write_jsonl(
+            &legacy,
+            &[
+                r#"{"type":"session_meta","timestamp":"2026-08-02T21:43:12.695Z","payload":{"id":"019fc46e-53c0-7861-95ad-b379c660fb69","parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","cwd":"/work","cli_version":"0.145.0","timestamp":"2026-08-02T21:43:12.695Z"}}"#,
+                r#"{"type":"session_meta","timestamp":"2026-08-02T21:43:12.695Z","payload":{"id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","cwd":"/work","cli_version":"0.145.0","timestamp":"2026-08-02T13:59:35.564Z"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T21:43:12.700Z","payload":{"type":"task_started","turn_id":"019fc46d-6979-7711-86f3-823997623d47"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T21:43:12.736Z","payload":{"type":"task_started","turn_id":"019fc46e-545f-73f3-a201-88b6a34e78f0"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T21:45:17.200Z","payload":{"type":"task_complete","turn_id":"019fc46e-545f-73f3-a201-88b6a34e78f0"}}"#,
+            ],
+        );
+        let parsed = parse_codex_jsonl(&legacy).unwrap();
+        assert!(!parsed.lifecycle_valid);
+        assert!(!parsed.is_exact_terminal_lifecycle());
+    }
+
+    #[test]
+    fn copied_rollout_metadata_is_bounded_and_excess_fails_closed() {
+        fn uuid_v7_at(timestamp_ms: u64, serial: usize) -> String {
+            format!(
+                "{:08x}-{:04x}-7000-8000-{:012x}",
+                timestamp_ms >> 16,
+                timestamp_ms & 0xffff,
+                serial
+            )
+        }
+
+        fn rfc3339(timestamp_ms: u64) -> String {
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_ms as i64)
+                .unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        }
+
+        fn write_copied_chain(path: &Path, replayed_count: usize) {
+            let base_ms = 1_774_710_000_000_u64;
+            let replayed_ids = (0..replayed_count)
+                .map(|index| uuid_v7_at(base_ms + index as u64 * 1_000, index))
+                .collect::<Vec<_>>();
+            let child_timestamp_ms = base_ms + replayed_count as u64 * 1_000;
+            let child_id = uuid_v7_at(child_timestamp_ms, replayed_count);
+            let child_timestamp = rfc3339(child_timestamp_ms);
+            let mut file = File::create(path).unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "type": "session_meta",
+                    "timestamp": child_timestamp,
+                    "payload": {
+                        "id": child_id,
+                        "parent_thread_id": replayed_ids.last().unwrap(),
+                        "cwd": "/work",
+                        "cli_version": "0.146.0",
+                        "timestamp": child_timestamp,
+                    }
+                })
+            )
+            .unwrap();
+
+            for (index, replayed_id) in replayed_ids.iter().enumerate() {
+                let metadata_timestamp = rfc3339(base_ms + index as u64 * 1_000);
+                let mut payload = serde_json::json!({
+                    "id": replayed_id,
+                    "cwd": "/work",
+                    "cli_version": "0.146.0",
+                    "timestamp": metadata_timestamp,
+                });
+                if index > 0 {
+                    payload["parent_thread_id"] = Value::String(replayed_ids[index - 1].clone());
+                }
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "type": "session_meta",
+                        "timestamp": metadata_timestamp,
+                        "payload": payload,
+                    })
+                )
+                .unwrap();
+            }
+
+            let epoch_thresholds = (1..replayed_count)
+                .map(|index| base_ms + index as u64 * 1_000)
+                .chain(std::iter::once(child_timestamp_ms));
+            for (index, threshold_ms) in epoch_thresholds.enumerate() {
+                let turn_id = uuid_v7_at(threshold_ms + 100, replayed_count + index + 1);
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "type": "event_msg",
+                        "timestamp": rfc3339(threshold_ms + 50),
+                        "payload": { "type": "thread_settings_applied" },
+                    })
+                )
+                .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "type": "event_msg",
+                        "timestamp": rfc3339(threshold_ms + 150),
+                        "payload": { "type": "task_started", "turn_id": turn_id },
+                    })
+                )
+                .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "type": "event_msg",
+                        "timestamp": rfc3339(threshold_ms + 200),
+                        "payload": { "type": "task_complete", "turn_id": turn_id },
+                    })
+                )
+                .unwrap();
+            }
+            file.flush().unwrap();
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let at_limit = temp.path().join("rollout-copied-meta-at-limit.jsonl");
+        write_copied_chain(&at_limit, MAX_COPIED_ROLLOUT_SESSION_META);
+        let parsed = parse_codex_jsonl(&at_limit).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert!(parsed.is_exact_terminal_lifecycle());
+
+        let over_limit = temp.path().join("rollout-copied-meta-over-limit.jsonl");
+        write_copied_chain(&over_limit, MAX_COPIED_ROLLOUT_SESSION_META + 1);
+        let parsed = parse_codex_jsonl(&over_limit).unwrap();
+        assert!(!parsed.lifecycle_valid);
+        assert!(!parsed.is_exact_terminal_lifecycle());
+    }
+
+    #[test]
+    fn attested_fork_metadata_delimits_copied_history_without_replayed_parent_meta() {
+        let temp = tempfile::tempdir().unwrap();
+        let copied = temp.path().join("rollout-attested-fork-child.jsonl");
+        write_jsonl(
+            &copied,
+            &[
+                r#"{"type":"session_meta","timestamp":"2026-08-02T22:02:12.914Z","payload":{"id":"019fc47f-b832-75b1-9427-5f024c502791","parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","forked_from_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84"}}},"cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T22:02:12.914Z"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T22:02:12.920Z","payload":{"type":"task_started","turn_id":"019fc46d-6979-7711-86f3-823997623d47"}}"#,
+                r#"{"type":"response_item","timestamp":"2026-08-02T22:02:12.925Z","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"parent-call"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T22:02:12.930Z","payload":{"type":"thread_settings_applied"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T22:02:12.935Z","payload":{"type":"task_started","turn_id":"019fc47f-b8b7-7210-99b2-d8b4d8bc86b7"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T22:02:12.950Z","payload":{"type":"agent_message","message":"child done"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T22:02:13.000Z","payload":{"type":"task_complete","turn_id":"019fc47f-b8b7-7210-99b2-d8b4d8bc86b7"}}"#,
+            ],
+        );
+
+        let parsed = parse_codex_jsonl(&copied).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert!(parsed.is_exact_terminal_lifecycle());
+        assert_eq!(
+            parsed.completed_turn_id.as_deref(),
+            Some("019fc47f-b8b7-7210-99b2-d8b4d8bc86b7")
+        );
+        assert_eq!(parsed.turn_count, 1);
+        assert!(parsed.tool_calls.is_empty());
+
+        let conflicting = temp.path().join("rollout-conflicting-fork-child.jsonl");
+        write_jsonl(
+            &conflicting,
+            &[
+                r#"{"type":"session_meta","timestamp":"2026-08-02T22:02:12.914Z","payload":{"id":"019fc47f-b832-75b1-9427-5f024c502791","parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","forked_from_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019fc2c0-0000-7000-8000-000000000000"}}},"cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T22:02:12.914Z"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T22:02:12.930Z","payload":{"type":"thread_settings_applied"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T22:02:12.935Z","payload":{"type":"task_started","turn_id":"019fc47f-b8b7-7210-99b2-d8b4d8bc86b7"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T22:02:13.000Z","payload":{"type":"task_complete","turn_id":"019fc47f-b8b7-7210-99b2-d8b4d8bc86b7"}}"#,
+            ],
+        );
+        assert!(!parse_codex_jsonl(&conflicting).unwrap().lifecycle_valid);
+    }
+
+    #[test]
+    fn direct_fork_epoch_attestation_requires_the_complete_exact_0146_shape() {
+        const SETTINGS: &str = r#"{"type":"event_msg","timestamp":"2026-08-02T22:02:12.930Z","payload":{"type":"thread_settings_applied"}}"#;
+        const START: &str = r#"{"type":"event_msg","timestamp":"2026-08-02T22:02:12.935Z","payload":{"type":"task_started","turn_id":"019fc47f-b8b7-7210-99b2-d8b4d8bc86b7"}}"#;
+        const COMPLETE: &str = r#"{"type":"event_msg","timestamp":"2026-08-02T22:02:13.000Z","payload":{"type":"task_complete","turn_id":"019fc47f-b8b7-7210-99b2-d8b4d8bc86b7"}}"#;
+        let cases = [
+            (
+                "missing-direct-parent",
+                r#"{"type":"session_meta","timestamp":"2026-08-02T22:02:12.914Z","payload":{"id":"019fc47f-b832-75b1-9427-5f024c502791","forked_from_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84"}}},"cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T22:02:12.914Z"}}"#,
+            ),
+            (
+                "missing-source-parent",
+                r#"{"type":"session_meta","timestamp":"2026-08-02T22:02:12.914Z","payload":{"id":"019fc47f-b832-75b1-9427-5f024c502791","parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","forked_from_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T22:02:12.914Z"}}"#,
+            ),
+            (
+                "mismatched-fork-parent",
+                r#"{"type":"session_meta","timestamp":"2026-08-02T22:02:12.914Z","payload":{"id":"019fc47f-b832-75b1-9427-5f024c502791","parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","forked_from_id":"019fc2c0-0000-7000-8000-000000000000","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84"}}},"cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T22:02:12.914Z"}}"#,
+            ),
+            (
+                "non-string-direct-parent",
+                r#"{"type":"session_meta","timestamp":"2026-08-02T22:02:12.914Z","payload":{"id":"019fc47f-b832-75b1-9427-5f024c502791","parent_thread_id":42,"forked_from_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84"}}},"cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T22:02:12.914Z"}}"#,
+            ),
+            (
+                "unreviewed-patch-release",
+                r#"{"type":"session_meta","timestamp":"2026-08-02T22:02:12.914Z","payload":{"id":"019fc47f-b832-75b1-9427-5f024c502791","parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","forked_from_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84"}}},"cwd":"/work","cli_version":"0.146.1","timestamp":"2026-08-02T22:02:12.914Z"}}"#,
+            ),
+            (
+                "parent-not-older-than-child",
+                r#"{"type":"session_meta","timestamp":"2026-08-02T22:02:12.914Z","payload":{"id":"019fc47f-b832-75b1-9427-5f024c502791","parent_thread_id":"019fc480-0000-7000-8000-000000000000","forked_from_id":"019fc480-0000-7000-8000-000000000000","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019fc480-0000-7000-8000-000000000000"}}},"cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T22:02:12.914Z"}}"#,
+            ),
+            (
+                "malformed-child-uuid",
+                r#"{"type":"session_meta","timestamp":"2026-08-02T22:02:12.914Z","payload":{"id":"not-a-uuid","parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","forked_from_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84"}}},"cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T22:02:12.914Z"}}"#,
+            ),
+        ];
+
+        let temp = tempfile::tempdir().unwrap();
+        for (name, metadata) in cases {
+            let path = temp.path().join(format!("rollout-{name}.jsonl"));
+            write_jsonl(&path, &[metadata, SETTINGS, START, COMPLETE]);
+            assert!(
+                !parse_codex_jsonl(&path).unwrap().lifecycle_valid,
+                "{name} must remain fail-closed"
+            );
+        }
+
+        let interrupted = temp.path().join("rollout-interrupted-copied-prefix.jsonl");
+        write_jsonl(
+            &interrupted,
+            &[
+                r#"{"type":"session_meta","timestamp":"2026-08-02T22:02:12.914Z","payload":{"id":"019fc47f-b832-75b1-9427-5f024c502791","parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","forked_from_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84"}}},"cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T22:02:12.914Z"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T22:02:12.920Z","payload":{"type":"stream_error"}}"#,
+                SETTINGS,
+                START,
+                COMPLETE,
+            ],
+        );
+        assert!(!parse_codex_jsonl(&interrupted).unwrap().lifecycle_valid);
+
+        let incomplete = temp.path().join("rollout-incomplete-direct-fork.jsonl");
+        write_jsonl(
+            &incomplete,
+            &[
+                r#"{"type":"session_meta","timestamp":"2026-08-02T22:02:12.914Z","payload":{"id":"019fc47f-b832-75b1-9427-5f024c502791","parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","forked_from_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84"}}},"cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T22:02:12.914Z"}}"#,
+                SETTINGS,
+            ],
+        );
+        assert!(!parse_codex_jsonl(&incomplete).unwrap().lifecycle_valid);
+    }
+
+    #[test]
+    fn copied_subagent_epoch_recovery_requires_the_exact_provider_delimiter() {
+        const CHILD_META: &str = r#"{"type":"session_meta","timestamp":"2026-08-02T21:43:12.695Z","payload":{"id":"019fc46e-53c0-7861-95ad-b379c660fb69","parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T21:43:12.695Z"}}"#;
+        const PARENT_META: &str = r#"{"type":"session_meta","timestamp":"2026-08-02T21:43:12.695Z","payload":{"id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T13:59:35.564Z"}}"#;
+        const PARENT_START: &str = r#"{"type":"event_msg","timestamp":"2026-08-02T21:43:12.700Z","payload":{"type":"task_started","turn_id":"019fc46d-6979-7711-86f3-823997623d47"}}"#;
+        const SETTINGS: &str = r#"{"type":"event_msg","timestamp":"2026-08-02T21:43:12.730Z","payload":{"type":"thread_settings_applied"}}"#;
+        const CHILD_START: &str = r#"{"type":"event_msg","timestamp":"2026-08-02T21:43:12.736Z","payload":{"type":"task_started","turn_id":"019fc46e-545f-73f3-a201-88b6a34e78f0"}}"#;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cases: [(&str, &[&str]); 8] = [
+            (
+                "missing-parent-meta",
+                &[CHILD_META, PARENT_START, SETTINGS, CHILD_START],
+            ),
+            (
+                "non-adjacent-delimiter",
+                &[
+                    CHILD_META,
+                    PARENT_META,
+                    PARENT_START,
+                    SETTINGS,
+                    r#"{"type":"event_msg","timestamp":"2026-08-02T21:43:12.732Z","payload":{"type":"token_count"}}"#,
+                    CHILD_START,
+                ],
+            ),
+            (
+                "missing-0.146-delimiter",
+                &[CHILD_META, PARENT_META, PARENT_START, CHILD_START],
+            ),
+            (
+                "malformed-copied-stream",
+                &[
+                    CHILD_META,
+                    PARENT_META,
+                    "NOT JSON",
+                    PARENT_START,
+                    SETTINGS,
+                    CHILD_START,
+                ],
+            ),
+            (
+                "missing-child-local-task",
+                &[CHILD_META, PARENT_META, PARENT_START, SETTINGS],
+            ),
+            (
+                "failed-first-candidate-cannot-recover",
+                &[
+                    CHILD_META,
+                    PARENT_META,
+                    PARENT_START,
+                    CHILD_START,
+                    SETTINGS,
+                    r#"{"type":"event_msg","timestamp":"2026-08-02T21:45:35.627Z","payload":{"type":"task_started","turn_id":"019fc470-828a-79a0-9903-d5f02a8c437d"}}"#,
+                ],
+            ),
+            (
+                "equal-uuidv7-threshold",
+                &[
+                    CHILD_META,
+                    PARENT_META,
+                    PARENT_START,
+                    SETTINGS,
+                    r#"{"type":"event_msg","timestamp":"2026-08-02T21:43:12.736Z","payload":{"type":"task_started","turn_id":"019fc46e-53c0-7abc-8def-0123456789ab"}}"#,
+                ],
+            ),
+            (
+                "incomplete-ancestor-chain",
+                &[
+                    CHILD_META,
+                    r#"{"type":"session_meta","timestamp":"2026-08-02T21:43:12.695Z","payload":{"id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","parent_thread_id":"019fc2c0-0000-7000-8000-000000000000","cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T13:59:35.564Z"}}"#,
+                    PARENT_START,
+                    SETTINGS,
+                    CHILD_START,
+                ],
+            ),
+        ];
+
+        for (name, lines) in cases {
+            let path = temp.path().join(format!("rollout-{name}.jsonl"));
+            write_jsonl(&path, lines);
+            let parsed = parse_codex_jsonl(&path).unwrap();
+            assert!(!parsed.lifecycle_valid, "{name} must remain fail-closed");
+        }
+    }
+
+    #[test]
+    fn nested_copied_subagent_epochs_follow_the_exact_metadata_chain_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("rollout-nested-copied-child.jsonl");
+        write_jsonl(
+            &nested,
+            &[
+                r#"{"type":"session_meta","timestamp":"2026-08-02T18:04:28.102Z","payload":{"id":"019fc3a6-0fd2-77c1-8a24-2a0330b1ab2e","parent_thread_id":"019fc3a5-ecd7-75a3-80c9-f278fa72e5c6","cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T18:04:28.007Z"}}"#,
+                r#"{"type":"session_meta","timestamp":"2026-08-02T18:04:28.102Z","payload":{"id":"019fc3a5-ecd7-75a3-80c9-f278fa72e5c6","parent_thread_id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T18:04:19.051Z"}}"#,
+                r#"{"type":"session_meta","timestamp":"2026-08-02T18:04:28.102Z","payload":{"id":"019fc2c5-df6e-78f0-8773-9ab7a5fb6d84","cwd":"/work","cli_version":"0.146.0","timestamp":"2026-08-02T13:59:35.564Z"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T18:04:28.106Z","payload":{"type":"task_started","turn_id":"019fc3a3-fd5f-7b51-9657-5240320e5f8d"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T18:04:28.115Z","payload":{"type":"thread_settings_applied"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T18:04:28.116Z","payload":{"type":"task_started","turn_id":"019fc3a5-ed5f-7081-bcb2-f12e3e6d791c"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T18:04:28.117Z","payload":{"type":"task_complete","turn_id":"019fc3a5-ed5f-7081-bcb2-f12e3e6d791c"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T18:04:28.117Z","payload":{"type":"thread_settings_applied"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T18:04:28.118Z","payload":{"type":"task_started","turn_id":"019fc3a5-f000-7660-8b33-6d31a98fa13b"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T18:04:28.119Z","payload":{"type":"task_complete","turn_id":"019fc3a5-f000-7660-8b33-6d31a98fa13b"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T18:04:28.119Z","payload":{"type":"thread_settings_applied"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T18:04:28.120Z","payload":{"type":"task_started","turn_id":"019fc3a6-1058-7800-a69d-82ec56600245"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T18:04:29.000Z","payload":{"type":"agent_message","message":"child done"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-08-02T18:08:29.254Z","payload":{"type":"task_complete","turn_id":"019fc3a6-1058-7800-a69d-82ec56600245"}}"#,
+            ],
+        );
+
+        let parsed = parse_codex_jsonl(&nested).unwrap();
+        assert!(parsed.lifecycle_valid);
+        assert!(parsed.is_exact_terminal_lifecycle());
+        assert_eq!(
+            parsed.completed_turn_id.as_deref(),
+            Some("019fc3a6-1058-7800-a69d-82ec56600245")
+        );
+        assert_eq!(parsed.turn_count, 1);
     }
 
     #[test]
@@ -6466,10 +10157,23 @@ mod tests {
     }
 
     #[test]
-    fn positive_hook_status_requires_the_exact_supported_root_cli_version() {
+    fn positive_hook_status_accepts_compatible_stable_root_cli_versions() {
         let now_ms = 100_000;
         let record = hook_record(HookCandidate::TurnOpen, now_ms);
-        for unsupported in ["0.145.0", "0.146.1", ""] {
+        for supported in ["0.145.0", "0.146.1", "1.0.0"] {
+            let mut rollout = active_root_rollout(now_ms);
+            rollout.root_cli_version = supported.to_string();
+            assert_eq!(
+                project_hook_status(&record, Some(&rollout), now_ms),
+                (
+                    SessionStatus::Thinking,
+                    StatusAuthority::Heuristic,
+                    StatusReason::HookTurnOpen,
+                ),
+                "compatible root cli_version {supported:?} must retain lifecycle evidence"
+            );
+        }
+        for unsupported in ["0.144.999", "0.145.0-beta.1", ""] {
             let mut rollout = active_root_rollout(now_ms);
             rollout.root_cli_version = unsupported.to_string();
             assert_eq!(
@@ -6497,7 +10201,7 @@ mod tests {
     }
 
     #[test]
-    fn production_hook_conversion_cannot_promote_live_but_preserves_exact_done_proof() {
+    fn production_hook_conversion_is_heuristic_unactionable_and_preserves_exact_done_proof() {
         let now_ms = 100_000;
         let collector = CodexCollector::new();
         let shared = hook_shared();
@@ -6505,12 +10209,12 @@ mod tests {
         assert!(matches!(record.candidate, HookCandidate::TurnOpen));
         assert!(
             !record.effective_hook_engine_attested,
-            "Codex 0.146 cannot attest the effective hook engine for one live thread"
+            "supported Codex releases cannot attest the effective hook engine for one live thread"
         );
 
         // The OS probes are isolated from conversion in this unit test. Make
-        // every other ownership input exact so the missing native attestation
-        // is the only reason live status cannot be promoted.
+        // every other ownership input exact so the live row can be displayed
+        // heuristically while action ownership remains unavailable.
         record.process_state = HookProcessState::Live;
         record.native_process_verified = true;
         record.actionable = true;
@@ -6521,21 +10225,19 @@ mod tests {
             "hook-session",
             "test-generation",
             "test:codex:42",
-            plugin::SUPPORTED_CODEX_VERSION,
+            "0.147.3",
         );
         let key = hook_done_key(&record).unwrap();
         let live =
             collector.finalize_hook_records(vec![session], vec![record.clone()], &shared, now_ms);
         assert_eq!(live.len(), 1);
-        assert_eq!(live[0].status, SessionStatus::Unknown);
+        assert_eq!(live[0].status, SessionStatus::Thinking);
         assert_eq!(
             live[0].status_evidence.authority,
-            StatusAuthority::Unavailable
+            StatusAuthority::Heuristic
         );
-        assert_eq!(
-            live[0].status_evidence.reason,
-            StatusReason::HookIntegrationUnverified
-        );
+        assert_eq!(live[0].status_evidence.reason, StatusReason::HookTurnOpen);
+        assert_eq!(live[0].version, "0.147.3");
         assert!(live[0].action_process_incarnation.is_none());
         assert!(collector
             .hook_process_rollout_bindings
@@ -6556,7 +10258,1097 @@ mod tests {
             StatusAuthority::Heuristic
         );
         assert_eq!(done[0].status_evidence.reason, StatusReason::ProcessExited);
+        assert_eq!(done[0].version, "0.147.3");
         assert!(done[0].action_process_incarnation.is_none());
+    }
+
+    #[test]
+    fn herdr_working_refines_unique_tool_across_codex_id_namespaces() {
+        let now_ms = 100_000;
+        let hook_id = "exec-f842a710-1234-4abc-8def-000000000000".to_string();
+        let rollout_id = "call_qOSAD01CGeN305j2BKf2D6vV".to_string();
+        let mut record = hook_record(
+            HookCandidate::ToolOpen(HashSet::from([hook_id.clone()])),
+            now_ms,
+        );
+        record.effective_hook_engine_attested = false;
+        let mut rollout = active_root_rollout(now_ms);
+        rollout.open_tool_ids = HashSet::from([rollout_id.clone()]);
+        rollout
+            .open_tool_started_at_ms
+            .insert(rollout_id.clone(), now_ms - 1_042);
+        rollout.open_tool_classes.insert(
+            rollout_id,
+            RolloutToolClass::CodeModeExec {
+                exec_started_at_ms: now_ms - 1_042,
+            },
+        );
+
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            Some(HerdrWorkingProjection {
+                status: SessionStatus::Executing,
+                status_since_ms: now_ms - 1_000,
+                consecutive_matching: 0,
+            })
+        );
+
+        record
+            .tool_opened_at_ms
+            .insert(hook_id.clone(), now_ms - 1_043);
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            None,
+            "a sole stale hook from before the outer exec cannot refine current work"
+        );
+        record.tool_opened_at_ms.insert(hook_id, now_ms - 1_000);
+
+        record.interaction_ambiguous = true;
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            None,
+            "a permission edge keeps visible work unclassified"
+        );
+
+        record.interaction_ambiguous = false;
+        record.observed_at_ms = now_ms + 1;
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            None,
+            "Herdr working must not bypass malformed hook state"
+        );
+    }
+
+    #[test]
+    fn herdr_working_refines_a_later_unique_wait_without_reusing_ids() {
+        let now_ms = 100_000;
+        let hook_id = "exec-f842a710-1234-4abc-8def-000000000000".to_string();
+        let rollout_id = "call_wait".to_string();
+        let mut record = hook_record(
+            HookCandidate::ToolOpen(HashSet::from([hook_id.clone()])),
+            now_ms,
+        );
+        record.status_since_ms = now_ms - 1_500;
+        record
+            .tool_opened_at_ms
+            .insert(hook_id.clone(), now_ms - 1_500);
+
+        let mut rollout = active_root_rollout(now_ms);
+        rollout.open_tool_ids = HashSet::from([rollout_id.clone()]);
+        rollout
+            .open_tool_started_at_ms
+            .insert(rollout_id.clone(), now_ms - 500);
+        rollout.open_tool_classes.insert(
+            rollout_id,
+            RolloutToolClass::CodeModeWait {
+                exec_started_at_ms: now_ms - 1_500,
+                exec_yielded_at_ms: now_ms - 1_000,
+            },
+        );
+        rollout.live_code_mode_cells = 1;
+        rollout.latest_lifecycle_at_ms = now_ms - 100;
+
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            Some(HerdrWorkingProjection {
+                status: SessionStatus::Executing,
+                status_since_ms: now_ms - 500,
+                consecutive_matching: 0,
+            })
+        );
+
+        record
+            .tool_opened_at_ms
+            .insert(hook_id.clone(), now_ms - 1_501);
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            None,
+            "a sole stale hook from before the yielded exec cannot corroborate its later wait"
+        );
+
+        record.tool_opened_at_ms.insert(hook_id, now_ms - 999);
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            None,
+            "a hook opened after the yield cannot be reused as the origin of its wait"
+        );
+    }
+
+    #[test]
+    fn herdr_working_reconciles_only_exact_canonical_root_completions() {
+        let now_ms = 100_000;
+        let stale_id = "call_Stale".to_string();
+        let current_id = "call_Current".to_string();
+        let mut record = hook_record(
+            HookCandidate::ToolOpen(HashSet::from([stale_id.clone(), current_id.clone()])),
+            now_ms,
+        );
+        record
+            .tool_opened_at_ms
+            .insert(stale_id.clone(), now_ms - 1_000);
+        record
+            .tool_opened_at_ms
+            .insert(current_id.clone(), now_ms - 300);
+
+        let mut rollout = active_root_rollout(now_ms);
+        rollout.latest_lifecycle_at_ms = now_ms - 100;
+        rollout.open_tool_ids = HashSet::from([current_id.clone()]);
+        rollout
+            .open_tool_started_at_ms
+            .insert(current_id.clone(), now_ms - 250);
+        rollout
+            .open_tool_classes
+            .insert(current_id, RolloutToolClass::Ordinary);
+        rollout.completed_tool_calls.insert(
+            stale_id,
+            CompletedRolloutCall {
+                started_at_ms: now_ms - 1_100,
+                completed_at_ms: now_ms - 900,
+                class: RolloutToolClass::Ordinary,
+                code_mode_terminal: false,
+            },
+        );
+
+        assert_eq!(
+            project_hook_status(&record, Some(&rollout), now_ms),
+            (
+                SessionStatus::Unknown,
+                StatusAuthority::Unavailable,
+                StatusReason::HookInteractionResolutionUnavailable,
+            ),
+            "rollout completion must not weaken the general hook projection"
+        );
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            Some(HerdrWorkingProjection {
+                status: SessionStatus::Executing,
+                status_since_ms: now_ms - 250,
+                consecutive_matching: 0,
+            })
+        );
+
+        let completion = rollout.completed_tool_calls.get_mut("call_Stale").unwrap();
+        completion.started_at_ms = now_ms - 950;
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            None,
+            "a provider completion that starts after the hook edge cannot close it"
+        );
+    }
+
+    #[test]
+    fn herdr_working_reconciles_one_terminal_code_mode_interval_without_guessing() {
+        let now_ms = 100_000;
+        let stale_hook = "exec-01234567-89ab-4def-8abc-0123456789ab".to_string();
+        let current_hook = "exec-11111111-2222-4333-8444-555555555555".to_string();
+        let current_outer = "call_Current".to_string();
+        let mut record = hook_record(
+            HookCandidate::ToolOpen(HashSet::from([stale_hook.clone(), current_hook.clone()])),
+            now_ms,
+        );
+        record
+            .tool_opened_at_ms
+            .insert(stale_hook.clone(), now_ms - 1_000);
+        record.tool_opened_at_ms.insert(current_hook, now_ms - 200);
+
+        let mut rollout = active_root_rollout(now_ms);
+        rollout.latest_lifecycle_at_ms = now_ms - 100;
+        rollout.open_tool_ids = HashSet::from([current_outer.clone()]);
+        rollout
+            .open_tool_started_at_ms
+            .insert(current_outer.clone(), now_ms - 250);
+        rollout.open_tool_classes.insert(
+            current_outer,
+            RolloutToolClass::CodeModeExec {
+                exec_started_at_ms: now_ms - 250,
+            },
+        );
+        rollout.completed_tool_calls.insert(
+            "call_Completed".to_string(),
+            CompletedRolloutCall {
+                started_at_ms: now_ms - 1_100,
+                completed_at_ms: now_ms - 900,
+                class: RolloutToolClass::CodeModeExec {
+                    exec_started_at_ms: now_ms - 1_100,
+                },
+                code_mode_terminal: true,
+            },
+        );
+
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            Some(HerdrWorkingProjection {
+                status: SessionStatus::Executing,
+                status_since_ms: now_ms - 200,
+                consecutive_matching: 0,
+            })
+        );
+
+        rollout
+            .completed_tool_calls
+            .get_mut("call_Completed")
+            .unwrap()
+            .code_mode_terminal = false;
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            None,
+            "a yielded Code Mode cell is not a terminal nested-tool completion"
+        );
+
+        rollout
+            .completed_tool_calls
+            .get_mut("call_Completed")
+            .unwrap()
+            .code_mode_terminal = true;
+        rollout.nested_code_mode_end_at_ms.insert(
+            "exec-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".to_string(),
+            now_ms - 950,
+        );
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            None,
+            "an exposed nested end identity cannot close a different stale hook"
+        );
+
+        rollout.nested_code_mode_end_at_ms.clear();
+        rollout
+            .nested_code_mode_end_at_ms
+            .insert(stale_hook, now_ms - 950);
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            Some(HerdrWorkingProjection {
+                status: SessionStatus::Executing,
+                status_since_ms: now_ms - 200,
+                consecutive_matching: 0,
+            }),
+            "an exact nested end identity may reconcile only its matching stale hook"
+        );
+        rollout.nested_code_mode_end_at_ms.clear();
+        rollout.completed_tool_calls.insert(
+            "call_Overlap".to_string(),
+            CompletedRolloutCall {
+                started_at_ms: now_ms - 1_050,
+                completed_at_ms: now_ms - 850,
+                class: RolloutToolClass::CodeModeExec {
+                    exec_started_at_ms: now_ms - 1_050,
+                },
+                code_mode_terminal: true,
+            },
+        );
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            None,
+            "overlapping Code Mode intervals have no exact hook bijection"
+        );
+
+        rollout.completed_tool_calls.remove("call_Overlap");
+        rollout.root_cli_version = "0.147.0".to_string();
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            None,
+            "an unaudited Code Mode release cannot reuse older correlation rules"
+        );
+    }
+
+    #[test]
+    fn herdr_completion_reconciliation_preserves_exact_subagent_projection() {
+        let now_ms = 100_000;
+        let stale_id = "call_Stale".to_string();
+        let mut active = hook_record(
+            HookCandidate::SubagentOpen {
+                active: HashSet::from(["child-1".to_string()]),
+                provisional: HashSet::new(),
+                root: HookRootCandidate::ToolOpen(HashSet::from([stale_id.clone()])),
+            },
+            now_ms,
+        );
+        active
+            .tool_opened_at_ms
+            .insert(stale_id.clone(), now_ms - 1_000);
+        let mut rollout = active_root_rollout(now_ms);
+        rollout.completed_tool_calls.insert(
+            stale_id.clone(),
+            CompletedRolloutCall {
+                started_at_ms: now_ms - 1_100,
+                completed_at_ms: now_ms - 900,
+                class: RolloutToolClass::Ordinary,
+                code_mode_terminal: false,
+            },
+        );
+        rollout
+            .descendants
+            .push(active_child_rollout("child-1", true, now_ms));
+        assert_eq!(
+            project_herdr_working_status(&active, Some(&rollout), now_ms),
+            Some(HerdrWorkingProjection {
+                status: SessionStatus::Executing,
+                status_since_ms: now_ms - 1_000,
+                consecutive_matching: 0,
+            })
+        );
+
+        let mut stopped = hook_record(
+            HookCandidate::SubagentOpen {
+                active: HashSet::new(),
+                provisional: HashSet::from(["child-1".to_string()]),
+                root: HookRootCandidate::ToolOpen(HashSet::from([stale_id.clone()])),
+            },
+            now_ms,
+        );
+        stopped.tool_opened_at_ms.insert(stale_id, now_ms - 1_000);
+        rollout.descendants = vec![terminal_child_rollout("child-1", true, now_ms)];
+        assert_eq!(
+            project_herdr_working_status(&stopped, Some(&rollout), now_ms),
+            Some(HerdrWorkingProjection {
+                status: SessionStatus::Thinking,
+                status_since_ms: now_ms - 1_000,
+                consecutive_matching: 0,
+            })
+        );
+
+        let current_id = "call_Current".to_string();
+        let terminal_tool = hook_record(
+            HookCandidate::SubagentOpen {
+                active: HashSet::new(),
+                provisional: HashSet::from(["child-1".to_string()]),
+                root: HookRootCandidate::ToolOpen(HashSet::from([
+                    "call_Stale".to_string(),
+                    current_id.clone(),
+                ])),
+            },
+            now_ms,
+        );
+        rollout.latest_lifecycle_at_ms = now_ms - 100;
+        rollout.open_tool_ids = HashSet::from([current_id.clone()]);
+        rollout
+            .open_tool_started_at_ms
+            .insert(current_id.clone(), now_ms - 250);
+        rollout
+            .open_tool_classes
+            .insert(current_id, RolloutToolClass::Ordinary);
+        assert_eq!(
+            project_herdr_working_status(&terminal_tool, Some(&rollout), now_ms),
+            Some(HerdrWorkingProjection {
+                status: SessionStatus::Executing,
+                status_since_ms: now_ms - 250,
+                consecutive_matching: 0,
+            })
+        );
+
+        rollout.descendants.clear();
+        assert_eq!(
+            project_herdr_working_status(&terminal_tool, Some(&rollout), now_ms),
+            None,
+            "missing provisional descendant completion remains unavailable"
+        );
+
+        stopped
+            .tool_classes
+            .insert("unexpected".to_string(), HookToolClass::Ordinary);
+        assert_eq!(
+            project_herdr_working_status(&stopped, Some(&rollout), now_ms),
+            None,
+            "malformed hook maps remain unavailable"
+        );
+    }
+
+    #[test]
+    fn herdr_working_rejects_interaction_and_parallel_tool_ambiguity() {
+        let now_ms = 100_000;
+        let hook_id = "exec-f842a710-1234-4abc-8def-000000000000".to_string();
+        let record = hook_record(HookCandidate::ToolOpen(HashSet::from([hook_id])), now_ms);
+        let rollout_id = "call_exec".to_string();
+        let mut rollout = active_root_rollout(now_ms);
+        rollout.open_tool_ids = HashSet::from([rollout_id.clone()]);
+        rollout
+            .open_tool_started_at_ms
+            .insert(rollout_id.clone(), now_ms - 900);
+        rollout
+            .open_tool_classes
+            .insert(rollout_id.clone(), RolloutToolClass::RequestUserInput);
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            None,
+            "an open interaction is never execution"
+        );
+
+        rollout.open_tool_classes.insert(
+            rollout_id,
+            RolloutToolClass::CodeModeExec {
+                exec_started_at_ms: now_ms - 900,
+            },
+        );
+        rollout.open_tool_ids.insert("call_parallel".to_string());
+        rollout
+            .open_tool_started_at_ms
+            .insert("call_parallel".to_string(), now_ms - 800);
+        rollout
+            .open_tool_classes
+            .insert("call_parallel".to_string(), RolloutToolClass::Ordinary);
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            None,
+            "parallel provider calls have no cross-namespace bijection"
+        );
+
+        rollout.open_tool_ids.remove("call_parallel");
+        rollout.open_tool_started_at_ms.remove("call_parallel");
+        rollout.open_tool_classes.remove("call_parallel");
+        rollout.open_tool_classes.clear();
+        assert_eq!(
+            project_herdr_working_status(&record, Some(&rollout), now_ms),
+            None,
+            "missing content-free classes fail closed"
+        );
+    }
+
+    #[test]
+    fn herdr_working_keeps_direct_ids_and_rejects_unreviewed_code_mode_shapes() {
+        let now_ms = 100_000;
+        let direct_id = "call_direct".to_string();
+        let direct = hook_record(
+            HookCandidate::ToolOpen(HashSet::from([direct_id.clone()])),
+            now_ms,
+        );
+        let mut rollout = active_root_rollout(now_ms);
+        rollout.open_tool_ids = HashSet::from([direct_id.clone()]);
+        rollout
+            .open_tool_started_at_ms
+            .insert(direct_id.clone(), now_ms - 900);
+        rollout
+            .open_tool_classes
+            .insert(direct_id, RolloutToolClass::Ordinary);
+        assert!(project_herdr_working_status(&direct, Some(&rollout), now_ms).is_some());
+
+        let code_mode = hook_record(
+            HookCandidate::ToolOpen(HashSet::from([
+                "exec-f842a710-1234-4abc-8def-000000000000".to_string()
+            ])),
+            now_ms,
+        );
+        rollout.root_cli_version = "0.147.0".to_string();
+        rollout.open_tool_ids = HashSet::from(["call_outer".to_string()]);
+        rollout.open_tool_started_at_ms = HashMap::from([("call_outer".to_string(), now_ms - 900)]);
+        rollout.open_tool_classes = HashMap::from([(
+            "call_outer".to_string(),
+            RolloutToolClass::CodeModeExec {
+                exec_started_at_ms: now_ms - 900,
+            },
+        )]);
+        assert_eq!(
+            project_herdr_working_status(&code_mode, Some(&rollout), now_ms),
+            None,
+            "future Code Mode shapes require an explicit source audit"
+        );
+
+        rollout.root_cli_version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+        let malformed = hook_record(
+            HookCandidate::ToolOpen(HashSet::from(["exec-not-a-uuid".to_string()])),
+            now_ms,
+        );
+        assert_eq!(
+            project_herdr_working_status(&malformed, Some(&rollout), now_ms),
+            None,
+            "only the exact nested Code Mode UUID shape crosses ID namespaces"
+        );
+    }
+
+    #[test]
+    fn hook_conversion_preserves_content_free_open_tool_classes() {
+        let now_ms = 100_000;
+        let mut state = production_turn_open_hook_state(now_ms);
+        state
+            .open_tools
+            .insert("exec-f842".to_string(), HookToolClass::Ordinary);
+        state
+            .tool_opened_at_ms
+            .insert("exec-f842".to_string(), now_ms - 500);
+        state.last_event = HookEventKind::PreToolUse;
+        state.updated_at_ms = now_ms;
+
+        let record = hook_record_from_state(state);
+        assert_eq!(
+            record.tool_classes,
+            HashMap::from([("exec-f842".to_string(), HookToolClass::Ordinary)])
+        );
+    }
+
+    #[test]
+    fn herdr_overlay_maps_attention_idle_and_coarse_work_without_actions() {
+        let now_ms = 100_000;
+        let collector = CodexCollector::new();
+        let record = hook_record(HookCandidate::TurnOpen, now_ms);
+        let observation = |status| HerdrObservation {
+            status,
+            observed_at_ms: now_ms,
+            status_since_ms: now_ms - 5_000,
+            consecutive_matching: 3,
+        };
+
+        let mut blocked = collector.hook_placeholder(&record);
+        blocked.pid = record.pid;
+        apply_herdr_observation(&mut blocked, observation(HerdrStatus::Blocked), None, None);
+        assert_eq!(blocked.status, SessionStatus::Waiting);
+        assert_eq!(
+            blocked.status_evidence.reason,
+            StatusReason::HerdrScreenBlocked
+        );
+        assert!(blocked.awaiting_input);
+        assert!(blocked.action_process_incarnation.is_none());
+
+        let mut idle = collector.hook_placeholder(&record);
+        idle.pid = record.pid;
+        apply_herdr_observation(&mut idle, observation(HerdrStatus::Idle), None, None);
+        assert_eq!(idle.status, SessionStatus::Idle);
+        assert_eq!(idle.status_evidence.status_since_ms, now_ms - 5_000);
+        assert_eq!(idle.status_evidence.consecutive_matching, 3);
+        assert!(!idle.awaiting_input);
+        assert!(idle.action_process_incarnation.is_none());
+
+        let mut unrefined = collector.hook_placeholder(&record);
+        unrefined.pid = record.pid;
+        apply_herdr_observation(
+            &mut unrefined,
+            observation(HerdrStatus::Working),
+            None,
+            None,
+        );
+        assert_eq!(unrefined.status, SessionStatus::Working);
+        assert_eq!(
+            unrefined.status_evidence.authority,
+            StatusAuthority::Heuristic
+        );
+        assert_eq!(
+            unrefined.status_evidence.reason,
+            StatusReason::HerdrWorkingUnrefined
+        );
+        assert!(unrefined.action_process_incarnation.is_none());
+    }
+
+    #[test]
+    fn herdr_selects_the_current_same_process_generation_and_tracks_its_phase() {
+        let now_ms = 100_000;
+        let collector = CodexCollector::new();
+        let mut current = hook_record(
+            HookCandidate::ToolOpen(HashSet::from([
+                "exec-f842a710-1234-4abc-8def-000000000000".to_string()
+            ])),
+            now_ms,
+        );
+        current.session_id = "current-session".to_string();
+        current.generation_id = "current-generation".to_string();
+        let mut stale = hook_record(HookCandidate::TurnOpen, now_ms);
+        stale.session_id = "stale-session".to_string();
+        stale.generation_id = "stale-generation".to_string();
+        stale.started_at_ms = now_ms.saturating_sub(20_000);
+        let stale_key = hook_done_key(&stale).unwrap();
+        let current_key = hook_done_key(&current).unwrap();
+
+        let mut rollout = active_root_rollout(now_ms);
+        rollout.open_tool_ids = HashSet::from(["call_qOS".to_string()]);
+        rollout
+            .open_tool_started_at_ms
+            .insert("call_qOS".to_string(), now_ms - 1_042);
+        rollout.open_tool_classes.insert(
+            "call_qOS".to_string(),
+            RolloutToolClass::CodeModeExec {
+                exec_started_at_ms: now_ms - 1_042,
+            },
+        );
+        collector
+            .rollout_lifecycle
+            .borrow_mut()
+            .insert(current.session_id.clone(), rollout);
+        let mut session = collector.hook_placeholder(&current);
+        session.pid = 0;
+        session.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+        let mut stale_session = collector.hook_placeholder(&stale);
+        stale_session.pid = 0;
+        stale_session.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+        let working = HerdrObservation {
+            status: HerdrStatus::Working,
+            observed_at_ms: now_ms,
+            status_since_ms: now_ms - 2_000,
+            consecutive_matching: 2,
+        };
+        let observations = HashMap::from([((current.session_id.clone(), current.pid), working)]);
+
+        let executing = collector.finalize_hook_records_with_herdr(
+            vec![stale_session, session],
+            vec![stale.clone(), current.clone()],
+            &hook_shared(),
+            now_ms,
+            observations.clone(),
+        );
+        assert_eq!(executing.len(), 1);
+        assert_eq!(executing[0].session_id, "current-session");
+        assert_eq!(executing[0].pid, 42);
+        assert_eq!(executing[0].status, SessionStatus::Executing);
+        assert_eq!(
+            executing[0].status_evidence.authority,
+            StatusAuthority::Heuristic
+        );
+        assert_eq!(
+            executing[0].status_evidence.reason,
+            StatusReason::HerdrScreenWorking
+        );
+        assert_eq!(executing[0].status_evidence.status_since_ms, now_ms - 1_000);
+        assert_eq!(executing[0].status_evidence.consecutive_matching, 1);
+        assert_eq!(executing[0].pending_since_ms, now_ms - 1_000);
+        assert!(executing[0].action_process_incarnation.is_none());
+        assert!(!collector
+            .hook_process_states
+            .borrow()
+            .contains_key(&stale_key));
+        assert!(!collector
+            .hook_process_rollout_bindings
+            .borrow()
+            .contains_key(&current_key));
+
+        let mut stale_gone = stale.clone();
+        let mut thinking = hook_record(HookCandidate::TurnOpen, now_ms + 1_000);
+        thinking.session_id = "current-session".to_string();
+        thinking.generation_id = "current-generation".to_string();
+        let mut stale_next = stale;
+        stale_next.observed_at_ms = now_ms + 1_000;
+        stale_next.status_since_ms = now_ms;
+        let mut thinking_continued = thinking.clone();
+        let mut stale_continued = stale_next.clone();
+        collector.rollout_lifecycle.borrow_mut().insert(
+            thinking.session_id.clone(),
+            active_root_rollout(now_ms + 1_000),
+        );
+        let mut session = collector.hook_placeholder(&thinking);
+        session.pid = 0;
+        session.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+        let mut stale_session = collector.hook_placeholder(&stale_next);
+        stale_session.pid = 0;
+        stale_session.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+        let observations = HashMap::from([(
+            (thinking.session_id.clone(), thinking.pid),
+            HerdrObservation {
+                observed_at_ms: now_ms + 1_000,
+                ..working
+            },
+        )]);
+        let thinking = collector.finalize_hook_records_with_herdr(
+            vec![stale_session, session],
+            vec![stale_next, thinking],
+            &hook_shared(),
+            now_ms + 1_000,
+            observations,
+        );
+        assert_eq!(thinking.len(), 1);
+        assert_eq!(thinking[0].status, SessionStatus::Thinking);
+        assert_eq!(
+            thinking[0].status_evidence.reason,
+            StatusReason::HerdrScreenWorking
+        );
+        assert_eq!(thinking[0].status_evidence.status_since_ms, now_ms);
+        assert_eq!(thinking[0].status_evidence.consecutive_matching, 1);
+        assert_eq!(thinking[0].thinking_since_ms, now_ms);
+        assert!(thinking[0].action_process_incarnation.is_none());
+
+        thinking_continued.observed_at_ms = now_ms + 2_000;
+        stale_continued.observed_at_ms = now_ms + 2_000;
+        collector.rollout_lifecycle.borrow_mut().insert(
+            thinking_continued.session_id.clone(),
+            active_root_rollout(now_ms + 2_000),
+        );
+        let mut session = collector.hook_placeholder(&thinking_continued);
+        session.pid = 0;
+        session.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+        let mut stale_session = collector.hook_placeholder(&stale_continued);
+        stale_session.pid = 0;
+        stale_session.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+        let observations = HashMap::from([(
+            (
+                thinking_continued.session_id.clone(),
+                thinking_continued.pid,
+            ),
+            HerdrObservation {
+                observed_at_ms: now_ms + 2_000,
+                consecutive_matching: 4,
+                ..working
+            },
+        )]);
+        let continued = collector.finalize_hook_records_with_herdr(
+            vec![stale_session, session],
+            vec![stale_continued, thinking_continued],
+            &hook_shared(),
+            now_ms + 2_000,
+            observations,
+        );
+        assert_eq!(continued.len(), 1);
+        assert_eq!(continued[0].status, SessionStatus::Thinking);
+        assert_eq!(continued[0].status_evidence.status_since_ms, now_ms);
+        assert_eq!(continued[0].status_evidence.consecutive_matching, 2);
+
+        stale_gone.candidate = HookCandidate::Ended;
+        stale_gone.process_state = HookProcessState::Gone;
+        stale_gone.native_process_verified = false;
+        stale_gone.observed_at_ms = now_ms + 3_000;
+        stale_gone.ended_at_ms = now_ms + 2_500;
+        stale_gone.exit_observed_at_ms = now_ms + 2_500;
+        stale_gone.exit_supported_rollout_correlated = false;
+        let exited = collector.finalize_hook_records_with_herdr(
+            Vec::new(),
+            vec![stale_gone],
+            &hook_shared(),
+            now_ms + 3_000,
+            HashMap::new(),
+        );
+        assert!(exited.is_empty());
+        assert!(!collector
+            .hook_exit_observations
+            .borrow()
+            .contains_key(&stale_key));
+        assert!(!collector
+            .hook_done_tombstones
+            .borrow()
+            .contains_key(&stale_key));
+    }
+
+    #[test]
+    fn herdr_working_preserves_fault_evidence_while_reporting_coarse_work() {
+        let now_ms = 100_000;
+        for (index, reason) in [StatusReason::HookStateMalformed, StatusReason::HookEventGap]
+            .into_iter()
+            .enumerate()
+        {
+            let collector = CodexCollector::new();
+            let tool_ids = HashSet::from(["tool-1".to_string()]);
+            let mut record = hook_record(HookCandidate::Unknown(reason), now_ms);
+            record.session_id = format!("unavailable-session-{index}");
+            record.generation_id = format!("unavailable-generation-{index}");
+
+            let mut rollout = active_root_rollout(now_ms);
+            rollout.open_tool_ids = tool_ids;
+            rollout
+                .open_tool_started_at_ms
+                .insert("tool-1".to_string(), now_ms - 900);
+            collector
+                .rollout_lifecycle
+                .borrow_mut()
+                .insert(record.session_id.clone(), rollout);
+
+            let mut session = collector.hook_placeholder(&record);
+            session.pid = record.pid;
+            session.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+            let observations = HashMap::from([(
+                (record.session_id.clone(), record.pid),
+                HerdrObservation {
+                    status: HerdrStatus::Working,
+                    observed_at_ms: now_ms,
+                    status_since_ms: now_ms - 2_000,
+                    consecutive_matching: 2,
+                },
+            )]);
+
+            let sessions = collector.finalize_hook_records_with_herdr(
+                vec![session],
+                vec![record],
+                &hook_shared(),
+                now_ms,
+                observations,
+            );
+
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].status, SessionStatus::Working);
+            assert_eq!(
+                sessions[0].status_evidence.authority,
+                StatusAuthority::Heuristic
+            );
+            assert_eq!(
+                sessions[0].status_evidence.reason,
+                StatusReason::HerdrWorkingUnrefined
+            );
+            assert!(sessions[0]
+                .status_evidence
+                .observations
+                .iter()
+                .any(|observation| observation.reason == reason));
+            assert!(sessions[0].action_process_incarnation.is_none());
+        }
+    }
+
+    #[test]
+    fn herdr_working_reports_coarse_activity_without_a_current_hook_record() {
+        let now_ms = 100_000;
+        let collector = CodexCollector::new();
+        let record = hook_record(HookCandidate::TurnOpen, now_ms);
+        let mut rollout_only = collector.hook_placeholder(&record);
+        rollout_only.pid = record.pid;
+        rollout_only.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+        let observations = HashMap::from([(
+            (record.session_id.clone(), record.pid),
+            HerdrObservation {
+                status: HerdrStatus::Working,
+                observed_at_ms: now_ms,
+                status_since_ms: now_ms - 2_000,
+                consecutive_matching: 2,
+            },
+        )]);
+
+        let sessions = collector.finalize_hook_records_with_herdr(
+            vec![rollout_only],
+            Vec::new(),
+            &hook_shared(),
+            now_ms,
+            observations,
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Working);
+        assert_eq!(
+            sessions[0].status_evidence.authority,
+            StatusAuthority::Heuristic
+        );
+        assert_eq!(
+            sessions[0].status_evidence.reason,
+            StatusReason::HerdrWorkingUnrefined
+        );
+        assert!(sessions[0]
+            .status_evidence
+            .observations
+            .iter()
+            .any(|sample| {
+                sample.reason == StatusReason::HookIntegrationUnverified
+                    && sample.authority == StatusAuthority::Unavailable
+            }));
+        assert_eq!(sessions[0].current_tasks, vec!["working"]);
+        assert!(sessions[0].action_process_incarnation.is_none());
+    }
+
+    #[test]
+    fn pidless_rollout_recovers_herdr_status_without_actions_or_exit_proof() {
+        let now_ms = 100_000;
+        let collector = CodexCollector::new();
+        let tool_ids = HashSet::from(["tool-1".to_string()]);
+        let record = hook_record(HookCandidate::ToolOpen(tool_ids.clone()), now_ms);
+        let binding_key = hook_done_key(&record).unwrap();
+        let mut rollout = active_root_rollout(now_ms);
+        rollout.open_tool_ids = tool_ids;
+        rollout
+            .open_tool_started_at_ms
+            .insert("tool-1".to_string(), now_ms - 900);
+        rollout
+            .open_tool_classes
+            .insert("tool-1".to_string(), RolloutToolClass::Ordinary);
+        collector
+            .rollout_lifecycle
+            .borrow_mut()
+            .insert(record.session_id.clone(), rollout);
+        let mut pidless = collector.hook_placeholder(&record);
+        pidless.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+        let observations = HashMap::from([(
+            (record.session_id.clone(), record.pid),
+            HerdrObservation {
+                status: HerdrStatus::Working,
+                observed_at_ms: now_ms,
+                status_since_ms: now_ms - 2_000,
+                consecutive_matching: 2,
+            },
+        )]);
+
+        let sessions = collector.finalize_hook_records_with_herdr(
+            vec![pidless],
+            vec![record],
+            &hook_shared(),
+            now_ms,
+            observations,
+        );
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].pid, 42);
+        assert_eq!(sessions[0].status, SessionStatus::Executing);
+        assert!(sessions[0].action_process_incarnation.is_none());
+        assert!(!collector
+            .hook_process_rollout_bindings
+            .borrow()
+            .contains_key(&binding_key));
+    }
+
+    #[test]
+    fn current_generation_suppression_is_scoped_to_the_stale_process_claim() {
+        let now_ms = 100_000;
+        let collector = CodexCollector::new();
+        let mut current = hook_record(HookCandidate::TurnOpen, now_ms);
+        current.session_id = "current-session".to_string();
+        current.generation_id = "current-generation".to_string();
+        let mut stale = hook_record(HookCandidate::TurnOpen, now_ms);
+        stale.session_id = "reused-session-id".to_string();
+        stale.generation_id = "stale-generation".to_string();
+
+        let current_session = collector.hook_placeholder(&current);
+        let stale_pidless = collector.hook_placeholder(&stale);
+        let mut independent = collector.hook_placeholder(&stale);
+        independent.pid = 99;
+        let mut sessions = vec![stale_pidless, independent, current_session];
+        let mut records = vec![stale, current.clone()];
+        let observations = HashMap::from([(
+            (current.session_id.clone(), current.pid),
+            HerdrObservation {
+                status: HerdrStatus::Working,
+                observed_at_ms: now_ms,
+                status_since_ms: now_ms,
+                consecutive_matching: 1,
+            },
+        )]);
+        let shared = hook_shared();
+
+        reconcile_current_hook_generations(
+            &mut records,
+            &mut sessions,
+            &HashMap::new(),
+            &observations,
+            &shared.process_info,
+            &HashSet::from([current.pid]),
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].session_id, "current-session");
+        assert!(sessions
+            .iter()
+            .any(|session| session.session_id == "current-session" && session.pid == 0));
+        assert!(sessions
+            .iter()
+            .any(|session| session.session_id == "reused-session-id" && session.pid == 99));
+        assert!(!sessions
+            .iter()
+            .any(|session| session.session_id == "reused-session-id" && session.pid == 0));
+    }
+
+    #[test]
+    fn rollout_selects_only_the_current_generation_and_only_it_can_transition_to_done() {
+        let now_ms = 100_000;
+        let collector = CodexCollector::new();
+        let mut current = hook_record(HookCandidate::TurnOpen, now_ms);
+        current.session_id = "current-session".to_string();
+        current.generation_id = "current-generation".to_string();
+        current.effective_hook_engine_attested = false;
+        let mut stale = hook_record(HookCandidate::TurnOpen, now_ms);
+        stale.session_id = "stale-session".to_string();
+        stale.generation_id = "stale-generation".to_string();
+        stale.started_at_ms = now_ms - 20_000;
+        stale.effective_hook_engine_attested = false;
+        let current_key = hook_done_key(&current).unwrap();
+        let stale_key = hook_done_key(&stale).unwrap();
+
+        collector
+            .rollout_lifecycle
+            .borrow_mut()
+            .insert(current.session_id.clone(), active_root_rollout(now_ms));
+        let mut current_session = collector.hook_placeholder(&current);
+        current_session.pid = current.pid;
+        current_session.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+        current_session.mem_mb = 777;
+        current_session.children.push(ChildProcess {
+            pid: 77,
+            command: "codex-child".to_string(),
+            mem_kb: 1_024,
+            port: None,
+        });
+        let stale_session = collector.hook_placeholder(&stale);
+
+        let live = collector.finalize_hook_records_with_herdr(
+            vec![stale_session, current_session],
+            vec![stale.clone(), current.clone()],
+            &hook_shared(),
+            now_ms,
+            HashMap::new(),
+        );
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].session_id, "current-session");
+        assert_eq!(live[0].status, SessionStatus::Thinking);
+        assert_eq!(live[0].status_evidence.reason, StatusReason::HookTurnOpen);
+        assert!(live[0].action_process_incarnation.is_none());
+        assert_eq!(live[0].mem_mb, 0);
+        assert!(live[0].children.is_empty());
+        assert!(collector
+            .hook_process_rollout_bindings
+            .borrow()
+            .contains_key(&current_key));
+        assert!(!collector
+            .hook_process_rollout_bindings
+            .borrow()
+            .contains_key(&stale_key));
+
+        let mut current_gone = current;
+        current_gone.process_state = HookProcessState::Gone;
+        current_gone.native_process_verified = false;
+        current_gone.observed_at_ms = now_ms + 1_000;
+        let mut stale_gone = stale;
+        stale_gone.process_state = HookProcessState::Gone;
+        stale_gone.native_process_verified = false;
+        stale_gone.observed_at_ms = now_ms + 1_000;
+        let exited = collector.finalize_hook_records_with_herdr(
+            Vec::new(),
+            vec![stale_gone, current_gone],
+            &hook_shared(),
+            now_ms + 1_000,
+            HashMap::new(),
+        );
+        let current = exited
+            .iter()
+            .find(|session| session.session_id == "current-session")
+            .expect("the selected generation should retain its exact exit row");
+        assert_eq!(current.status, SessionStatus::Done);
+        assert_eq!(current.status_evidence.reason, StatusReason::ProcessExited);
+        assert!(exited.iter().all(|session| {
+            session.session_id != "stale-session" || session.status != SessionStatus::Done
+        }));
+        assert!(!collector
+            .hook_done_tombstones
+            .borrow()
+            .contains_key(&stale_key));
+    }
+
+    #[test]
+    fn disagreeing_rollout_and_herdr_current_sessions_remain_unknown() {
+        let now_ms = 100_000;
+        for status in [
+            HerdrStatus::Working,
+            HerdrStatus::Blocked,
+            HerdrStatus::Idle,
+        ] {
+            let collector = CodexCollector::new();
+            let mut rollout_selected = hook_record(HookCandidate::TurnOpen, now_ms);
+            rollout_selected.session_id = "rollout-session".to_string();
+            rollout_selected.generation_id = "rollout-generation".to_string();
+            let mut herdr_selected = hook_record(HookCandidate::TurnOpen, now_ms);
+            herdr_selected.session_id = "herdr-session".to_string();
+            herdr_selected.generation_id = "herdr-generation".to_string();
+            collector.rollout_lifecycle.borrow_mut().insert(
+                rollout_selected.session_id.clone(),
+                active_root_rollout(now_ms),
+            );
+            let mut session = collector.hook_placeholder(&rollout_selected);
+            session.pid = rollout_selected.pid;
+            session.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+            let observations = HashMap::from([(
+                (herdr_selected.session_id.clone(), herdr_selected.pid),
+                HerdrObservation {
+                    status,
+                    observed_at_ms: now_ms,
+                    status_since_ms: now_ms - 2_000,
+                    consecutive_matching: 2,
+                },
+            )]);
+
+            let sessions = collector.finalize_hook_records_with_herdr(
+                vec![session],
+                vec![rollout_selected, herdr_selected],
+                &hook_shared(),
+                now_ms,
+                observations,
+            );
+            assert_eq!(sessions.len(), 2);
+            assert!(sessions.iter().all(|session| {
+                session.status == SessionStatus::Unknown
+                    && session.status_evidence.reason == StatusReason::OwnershipUnconfirmed
+                    && session.action_process_incarnation.is_none()
+            }));
+        }
     }
 
     #[test]
@@ -6591,7 +11383,7 @@ mod tests {
                 StatusAuthority::Unavailable,
                 StatusReason::HookIntegrationUnverified,
             ),
-            "a child from an unaudited release invalidates child lifecycle proof"
+            "a child from a different release invalidates child lifecycle proof"
         );
     }
 
@@ -6923,6 +11715,8 @@ mod tests {
         child.open_tool_ids = HashSet::from(["child-call".to_string()]);
         child.open_tool_started_at_ms =
             HashMap::from([("child-call".to_string(), now_ms.saturating_sub(500))]);
+        child.open_tool_classes =
+            HashMap::from([("child-call".to_string(), RolloutToolClass::Ordinary)]);
         rollout.descendants.push(child);
         assert_eq!(
             project_hook_status(&record, Some(&rollout), now_ms),
@@ -6984,7 +11778,7 @@ mod tests {
             .insert(record.session_id.clone(), rollout);
         let mut session = collector.hook_placeholder(&record);
         session.pid = record.pid;
-        session.version = plugin::SUPPORTED_CODEX_VERSION.to_string();
+        session.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
         let shared = hook_shared();
         let live =
             collector.finalize_hook_records(vec![session], vec![record.clone()], &shared, now_ms);
@@ -7085,7 +11879,7 @@ mod tests {
             "hook-session",
             "generation-one",
             "test:codex:42",
-            plugin::SUPPORTED_CODEX_VERSION,
+            plugin::MIN_SUPPORTED_CODEX_VERSION,
         );
         let key = hook_done_key(&record).unwrap();
         let live =
@@ -7157,7 +11951,7 @@ mod tests {
             "hook-session",
             "generation-one",
             "test:codex:42",
-            plugin::SUPPORTED_CODEX_VERSION,
+            plugin::MIN_SUPPORTED_CODEX_VERSION,
         );
         let key = hook_done_key(&record).unwrap();
         let fallback_session = session.clone();
@@ -7198,10 +11992,19 @@ mod tests {
         let mut already_gone = hook_record(HookCandidate::TurnOpen, 100_000);
         already_gone.process_state = HookProcessState::Gone;
         already_gone.native_process_verified = false;
-        let fresh =
-            fresh_collector.finalize_hook_records(Vec::new(), vec![already_gone], &shared, 100_000);
-        assert_eq!(fresh[0].status, SessionStatus::Unknown);
+        let mut pidless_alias = fresh_collector.hook_placeholder(&already_gone);
+        pidless_alias.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+        let fresh = fresh_collector.finalize_hook_records(
+            vec![pidless_alias],
+            vec![already_gone.clone()],
+            &shared,
+            100_000,
+        );
+        assert!(fresh.is_empty());
         assert!(fresh_collector.hook_done_tombstones.borrow().is_empty());
+        assert!(fresh_collector
+            .finalize_hook_records(Vec::new(), vec![already_gone], &shared, 100_001)
+            .is_empty());
 
         for reason in [
             StatusReason::HookStateMalformed,
@@ -7217,7 +12020,7 @@ mod tests {
                 "hook-session",
                 "generation-one",
                 "test:codex:42",
-                plugin::SUPPORTED_CODEX_VERSION,
+                plugin::MIN_SUPPORTED_CODEX_VERSION,
             );
             collector.finalize_hook_records(vec![session], vec![record.clone()], &shared, 100_000);
             let mut faulty_gone = record;
@@ -7226,10 +12029,45 @@ mod tests {
             faulty_gone.candidate = HookCandidate::Unknown(reason);
             let faulty =
                 collector.finalize_hook_records(Vec::new(), vec![faulty_gone], &shared, 101_000);
-            assert_eq!(faulty[0].status, SessionStatus::Unknown);
-            assert_eq!(faulty[0].status_evidence.reason, reason);
+            assert!(faulty.is_empty(), "gone {reason:?} rows must be omitted");
             assert!(collector.hook_done_tombstones.borrow().is_empty());
         }
+    }
+
+    #[test]
+    fn suppressed_gone_hook_record_preserves_an_independently_live_rollout() {
+        let mut gone = hook_record(HookCandidate::TurnOpen, 100_000);
+        gone.process_state = HookProcessState::Gone;
+        gone.native_process_verified = false;
+
+        let collector = CodexCollector::new();
+        let mut live_rollout = collector.hook_placeholder(&gone);
+        live_rollout.pid = 99;
+        live_rollout.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
+        let process_info = HashMap::from([
+            (42, proc_info(42, 1, "/usr/local/bin/codex")),
+            (99, proc_info(99, 1, "/usr/local/bin/codex")),
+        ]);
+        let shared = super::super::SharedProcessData {
+            children_map: process::get_children_map(&process_info),
+            process_info,
+            ports: HashMap::new(),
+            slow_tick: false,
+            mcp_server_pids: HashSet::new(),
+            mcp_owned_rollouts: HashSet::new(),
+            mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::new(),
+        };
+
+        let sessions =
+            collector.finalize_hook_records(vec![live_rollout], vec![gone], &shared, 100_000);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].pid, 99);
+        assert_eq!(sessions[0].status, SessionStatus::Unknown);
+        assert_eq!(
+            sessions[0].status_evidence.reason,
+            StatusReason::HookIntegrationUnverified
+        );
     }
 
     #[test]
@@ -7242,7 +12080,7 @@ mod tests {
             "hook-session",
             "generation-one",
             "test:codex:42",
-            plugin::SUPPORTED_CODEX_VERSION,
+            plugin::MIN_SUPPORTED_CODEX_VERSION,
         );
         record.candidate =
             HookCandidate::Unknown(StatusReason::HookInteractionResolutionUnavailable);
@@ -7277,7 +12115,7 @@ mod tests {
             "hook-session",
             "generation-one",
             "test:codex:42",
-            "0.146.1",
+            "0.144.0",
         );
         let live =
             collector.finalize_hook_records(vec![session], vec![record.clone()], &shared, 100_000);
@@ -7287,11 +12125,7 @@ mod tests {
         gone.process_state = HookProcessState::Gone;
         gone.native_process_verified = false;
         let gone = collector.finalize_hook_records(Vec::new(), vec![gone], &shared, 101_000);
-        assert_eq!(gone[0].status, SessionStatus::Unknown);
-        assert_eq!(
-            gone[0].status_evidence.reason,
-            StatusReason::HookIntegrationUnverified
-        );
+        assert!(gone.is_empty());
         assert!(collector.hook_done_tombstones.borrow().is_empty());
         assert!(collector
             .finalize_hook_records(Vec::new(), Vec::new(), &shared, 101_001)
@@ -7340,7 +12174,7 @@ mod tests {
             "hook-session",
             "generation-old",
             "test:codex:42",
-            plugin::SUPPORTED_CODEX_VERSION,
+            plugin::MIN_SUPPORTED_CODEX_VERSION,
         );
         let old_key = hook_done_key(&old_record).unwrap();
         collector.finalize_hook_records(
@@ -7356,7 +12190,7 @@ mod tests {
             "hook-session",
             "generation-new",
             "test:codex:42",
-            plugin::SUPPORTED_CODEX_VERSION,
+            plugin::MIN_SUPPORTED_CODEX_VERSION,
         );
         let new_key = hook_done_key(&new_record).unwrap();
         let new_live = collector.finalize_hook_records(
@@ -7384,7 +12218,7 @@ mod tests {
             "hook-session",
             "generation-new",
             "test:codex:42",
-            plugin::SUPPORTED_CODEX_VERSION,
+            plugin::MIN_SUPPORTED_CODEX_VERSION,
         );
         let sessions = collector.finalize_hook_records(
             vec![refreshed_new_session],
@@ -7407,7 +12241,7 @@ mod tests {
             "old-session",
             "old-generation",
             "old-incarnation",
-            plugin::SUPPORTED_CODEX_VERSION,
+            plugin::MIN_SUPPORTED_CODEX_VERSION,
         );
         let old_key = hook_done_key(&old_record).unwrap();
         collector.finalize_hook_records(
@@ -7423,7 +12257,7 @@ mod tests {
             "new-session",
             "new-generation",
             "new-incarnation",
-            plugin::SUPPORTED_CODEX_VERSION,
+            plugin::MIN_SUPPORTED_CODEX_VERSION,
         );
         let new_key = hook_done_key(&new_record).unwrap();
         collector.finalize_hook_records(
@@ -7450,7 +12284,7 @@ mod tests {
             "new-session",
             "new-generation",
             "new-incarnation",
-            plugin::SUPPORTED_CODEX_VERSION,
+            plugin::MIN_SUPPORTED_CODEX_VERSION,
         );
         let sessions = collector.finalize_hook_records(
             vec![refreshed_new_session],
@@ -7587,7 +12421,7 @@ mod tests {
         ));
         let mut session = collector.hook_placeholder(&record);
         session.pid = 42;
-        session.version = plugin::SUPPORTED_CODEX_VERSION.to_string();
+        session.version = plugin::MIN_SUPPORTED_CODEX_VERSION.to_string();
         let sessions = collector.finalize_hook_records(
             vec![session],
             vec![record.clone()],
@@ -7628,7 +12462,7 @@ mod tests {
         let now_ms = 100_000;
         let collector = CodexCollector::new();
         let mut rollout = active_root_rollout(now_ms);
-        rollout.root_cli_version = "0.146.1".to_string();
+        rollout.root_cli_version = "0.144.0".to_string();
         collector
             .rollout_lifecycle
             .borrow_mut()
@@ -7637,7 +12471,7 @@ mod tests {
         let binding_key = hook_done_key(&record).unwrap();
         let mut session = collector.hook_placeholder(&record);
         session.pid = 42;
-        session.version = "0.146.1".to_string();
+        session.version = "0.144.0".to_string();
 
         let sessions =
             collector.finalize_hook_records(vec![session], vec![record], &hook_shared(), now_ms);

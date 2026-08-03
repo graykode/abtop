@@ -18,7 +18,7 @@
 //!
 //! Enum wire formats are part of the snapshot contract: variants such as
 //! [`model::SessionStatus`] serialize as their CamelCase names (`"Thinking"`,
-//! `"Executing"`, `"Idle"`, …) and chat roles serialize as `"user"` /
+//! `"Executing"`, `"Working"`, `"Idle"`, …) and chat roles serialize as `"user"` /
 //! `"assistant"`.
 //! These strings are stable and won't be renamed without a major version bump.
 //!
@@ -37,11 +37,12 @@
 //! use abtop::{config, theme::Theme};
 //!
 //! let cfg = config::load_config();
-//! let mut app = App::new_with_config_and_claude_dirs(
+//! let mut app = App::new_with_config_and_claude_dirs_and_codexbar(
 //!     Theme::default(),
 //!     &cfg.hidden_agents,
 //!     cfg.panels,
 //!     &cfg.claude_config_dirs,
+//!     cfg.codexbar_quota_fallback,
 //! );
 //! loop {
 //!     app.tick_no_summaries();                // refresh without spawning `claude --print`
@@ -58,6 +59,7 @@ mod codex_hooks;
 pub mod collector;
 pub mod config;
 pub mod demo;
+mod herdr;
 pub mod host_info;
 pub mod jump;
 pub mod locale;
@@ -70,7 +72,7 @@ pub mod ui;
 use app::{App, JumpOutcome};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    MouseButton, MouseEvent, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -81,17 +83,23 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, stdout};
 use std::time::Duration;
 
+// The collector enforces a 15-second process timeout. One-shot modes wait one
+// additional second so they observe the sanitized terminal result instead of
+// racing the worker and serializing a stale `checking` state.
+const CODEXBAR_ONESHOT_WAIT: Duration = Duration::from_secs(16);
+
 /// Construct a headless `App`. Demo mode deliberately ignores user-specific
 /// visibility and discovery settings so its snapshots remain reproducible.
 fn build_app(theme: theme::Theme, cfg: &config::AppConfig, demo_mode: bool) -> App {
     if demo_mode {
         App::new_with_config_and_claude_dirs(theme, &[], config::PanelVisibility::default(), &[])
     } else {
-        App::new_with_config_and_claude_dirs(
+        App::new_with_config_and_claude_dirs_and_codexbar(
             theme,
             &cfg.hidden_agents,
             cfg.panels,
             &cfg.claude_config_dirs,
+            cfg.codexbar_quota_fallback,
         )
     }
 }
@@ -256,6 +264,7 @@ pub fn run() -> io::Result<()> {
             demo::populate_demo(&mut app);
         } else {
             app.tick_no_summaries();
+            app.wait_for_initial_codexbar_quota(CODEXBAR_ONESHOT_WAIT);
         }
         match serde_json::to_string_pretty(&app.to_snapshot(2000)) {
             Ok(json) => {
@@ -289,6 +298,7 @@ pub fn run() -> io::Result<()> {
             // change. Recollect once without scheduling another summary job so
             // the printed status reflects the end of the wait, not its start.
             app.tick_no_summaries();
+            app.wait_for_initial_codexbar_quota(CODEXBAR_ONESHOT_WAIT);
         }
         print_snapshot(&app);
         return Ok(());
@@ -302,15 +312,7 @@ pub fn run() -> io::Result<()> {
     }
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let app_result = run_app(
-        &mut terminal,
-        demo_mode,
-        initial_theme,
-        exit_on_jump,
-        &cfg.hidden_agents,
-        cfg.panels,
-        &cfg.claude_config_dirs,
-    );
+    let app_result = run_app(&mut terminal, demo_mode, initial_theme, exit_on_jump, &cfg);
 
     // Always attempt both cleanup steps regardless of app result
     let r1 = if mouse_capture {
@@ -406,12 +408,18 @@ fn print_codex_launcher_help() {
     println!("to remove the retired block and install the isolated hook plugin.");
 }
 
-const CODEX_COVERAGE_NOTICE: &str = "Codex 0.146.0 cannot attest effective managed/cloud/profile/live hook coverage; installation readiness is diagnostic only.";
-const CODEX_LIVE_STATUS_NOTICE: &str = "Live Codex Think/Exec/Wait/Idle remain Unknown and non-actionable; only an exact supported process/session Live→Gone transition can report non-actionable heuristic Done for 30 seconds.";
+const CODEX_COVERAGE_NOTICE: &str = "Supported Codex releases cannot attest effective managed/cloud/profile/live hook coverage; installation readiness is diagnostic only.";
+const CODEX_LIVE_STATUS_NOTICE: &str = "Exact supported Codex hook/rollout shapes may report non-actionable heuristic Think, Exec, or Idle; tool and interaction ambiguity remains Unknown. Exactly correlated Herdr terminals may additionally report non-actionable heuristic Wait, Idle, or generic Work when activity cannot be refined. Exact supported process/session Live→Gone transitions report non-actionable heuristic Done for 30 seconds.";
 
 fn print_codex_coverage_notice() {
     println!("{CODEX_COVERAGE_NOTICE}");
     println!("{CODEX_LIVE_STATUS_NOTICE}");
+}
+
+fn codex_trust_review_required_notice(hook_count: usize) -> String {
+    format!(
+        "Codex lifecycle monitoring is not ready until all {hook_count} abtop hooks are reviewed and approved and a fresh Codex session is started."
+    )
 }
 
 fn print_codex_setup_report(report: &codex_hooks::plugin::SetupReport) {
@@ -439,7 +447,11 @@ fn print_codex_setup_report(report: &codex_hooks::plugin::SetupReport) {
     println!("Native `codex` was not wrapped, aliased, or replaced.");
     print_codex_coverage_notice();
     if report.review_required {
-        println!("Restart Codex and review only the 11 abtop hooks in its trust prompt.");
+        println!("{}", codex_trust_review_required_notice(report.hook_count));
+        println!(
+            "Restart Codex and review only the {} abtop hooks in its trust prompt.",
+            report.hook_count
+        );
         println!("Do not approve unrelated hooks from the same prompt.");
     } else {
         println!("Restart existing Codex sessions so they load this plugin version.");
@@ -536,9 +548,7 @@ fn run_app(
     demo_mode: bool,
     initial_theme: Option<theme::Theme>,
     exit_on_jump: bool,
-    hidden_agents: &[String],
-    panels: config::PanelVisibility,
-    claude_config_dirs: &[std::path::PathBuf],
+    config: &config::AppConfig,
 ) -> io::Result<()> {
     let mut app = if demo_mode {
         App::new_with_config_and_claude_dirs(
@@ -548,11 +558,12 @@ fn run_app(
             &[],
         )
     } else {
-        App::new_with_config_and_claude_dirs(
+        App::new_with_config_and_claude_dirs_and_codexbar(
             initial_theme.unwrap_or_default(),
-            hidden_agents,
-            panels,
-            claude_config_dirs,
+            &config.hidden_agents,
+            config.panels,
+            &config.claude_config_dirs,
+            config.codexbar_quota_fallback,
         )
     };
     if demo_mode {
@@ -643,7 +654,13 @@ fn handle_key_press(
             KeyCode::Backspace => app.filter_pop(),
             KeyCode::Down => app.select_next(),
             KeyCode::Up => app.select_prev(),
-            KeyCode::Char(c) => app.filter_push(c),
+            KeyCode::Char(c)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                app.filter_push(c);
+            }
             _ => {}
         }
     } else {
@@ -765,6 +782,7 @@ fn print_snapshot(app: &App) {
         }
         println!();
     }
+    print_snapshot_quota(app);
     for session in &app.sessions {
         let status = snapshot_status_label(&session.status);
         let sid_short: String = session.session_id.chars().take(7).collect();
@@ -816,10 +834,149 @@ fn print_snapshot(app: &App) {
     }
 }
 
+fn print_snapshot_quota(app: &App) {
+    let unavailable_providers = app
+        .codexbar_provider_snapshots()
+        .iter()
+        .filter(|provider| provider.error.is_some())
+        .map(|provider| provider.provider.as_str());
+    let rows = snapshot_quota_rows(&app.rate_limits, unavailable_providers);
+    if rows.is_empty() {
+        return;
+    }
+    println!("quota:");
+    for row in rows {
+        println!("{row}");
+    }
+    println!();
+}
+
+fn snapshot_quota_rows<'a>(
+    rate_limits: &[model::RateLimitInfo],
+    unavailable_providers: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut providers = std::collections::BTreeMap::<String, (Vec<String>, bool)>::new();
+
+    for info in rate_limits {
+        let Some(provider) = collector::codexbar::canonical_provider_id(&info.source) else {
+            continue;
+        };
+        let row = providers.entry(provider).or_default();
+        if info.windows.is_empty() {
+            if let Some(window) = format_snapshot_quota_window(
+                info.five_hour_pct,
+                info.five_hour_resets_at,
+                info.five_hour_window_minutes,
+            ) {
+                row.0.push(window);
+            }
+            if let Some(window) = format_snapshot_quota_window(
+                info.seven_day_pct,
+                info.seven_day_resets_at,
+                info.seven_day_window_minutes,
+            ) {
+                row.0.push(window);
+            }
+        } else {
+            row.0
+                .extend(info.windows.iter().map(format_snapshot_named_quota_window));
+        }
+    }
+
+    for provider in unavailable_providers {
+        let Some(provider) = collector::codexbar::canonical_provider_id(provider) else {
+            continue;
+        };
+        providers.entry(provider).or_default().1 = true;
+    }
+
+    let mut providers = providers.into_iter().collect::<Vec<_>>();
+    providers.sort_by(|(left, _), (right, _)| {
+        snapshot_provider_rank(left)
+            .cmp(&snapshot_provider_rank(right))
+            .then_with(|| left.cmp(right))
+    });
+    providers
+        .into_iter()
+        .filter_map(|(provider, (windows, unavailable))| {
+            if windows.is_empty() {
+                unavailable.then(|| format!("  {provider}: unavailable"))
+            } else {
+                Some(format!("  {provider}: {}", windows.join(" | ")))
+            }
+        })
+        .collect()
+}
+
+fn snapshot_provider_rank(provider: &str) -> u8 {
+    match provider {
+        "claude" => 0,
+        "codex" => 1,
+        "grok" => 2,
+        "kimi" => 3,
+        _ => 4,
+    }
+}
+
+fn format_snapshot_named_quota_window(window: &model::RateLimitWindow) -> String {
+    let label = sanitize_output(&window.label);
+    let label = label.trim();
+    let label = if label.is_empty() { "window" } else { label };
+    format_snapshot_quota_value(label, window.used_pct, window.resets_at)
+}
+
+fn format_snapshot_quota_window(
+    used_pct: Option<f64>,
+    resets_at: Option<u64>,
+    window_minutes: Option<u64>,
+) -> Option<String> {
+    let used_pct = used_pct?;
+    let label = match window_minutes {
+        Some(minutes) if minutes % 1_440 == 0 => format!("{}d", minutes / 1_440),
+        Some(minutes) if minutes % 60 == 0 => format!("{}h", minutes / 60),
+        Some(minutes) => format!("{minutes}m"),
+        None => "window".to_string(),
+    };
+    Some(format_snapshot_quota_value(&label, used_pct, resets_at))
+}
+
+fn format_snapshot_quota_value(label: &str, used_pct: f64, resets_at: Option<u64>) -> String {
+    let usage = if used_pct.is_finite() {
+        format!("{used_pct:.0}% used")
+    } else {
+        "usage unavailable".to_string()
+    };
+    let reset = resets_at.map(format_snapshot_reset).unwrap_or_default();
+    if reset.is_empty() {
+        format!("{label} {usage}")
+    } else {
+        format!("{label} {usage}, {reset}")
+    }
+}
+
+fn format_snapshot_reset(resets_at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let remaining = resets_at.saturating_sub(now);
+    if remaining == 0 {
+        return "reset due".to_string();
+    }
+    if remaining < 3_600 {
+        format!("resets in {}m", remaining.div_ceil(60))
+    } else if remaining < 86_400 {
+        format!("resets in {}h", remaining.div_ceil(3_600))
+    } else {
+        format!("resets in {}d", remaining.div_ceil(86_400))
+    }
+}
+
 fn snapshot_status_name(status: &model::SessionStatus) -> &'static str {
     match status {
         model::SessionStatus::Thinking => "Thinking",
         model::SessionStatus::Executing => "Executing",
+        model::SessionStatus::Working => "Working",
         model::SessionStatus::Waiting => "Waiting",
         model::SessionStatus::Idle => "Idle",
         model::SessionStatus::Unknown => "Unknown",
@@ -833,6 +990,7 @@ fn snapshot_status_label(status: &model::SessionStatus) -> &'static str {
     match status {
         model::SessionStatus::Thinking => "◉ Think",
         model::SessionStatus::Executing => "● Exec",
+        model::SessionStatus::Working => "◐ Work",
         model::SessionStatus::Waiting => "◌ Wait",
         model::SessionStatus::Idle => "○ Idle",
         model::SessionStatus::Unknown => "? Unknown",
@@ -947,7 +1105,7 @@ fn fmt_tok(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
+    use crossterm::event::KeyEvent;
     use ratatui::backend::TestBackend;
 
     #[test]
@@ -1052,9 +1210,20 @@ mod tests {
     fn codex_admin_notice_separates_installation_from_live_status_proof() {
         assert!(CODEX_COVERAGE_NOTICE.contains("cannot attest effective"));
         assert!(CODEX_COVERAGE_NOTICE.contains("installation readiness is diagnostic only"));
-        assert!(CODEX_LIVE_STATUS_NOTICE.contains("Think/Exec/Wait/Idle remain Unknown"));
+        assert!(CODEX_LIVE_STATUS_NOTICE.contains("non-actionable heuristic"));
+        assert!(CODEX_LIVE_STATUS_NOTICE.contains("Herdr"));
+        assert!(CODEX_LIVE_STATUS_NOTICE.contains("generic Work"));
         assert!(CODEX_LIVE_STATUS_NOTICE.contains("Live→Gone"));
         assert!(CODEX_LIVE_STATUS_NOTICE.contains("Done for 30 seconds"));
+    }
+
+    #[test]
+    fn codex_setup_trust_notice_requires_approval_and_a_fresh_session() {
+        let notice = codex_trust_review_required_notice(11);
+
+        assert!(notice.contains("lifecycle monitoring is not ready"));
+        assert!(notice.contains("all 11 abtop hooks are reviewed and approved"));
+        assert!(notice.contains("a fresh Codex session is started"));
     }
 
     #[test]
@@ -1079,11 +1248,115 @@ mod tests {
 
     #[test]
     fn once_status_labels_distinguish_idle_from_actionable_waiting() {
+        assert_eq!(
+            snapshot_status_name(&model::SessionStatus::Working),
+            "Working"
+        );
+        assert_eq!(
+            snapshot_status_label(&model::SessionStatus::Working),
+            "◐ Work"
+        );
         assert_eq!(snapshot_status_label(&model::SessionStatus::Idle), "○ Idle");
         assert_eq!(
             snapshot_status_label(&model::SessionStatus::Waiting),
             "◌ Wait"
         );
+    }
+
+    #[test]
+    fn once_quota_formatter_uses_actual_window_lengths() {
+        assert_eq!(
+            format_snapshot_quota_window(Some(25.0), None, Some(300)).as_deref(),
+            Some("5h 25% used")
+        );
+        assert_eq!(
+            format_snapshot_quota_window(Some(40.0), None, Some(10_080)).as_deref(),
+            Some("7d 40% used")
+        );
+        assert_eq!(
+            format_snapshot_quota_window(Some(50.0), None, Some(43_200)).as_deref(),
+            Some("30d 50% used")
+        );
+    }
+
+    #[test]
+    fn once_quota_rows_render_every_window_in_stable_provider_order() {
+        let window = |id: &str, label: &str, used_pct: f64| model::RateLimitWindow {
+            id: id.to_string(),
+            label: label.to_string(),
+            used_pct,
+            resets_at: None,
+            window_minutes: None,
+            provenance: model::RateLimitProvenance::CodexBar,
+        };
+        let limits = vec![
+            model::RateLimitInfo {
+                source: "zeta".to_string(),
+                windows: vec![window("primary", "Primary", 9.0)],
+                ..Default::default()
+            },
+            model::RateLimitInfo {
+                source: "grok".to_string(),
+                windows: vec![window("primary", "Primary", 18.0)],
+                ..Default::default()
+            },
+            model::RateLimitInfo {
+                source: "claude".to_string(),
+                windows: vec![
+                    window("primary", "5h", 28.0),
+                    window("tertiary", "30d", 11.0),
+                    window("fable", "Fable only", 0.0),
+                ],
+                ..Default::default()
+            },
+            model::RateLimitInfo {
+                source: "codex".to_string(),
+                windows: vec![window("spark", "Codex Spark Weekly", 0.0)],
+                ..Default::default()
+            },
+            model::RateLimitInfo {
+                source: "alpha".to_string(),
+                windows: vec![window("primary", "Primary", 3.0)],
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            snapshot_quota_rows(&limits, ["KIMI"]),
+            vec![
+                "  claude: 5h 28% used | 30d 11% used | Fable only 0% used",
+                "  codex: Codex Spark Weekly 0% used",
+                "  grok: Primary 18% used",
+                "  kimi: unavailable",
+                "  alpha: Primary 3% used",
+                "  zeta: Primary 9% used",
+            ]
+        );
+    }
+
+    #[test]
+    fn once_quota_rows_fall_back_to_legacy_windows_without_duplicates() {
+        let limits = vec![model::RateLimitInfo {
+            source: "claude".to_string(),
+            five_hour_pct: Some(25.0),
+            five_hour_window_minutes: Some(300),
+            seven_day_pct: Some(40.0),
+            seven_day_window_minutes: Some(10_080),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            snapshot_quota_rows(&limits, std::iter::empty()),
+            vec!["  claude: 5h 25% used | 7d 40% used"]
+        );
+    }
+
+    #[test]
+    fn once_quota_rows_never_render_provider_error_details() {
+        let rows = snapshot_quota_rows(&[], ["kimi"]);
+
+        assert_eq!(rows, vec!["  kimi: unavailable"]);
+        assert!(!rows.join("\n").contains("provider_error"));
     }
 
     #[test]
@@ -1111,5 +1384,36 @@ mod tests {
         assert!(text.contains("cmux: socket broken; restart cmux"));
         assert!(!text.contains("Broken pipe"));
         assert!(!text.contains("select-workspace"));
+    }
+
+    #[test]
+    fn control_modified_character_cannot_corrupt_an_active_filter() {
+        let mut app = App::new_with_config(
+            theme::Theme::default(),
+            &[],
+            config::PanelVisibility::default(),
+        );
+        app.filter_active = true;
+        app.filter_text = "019fc2c5".to_string();
+
+        handle_key_press(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            false,
+            false,
+            |_| JumpOutcome::NoOp,
+        );
+        assert_eq!(app.filter_text, "019fc2c5");
+        assert!(app.filter_active);
+
+        handle_key_press(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            false,
+            false,
+            |_| JumpOutcome::NoOp,
+        );
+        assert_eq!(app.filter_text, "019fc2c5");
+        assert!(!app.filter_active);
     }
 }

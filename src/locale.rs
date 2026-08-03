@@ -7,6 +7,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     // Status icons
     m.insert("sess.think", "◉ Think");
     m.insert("sess.exec", "● Exec");
+    m.insert("sess.work", "◐ Work");
     m.insert("sess.wait", "◌ Wait");
     m.insert("sess.idle", "○ Idle");
     m.insert("sess.unknown", "? Unknown");
@@ -192,8 +193,31 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("quota.5h", "5h");
     m.insert("quota.7d", "7d");
     m.insert("quota.no_data", "no data");
+    m.insert("quota.unavailable", "unavailable");
+    m.insert("quota.more_providers", "providers");
+    m.insert("quota.more_windows", "windows");
     m.insert("quota.abtop_setup", "abtop --setup");
     m.insert("quota.run_codex", "run codex once");
+    m.insert("quota.codexbar_checking", "CodexBar checking");
+    m.insert("quota.codexbar_unavailable", "CodexBar unavailable");
+    m.insert("quota.codexbar_install", "install CodexBar CLI");
+    m.insert("quota.codexbar_timeout", "CodexBar timed out");
+    m.insert(
+        "quota.codexbar_output_too_large",
+        "CodexBar output too large",
+    );
+    m.insert("quota.codexbar_process_failed", "check CodexBar providers");
+    m.insert("quota.codexbar_update", "update CodexBar");
+    m.insert("quota.codexbar_cancelled", "CodexBar check cancelled");
+    m.insert("quota.codexbar_retry", "retry CodexBar");
+    m.insert("quota.codexbar_install_compact", "install");
+    m.insert("quota.codexbar_timeout_compact", "timeout");
+    m.insert("quota.codexbar_output_compact", "too big");
+    m.insert("quota.codexbar_login_compact", "providers");
+    m.insert("quota.codexbar_invalid_compact", "invalid");
+    m.insert("quota.codexbar_update_compact", "update");
+    m.insert("quota.codexbar_cancel_compact", "cancel");
+    m.insert("quota.codexbar_retry_compact", "retry");
     m.insert("quota.total", "total");
     m.insert("quota.in", "in");
 
@@ -232,6 +256,11 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("config.ports_panel", "Ports panel (5)");
     m.insert("config.sessions_panel", "Sessions panel (6)");
     m.insert("config.mcp_panel", "MCP servers (7)");
+    m.insert("config.codexbar_quota", "CodexBar quotas");
+    m.insert("config.codexbar_checking", "checking");
+    m.insert("config.codexbar_active", "active");
+    m.insert("config.codexbar_partial", "partial");
+    m.insert("config.codexbar_unavailable", "unavailable");
 
     // Terminal size too small
     m.insert("term.too_small", "Terminal size too small:");
@@ -273,6 +302,7 @@ mod tests {
         let keys = [
             "sess.think",
             "sess.exec",
+            "sess.work",
             "sess.wait",
             "sess.idle",
             "sess.unknown",
@@ -286,11 +316,24 @@ mod tests {
             .map(|key| *LOCALE_EN.get(key).expect("every status has a label"))
             .collect::<HashSet<_>>();
         assert_eq!(labels.len(), keys.len());
-        assert!(!LOCALE_EN.contains_key("sess.work"));
 
         assert_eq!(LOCALE_EN["sess.exec"], "● Exec");
+        assert_eq!(LOCALE_EN["sess.work"], "◐ Work");
         assert_eq!(LOCALE_EN["sess.wait"], "◌ Wait");
         assert_eq!(LOCALE_EN["sess.idle"], "○ Idle");
         assert_eq!(LOCALE_EN["sess.unknown"], "? Unknown");
+    }
+
+    #[test]
+    fn codexbar_quota_copy_is_provider_wide() {
+        assert_eq!(LOCALE_EN["config.codexbar_quota"], "CodexBar quotas");
+        assert_eq!(LOCALE_EN["config.codexbar_partial"], "partial");
+        assert_eq!(LOCALE_EN["quota.unavailable"], "unavailable");
+        assert_eq!(LOCALE_EN["quota.more_providers"], "providers");
+        assert_eq!(LOCALE_EN["quota.more_windows"], "windows");
+        assert_eq!(
+            LOCALE_EN["quota.codexbar_process_failed"],
+            "check CodexBar providers"
+        );
     }
 }

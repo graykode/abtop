@@ -24,7 +24,8 @@ pub const PLUGIN_NAME: &str = "abtop";
 pub const MARKETPLACE_NAME: &str = "abtop-local";
 pub const PLUGIN_ID: &str = "abtop@abtop-local";
 pub const HOOK_SCHEMA_REVISION: &str = "1";
-pub(crate) const SUPPORTED_CODEX_VERSION: &str = "0.146.0";
+pub(crate) const MIN_SUPPORTED_CODEX_VERSION: &str = "0.145.0";
+const MIN_SUPPORTED_CODEX_VERSION_COMPONENTS: (u64, u64, u64) = (0, 145, 0);
 pub const INSTALL_ATTESTATION_FILE: &str = "installation.json";
 pub(crate) const HOOK_FAULT_TOKEN_ENV: &str = "ABTOP_CODEX_HOOK_FAULT_TOKEN";
 pub(crate) const HOOK_STATE_DIR_NAME: &str = "states";
@@ -744,13 +745,7 @@ fn status_with_parts(
         details.push("the base Codex config disables a required hook/plugin feature".to_string());
     }
     let cli = match config.as_ref() {
-        Some(config) => inspect_config_state_from_config(&paths, bundle.as_ref(), config)
-            .unwrap_or_else(|error| {
-                details.push(format!(
-                    "Codex plugin installation inspection failed: {error}"
-                ));
-                CliState::default()
-            }),
+        Some(config) => inspect_status_config_state(&paths, bundle.as_ref(), config, &mut details),
         None => CliState::default(),
     };
     if let Some(error) = compatibility_error {
@@ -950,8 +945,8 @@ pub fn read_current_installation_attestation() -> io::Result<Option<Installation
 /// Validate the static, base-config portion of runtime hook identity without
 /// invoking Codex or mutating its configuration.
 ///
-/// In Codex 0.146.0, individual hook state is merged only from the base/selected
-/// User layer and SessionFlags. This function validates the unprofiled base
+/// In the supported Codex hook contract, individual hook state is merged only
+/// from the base/selected User layer and SessionFlags. This function validates the unprofiled base
 /// layer only; process/runtime correlation must separately reject profiles,
 /// relevant session flags, config locks, and any lifecycle without fresh hook
 /// evidence. It is not a proof of the complete effective config stack.
@@ -1055,10 +1050,10 @@ fn render_bundle(abtop_binary: &Path, plugin_data_root: &Path) -> io::Result<Ren
         .collect::<String>();
     let plugin_version = format!("{}+codex.{suffix}", env!("CARGO_PKG_VERSION"));
     let command = format!(
-        "exec \"$PLUGIN_ROOT/scripts/abtop-codex-hook.sh\" --schema-revision {HOOK_SCHEMA_REVISION} --helper-digest {helper_digest}"
+        "\"$PLUGIN_ROOT/scripts/abtop-codex-hook.sh\" --schema-revision {HOOK_SCHEMA_REVISION} --helper-digest {helper_digest} >/dev/null 2>&1 || :; exit 0"
     );
     let command_windows = format!(
-        "cmd.exe /D /C call \"%PLUGIN_ROOT%\\scripts\\abtop-codex-hook.cmd\" --schema-revision {HOOK_SCHEMA_REVISION} --helper-digest {helper_digest}"
+        "cmd.exe /D /C call \"%PLUGIN_ROOT%\\scripts\\abtop-codex-hook.cmd\" --schema-revision {HOOK_SCHEMA_REVISION} --helper-digest {helper_digest} >nul 2>nul || exit /b 0"
     );
     let hook_commands = HOOK_EVENTS
         .iter()
@@ -1469,6 +1464,19 @@ fn inspect_config_state_from_config(
     bundle: Option<&RenderedBundle>,
     config: &toml::Value,
 ) -> io::Result<CliState> {
+    let mut state = inspect_registration_state_from_config(paths, config);
+
+    if let Some(bundle) = bundle {
+        let cache_valid = cached_bundle_matches_disk(paths, bundle)?;
+        if cache_version_path(paths, &bundle.plugin_version).exists() {
+            state.installed_version = Some(bundle.plugin_version.clone());
+        }
+        state.plugin_installed = state.plugin_configured && cache_valid;
+    }
+    Ok(state)
+}
+
+fn inspect_registration_state_from_config(paths: &PluginPaths, config: &toml::Value) -> CliState {
     let mut state = CliState::default();
 
     if let Some(registration) = config
@@ -1518,14 +1526,40 @@ fn inspect_config_state_from_config(
         }
     }
 
-    if let Some(bundle) = bundle {
-        let cache_valid = cached_bundle_matches_disk(paths, bundle)?;
-        if cache_version_path(paths, &bundle.plugin_version).exists() {
-            state.installed_version = Some(bundle.plugin_version.clone());
+    state
+}
+
+fn inspect_status_config_state(
+    paths: &PluginPaths,
+    bundle: Option<&RenderedBundle>,
+    config: &toml::Value,
+    details: &mut Vec<String>,
+) -> CliState {
+    match inspect_config_state_from_config(paths, bundle, config) {
+        Ok(state) => state,
+        Err(error) => {
+            let mut state = inspect_registration_state_from_config(paths, config);
+            let stale_version = bundle.and_then(|bundle| {
+                attested_cached_plugin_version(paths, &bundle.plugin_version).unwrap_or_else(
+                    |stale_error| {
+                        details.push(format!(
+                            "installed plugin version inspection failed: {stale_error}"
+                        ));
+                        None
+                    },
+                )
+            });
+            if let Some(version) = stale_version {
+                state.plugin_installed = state.plugin_configured;
+                state.installed_version = Some(version);
+            } else {
+                details.push(format!(
+                    "Codex plugin installation inspection failed: {error}"
+                ));
+            }
+            state
         }
-        state.plugin_installed = state.plugin_configured && cache_valid;
     }
-    Ok(state)
 }
 
 fn read_base_config(paths: &PluginPaths) -> io::Result<toml::Value> {
@@ -1634,8 +1668,8 @@ fn inspect_base_hook_state_from_config(
 }
 
 fn expected_trust_hash(identity: &HookCommandIdentity) -> String {
-    // Mirrors Codex 0.146.0's normalized command-hook identity: no matcher,
-    // one synchronous command handler, an explicit one-second timeout, and
+    // Mirrors the supported Codex contract's normalized command-hook identity:
+    // no matcher, one synchronous command handler, an explicit one-second timeout, and
     // only the command selected for the current platform. Discovery clears
     // `commandWindows` before hashing the normalized handler.
     #[cfg(windows)]
@@ -1751,6 +1785,68 @@ fn cache_version_path(paths: &PluginPaths, version: &str) -> PathBuf {
         .join(version)
 }
 
+fn attested_cached_plugin_version(
+    paths: &PluginPaths,
+    current_version: &str,
+) -> io::Result<Option<String>> {
+    let Some(attestation) = read_installation_attestation(&paths.codex_home)? else {
+        return Ok(None);
+    };
+    if attestation.plugin_version == current_version {
+        return Ok(None);
+    }
+    if !valid_attested_cache_version(&attestation.plugin_version) {
+        return Err(invalid_data(
+            "the attested plugin version is not a safe abtop cache version",
+        ));
+    }
+    if cached_attested_plugin_payload_exists(paths, &attestation.plugin_version)? {
+        Ok(Some(attestation.plugin_version))
+    } else {
+        Ok(None)
+    }
+}
+
+fn valid_attested_cache_version(version: &str) -> bool {
+    let Some((base, suffix)) = version.rsplit_once("+codex.") else {
+        return false;
+    };
+    !base.is_empty()
+        && base.len() <= 96
+        && base
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        && suffix.len() == 12
+        && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn cached_attested_plugin_payload_exists(paths: &PluginPaths, version: &str) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        cached_attested_plugin_payload_exists_unix(paths, version)
+    }
+    #[cfg(not(unix))]
+    {
+        cached_attested_plugin_payload_exists_portable(paths, version)
+    }
+}
+
+#[cfg(not(unix))]
+fn cached_attested_plugin_payload_exists_portable(
+    paths: &PluginPaths,
+    version: &str,
+) -> io::Result<bool> {
+    cached_plugin_payload_matches_disk_portable(paths, version, None)
+}
+
+#[cfg(unix)]
+fn cached_attested_plugin_payload_exists_unix(
+    paths: &PluginPaths,
+    installed_version: &str,
+) -> io::Result<bool> {
+    cached_plugin_payload_matches_disk_unix(paths, installed_version, None)
+}
+
 fn cached_bundle_matches_disk(paths: &PluginPaths, bundle: &RenderedBundle) -> io::Result<bool> {
     #[cfg(unix)]
     {
@@ -1766,6 +1862,15 @@ fn cached_bundle_matches_disk(paths: &PluginPaths, bundle: &RenderedBundle) -> i
 fn cached_bundle_matches_disk_portable(
     paths: &PluginPaths,
     bundle: &RenderedBundle,
+) -> io::Result<bool> {
+    cached_plugin_payload_matches_disk_portable(paths, &bundle.plugin_version, Some(bundle))
+}
+
+#[cfg(not(unix))]
+fn cached_plugin_payload_matches_disk_portable(
+    paths: &PluginPaths,
+    plugin_version: &str,
+    expected_bundle: Option<&RenderedBundle>,
 ) -> io::Result<bool> {
     let cache_plugin_root = paths
         .codex_home
@@ -1789,7 +1894,7 @@ fn cached_bundle_matches_disk_portable(
         validate_owned_directory(&directory, &metadata, false)?;
     }
 
-    let version_root = cache_version_path(paths, &bundle.plugin_version);
+    let version_root = cache_version_path(paths, plugin_version);
     let entries = fs::read_dir(&cache_plugin_root)?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<io::Result<Vec<_>>>()?;
@@ -1850,29 +1955,33 @@ fn cached_bundle_matches_disk_portable(
         return Ok(false);
     }
 
-    for (path, bytes, executable) in [
+    for (path, expected, executable) in [
         (
             version_root.join(".codex-plugin/plugin.json"),
-            bundle.plugin_manifest.as_slice(),
+            expected_bundle.map(|bundle| bundle.plugin_manifest.as_slice()),
             false,
         ),
         (
             version_root.join("hooks/hooks.json"),
-            bundle.hooks_manifest.as_slice(),
+            expected_bundle.map(|bundle| bundle.hooks_manifest.as_slice()),
             false,
         ),
         (
             version_root.join("scripts/abtop-codex-hook.sh"),
-            bundle.posix_launcher.as_slice(),
+            expected_bundle.map(|bundle| bundle.posix_launcher.as_slice()),
             true,
         ),
         (
             version_root.join("scripts/abtop-codex-hook.cmd"),
-            bundle.windows_launcher.as_slice(),
+            expected_bundle.map(|bundle| bundle.windows_launcher.as_slice()),
             false,
         ),
     ] {
-        if !private_regular_file_matches(&path, bytes, executable)? {
+        let valid = match expected {
+            Some(bytes) => private_regular_file_matches(&path, bytes, executable)?,
+            None => private_regular_mode_matches(&path, executable)?,
+        };
+        if !valid {
             return Ok(false);
         }
     }
@@ -1883,6 +1992,15 @@ fn cached_bundle_matches_disk_portable(
 fn cached_bundle_matches_disk_unix(
     paths: &PluginPaths,
     bundle: &RenderedBundle,
+) -> io::Result<bool> {
+    cached_plugin_payload_matches_disk_unix(paths, &bundle.plugin_version, Some(bundle))
+}
+
+#[cfg(unix)]
+fn cached_plugin_payload_matches_disk_unix(
+    paths: &PluginPaths,
+    plugin_version: &str,
+    expected_bundle: Option<&RenderedBundle>,
 ) -> io::Result<bool> {
     let home = open_unix_directory(&paths.codex_home, false)?;
     let home_metadata = home.metadata()?;
@@ -1906,7 +2024,7 @@ fn cached_bundle_matches_disk_unix(
         return Ok(false);
     };
 
-    let expected_versions = BTreeSet::from([OsString::from(&bundle.plugin_version)]);
+    let expected_versions = BTreeSet::from([OsString::from(plugin_version)]);
     if !unix_directory_has_exact_names(
         &plugin,
         &expected_versions,
@@ -1915,9 +2033,8 @@ fn cached_bundle_matches_disk_unix(
     )? {
         return Ok(false);
     }
-    let version_path = plugin_path.join(&bundle.plugin_version);
-    let Some(version) =
-        open_managed_directory_at(&plugin, &bundle.plugin_version, &version_path, false)?
+    let version_path = plugin_path.join(plugin_version);
+    let Some(version) = open_managed_directory_at(&plugin, plugin_version, &version_path, false)?
     else {
         return Ok(false);
     };
@@ -1978,45 +2095,41 @@ fn cached_bundle_matches_disk_unix(
     let hooks_file_path = hooks_path.join("hooks.json");
     let posix_path = scripts_path.join("abtop-codex-hook.sh");
     let windows_path = scripts_path.join("abtop-codex-hook.cmd");
-    let Some(plugin_manifest) = open_matching_managed_file_at(
+    let Some(plugin_manifest) = open_cached_payload_file_at(
         &manifest_directory,
         "plugin.json",
         &plugin_manifest_path,
-        &bundle.plugin_manifest,
-        false,
+        expected_bundle.map(|bundle| bundle.plugin_manifest.as_slice()),
         false,
     )?
     else {
         return Ok(false);
     };
-    let Some(hooks_file) = open_matching_managed_file_at(
+    let Some(hooks_file) = open_cached_payload_file_at(
         &hooks_directory,
         "hooks.json",
         &hooks_file_path,
-        &bundle.hooks_manifest,
-        false,
+        expected_bundle.map(|bundle| bundle.hooks_manifest.as_slice()),
         false,
     )?
     else {
         return Ok(false);
     };
-    let Some(posix_launcher) = open_matching_managed_file_at(
+    let Some(posix_launcher) = open_cached_payload_file_at(
         &scripts_directory,
         "abtop-codex-hook.sh",
         &posix_path,
-        &bundle.posix_launcher,
+        expected_bundle.map(|bundle| bundle.posix_launcher.as_slice()),
         true,
-        false,
     )?
     else {
         return Ok(false);
     };
-    let Some(windows_launcher) = open_matching_managed_file_at(
+    let Some(windows_launcher) = open_cached_payload_file_at(
         &scripts_directory,
         "abtop-codex-hook.cmd",
         &windows_path,
-        &bundle.windows_launcher,
-        false,
+        expected_bundle.map(|bundle| bundle.windows_launcher.as_slice()),
         false,
     )?
     else {
@@ -2050,7 +2163,7 @@ fn cached_bundle_matches_disk_unix(
     )?;
     let rebound_version = reopen_same_directory_at(
         &rebound_plugin,
-        &bundle.plugin_version,
+        plugin_version,
         &version,
         &version_path,
         false,
@@ -2076,40 +2189,36 @@ fn cached_bundle_matches_disk_unix(
         &scripts_path,
         false,
     )?;
-    reopen_same_file_at(
+    reopen_same_cached_payload_file_at(
         &rebound_manifest,
         "plugin.json",
         &plugin_manifest,
         &plugin_manifest_path,
-        &bundle.plugin_manifest,
-        false,
+        expected_bundle.map(|bundle| bundle.plugin_manifest.as_slice()),
         false,
     )?;
-    reopen_same_file_at(
+    reopen_same_cached_payload_file_at(
         &rebound_hooks,
         "hooks.json",
         &hooks_file,
         &hooks_file_path,
-        &bundle.hooks_manifest,
-        false,
+        expected_bundle.map(|bundle| bundle.hooks_manifest.as_slice()),
         false,
     )?;
-    reopen_same_file_at(
+    reopen_same_cached_payload_file_at(
         &rebound_scripts,
         "abtop-codex-hook.sh",
         &posix_launcher,
         &posix_path,
-        &bundle.posix_launcher,
+        expected_bundle.map(|bundle| bundle.posix_launcher.as_slice()),
         true,
-        false,
     )?;
-    reopen_same_file_at(
+    reopen_same_cached_payload_file_at(
         &rebound_scripts,
         "abtop-codex-hook.cmd",
         &windows_launcher,
         &windows_path,
-        &bundle.windows_launcher,
-        false,
+        expected_bundle.map(|bundle| bundle.windows_launcher.as_slice()),
         false,
     )?;
     Ok(unix_directory_has_exact_names(
@@ -2255,6 +2364,50 @@ fn unix_directory_names(directory: &File) -> io::Result<BTreeSet<OsString>> {
 }
 
 #[cfg(unix)]
+fn open_managed_cache_file_at(
+    parent: &File,
+    name: &str,
+    path: &Path,
+    executable: bool,
+) -> io::Result<Option<File>> {
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    let Some(file) = openat_unix(parent, std::ffi::OsStr::new(name), flags)? else {
+        return Ok(None);
+    };
+    let metadata = file.metadata()?;
+    validate_owned_regular_file(path, &metadata, false)?;
+    use std::os::unix::fs::PermissionsExt;
+    let expected_mode = if executable { 0o700 } else { 0o600 };
+    if metadata.permissions().mode() & 0o777 != expected_mode {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn reopen_same_cache_file_at(
+    parent: &File,
+    name: &str,
+    pinned: &File,
+    path: &Path,
+    executable: bool,
+) -> io::Result<File> {
+    let current = open_managed_cache_file_at(parent, name, path, executable)?.ok_or_else(|| {
+        invalid_data(format!(
+            "cached plugin file {} disappeared or changed during closing validation",
+            path.display()
+        ))
+    })?;
+    if !same_file_content_snapshot(&pinned.metadata()?, &current.metadata()?) {
+        return Err(invalid_data(format!(
+            "cached plugin file {} was replaced during validation",
+            path.display()
+        )));
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
 fn open_matching_managed_file_at(
     parent: &File,
     name: &str,
@@ -2329,6 +2482,35 @@ fn reopen_same_file_at(
         )));
     }
     Ok(current)
+}
+
+#[cfg(unix)]
+fn open_cached_payload_file_at(
+    parent: &File,
+    name: &str,
+    path: &Path,
+    expected: Option<&[u8]>,
+    executable: bool,
+) -> io::Result<Option<File>> {
+    match expected {
+        Some(bytes) => open_matching_managed_file_at(parent, name, path, bytes, executable, false),
+        None => open_managed_cache_file_at(parent, name, path, executable),
+    }
+}
+
+#[cfg(unix)]
+fn reopen_same_cached_payload_file_at(
+    parent: &File,
+    name: &str,
+    pinned: &File,
+    path: &Path,
+    expected: Option<&[u8]>,
+    executable: bool,
+) -> io::Result<File> {
+    match expected {
+        Some(bytes) => reopen_same_file_at(parent, name, pinned, path, bytes, executable, false),
+        None => reopen_same_cache_file_at(parent, name, pinned, path, executable),
+    }
 }
 
 #[cfg(unix)]
@@ -3781,12 +3963,25 @@ fn ensure_hook_state_platform_supported() -> io::Result<()> {
 
 fn validate_supported_codex_release(bytes: &[u8]) -> io::Result<()> {
     let (major, minor, patch) = parse_codex_cli_version(bytes)?;
-    if (major, minor, patch) != (0, 146, 0) {
+    if (major, minor, patch) < MIN_SUPPORTED_CODEX_VERSION_COMPONENTS {
         return Err(invalid_data(format!(
-            "Codex hook integration requires codex-cli {SUPPORTED_CODEX_VERSION}, but the selected executable reports {major}.{minor}.{patch}; every other release remains unsupported until its hook contract is audited"
+            "Codex hook integration requires stable codex-cli {MIN_SUPPORTED_CODEX_VERSION} or newer, but the selected executable reports {major}.{minor}.{patch}"
         )));
     }
     Ok(())
+}
+
+pub(crate) fn codex_version_is_supported(version: &str) -> bool {
+    parse_stable_semver(version)
+        .is_some_and(|parsed| parsed >= MIN_SUPPORTED_CODEX_VERSION_COMPONENTS)
+}
+
+pub(crate) fn codex_version_has_verified_code_mode_shape(version: &str) -> bool {
+    // Codex 0.145.0 and 0.146.0 create nested Code Mode hook IDs as
+    // `exec-<UUIDv4>` while the outer rollout records `exec` / `wait` under a
+    // provider `call_*` ID. Future releases stay fail-closed until that
+    // cross-surface shape is reviewed again.
+    matches!(parse_stable_semver(version), Some((0, 145 | 146, 0)))
 }
 
 fn validate_codex_binary_identity(path: &Path, codex_home: &Path) -> io::Result<PathBuf> {
@@ -3838,14 +4033,20 @@ fn parse_codex_cli_version(bytes: &[u8]) -> io::Result<(u64, u64, u64)> {
     let version = line.strip_prefix("codex-cli ").ok_or_else(|| {
         invalid_data("the selected executable did not report an exact native `codex-cli` version")
     })?;
+    parse_stable_semver(version).ok_or_else(|| {
+        invalid_data(format!(
+            "native Codex reported an unsupported semantic version `{version}`"
+        ))
+    })
+}
+
+fn parse_stable_semver(version: &str) -> Option<(u64, u64, u64)> {
     if version.is_empty()
         || version
             .bytes()
             .any(|byte| !byte.is_ascii_digit() && byte != b'.')
     {
-        return Err(invalid_data(format!(
-            "native Codex reported an unsupported semantic version `{version}`"
-        )));
+        return None;
     }
     let components = version.split('.').collect::<Vec<_>>();
     if components.len() != 3
@@ -3853,21 +4054,14 @@ fn parse_codex_cli_version(bytes: &[u8]) -> io::Result<(u64, u64, u64)> {
             component.is_empty() || component.len() > 1 && component.starts_with('0')
         })
     {
-        return Err(invalid_data(format!(
-            "native Codex reported an unsupported semantic version `{version}`"
-        )));
+        return None;
     }
     let parsed = components
         .into_iter()
-        .map(|component| {
-            component.parse::<u64>().map_err(|_| {
-                invalid_data(format!(
-                    "native Codex reported an unsupported semantic version `{version}`"
-                ))
-            })
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    Ok((parsed[0], parsed[1], parsed[2]))
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some((parsed[0], parsed[1], parsed[2]))
 }
 
 fn validate_required_feature_rows(bytes: &[u8]) -> io::Result<()> {
@@ -3940,11 +4134,11 @@ fn validate_hook_schema_bytes(schema: &[u8]) -> io::Result<()> {
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     let expected = HOOK_EVENTS.into_iter().collect::<BTreeSet<_>>();
-    if actual != expected {
+    let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+    if !missing.is_empty() {
         return Err(invalid_data(format!(
-            "native Codex managed-hook event set is incompatible: expected {}, found {}",
-            expected.into_iter().collect::<Vec<_>>().join(", "),
-            actual.into_iter().collect::<Vec<_>>().join(", ")
+            "native Codex managed-hook event set is incompatible: missing required events {}",
+            missing.join(", ")
         )));
     }
     Ok(())
@@ -5352,9 +5546,92 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains(&bundle.helper_digest));
-            assert!(handler["command"].as_str().unwrap().starts_with("exec "));
+            let command = handler["command"].as_str().unwrap();
+            assert!(command.starts_with("\"$PLUGIN_ROOT/scripts/abtop-codex-hook.sh\" "));
+            assert!(command.ends_with(">/dev/null 2>&1 || :; exit 0"));
+            let command_windows = handler["commandWindows"].as_str().unwrap();
+            assert!(command_windows.starts_with("cmd.exe /D /C call "));
+            assert!(command_windows.ends_with(">nul 2>nul || exit /b 0"));
         }
         assert!(hooks.get("PostToolUseFailure").is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn posix_hook_command_invokes_the_exact_launcher_argv_silently() {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("abtop-helper");
+        executable_file(&helper, b"helper bytes");
+        let bundle = rendered_test_bundle(&helper);
+        let manifest: Value = serde_json::from_slice(&bundle.hooks_manifest).unwrap();
+        let command = manifest["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+
+        let plugin_root = temp.path().join("plugin root");
+        fs::create_dir_all(plugin_root.join("scripts")).unwrap();
+        let launcher = plugin_root.join("scripts/abtop-codex-hook.sh");
+        executable_file(
+            &launcher,
+            b"#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" > \"$ABTOP_TEST_ARGV\"\nprintf 'sensitive stdout\\n'\nprintf 'sensitive stderr\\n' >&2\nexit 37\n",
+        );
+        let captured = temp.path().join("argv.txt");
+
+        let output = Command::new("sh")
+            .args(["-c", command])
+            .env("PLUGIN_ROOT", &plugin_root)
+            .env("ABTOP_TEST_ARGV", &captured)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            fs::read_to_string(captured).unwrap(),
+            format!(
+                "4\n--schema-revision\n{HOOK_SCHEMA_REVISION}\n--helper-digest\n{}\n",
+                bundle.helper_digest
+            )
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn posix_hook_command_absorbs_missing_and_unexecutable_launchers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("abtop-helper");
+        executable_file(&helper, b"helper bytes");
+        let bundle = rendered_test_bundle(&helper);
+        let manifest: Value = serde_json::from_slice(&bundle.hooks_manifest).unwrap();
+        let command = manifest["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+
+        let missing_root = temp.path().join("missing plugin root");
+        let missing = Command::new("sh")
+            .args(["-c", command])
+            .env("PLUGIN_ROOT", &missing_root)
+            .output()
+            .unwrap();
+        assert!(missing.status.success());
+        assert!(missing.stdout.is_empty());
+        assert!(missing.stderr.is_empty());
+
+        let unexecutable_root = temp.path().join("unexecutable plugin root");
+        fs::create_dir_all(unexecutable_root.join("scripts")).unwrap();
+        let launcher = unexecutable_root.join("scripts/abtop-codex-hook.sh");
+        fs::write(&launcher, b"#!/bin/sh\nexit 91\n").unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o600)).unwrap();
+        let unexecutable = Command::new("sh")
+            .args(["-c", command])
+            .env("PLUGIN_ROOT", &unexecutable_root)
+            .output()
+            .unwrap();
+        assert!(unexecutable.status.success());
+        assert!(unexecutable.stdout.is_empty());
+        assert!(unexecutable.stderr.is_empty());
     }
 
     #[test]
@@ -5571,17 +5848,19 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn setup_rejects_an_unaudited_codex_minor_before_writing_the_bundle() {
+    fn setup_rejects_codex_older_than_the_minimum_before_writing_the_bundle() {
         let temp = tempfile::tempdir().unwrap();
         let codex_home = temp.path().join("codex");
         fs::create_dir(&codex_home).unwrap();
-        let codex = temp.path().join("codex-future");
-        executable_file(&codex, b"#!/bin/sh\nprintf 'codex-cli 0.147.0\\n'\n");
+        let codex = temp.path().join("codex-old");
+        executable_file(&codex, b"#!/bin/sh\nprintf 'codex-cli 0.144.0\\n'\n");
         let helper = temp.path().join("abtop");
         executable_file(&helper, b"helper bytes");
 
         let error = install_after_legacy_cleanup(&codex_home, &codex, &helper).unwrap_err();
-        assert!(error.to_string().contains("requires codex-cli 0.146.0"));
+        assert!(error
+            .to_string()
+            .contains("requires stable codex-cli 0.145.0 or newer"));
         assert!(!codex_home.join("abtop").exists());
     }
 
@@ -5600,13 +5879,15 @@ mod tests {
             migration::LEGACY_END_MARKER
         );
         fs::write(&profile, &original).unwrap();
-        let codex = temp.path().join("codex-future");
-        executable_file(&codex, b"#!/bin/sh\nprintf 'codex-cli 0.147.0\\n'\n");
+        let codex = temp.path().join("codex-old");
+        executable_file(&codex, b"#!/bin/sh\nprintf 'codex-cli 0.144.0\\n'\n");
         let helper = temp.path().join("abtop");
         executable_file(&helper, b"helper bytes");
 
         let error = setup_with_home(&codex_home, &codex, &helper, &legacy_home).unwrap_err();
-        assert!(error.to_string().contains("requires codex-cli 0.146.0"));
+        assert!(error
+            .to_string()
+            .contains("requires stable codex-cli 0.145.0 or newer"));
         assert_eq!(fs::read_to_string(profile).unwrap(), original);
         assert!(!legacy_home.join(".abtop-codex-migration.lock").exists());
     }
@@ -5623,6 +5904,7 @@ mod tests {
         for event in HOOK_EVENTS {
             properties.insert(event.to_string(), json!({"type": "array"}));
         }
+        properties.insert("FutureLifecycleEvent".to_string(), json!({"type": "array"}));
         let schema = serde_json::to_string(&json!({
             "definitions": {
                 "ManagedHooksRequirements": { "properties": properties }
@@ -5638,7 +5920,7 @@ if [ "$(basename "$0")" != "codex" ]; then
   exit 91
 fi
 if [ "$1" = "--version" ]; then
-  printf 'codex-cli 0.146.0\n'
+  printf 'codex-cli 0.147.0\n'
   exit 0
 fi
 if [ "$1" = "features" ] && [ "$2" = "list" ]; then
@@ -5718,7 +6000,11 @@ exit 92
     }
 
     #[test]
-    fn codex_version_gate_accepts_only_exact_stable_semver_shape() {
+    fn codex_version_gate_accepts_the_minimum_and_newer_stable_releases() {
+        assert_eq!(
+            parse_codex_cli_version(b"codex-cli 0.145.0\n").unwrap(),
+            (0, 145, 0)
+        );
         assert_eq!(
             parse_codex_cli_version(b"codex-cli 0.146.0\n").unwrap(),
             (0, 146, 0)
@@ -5727,11 +6013,29 @@ exit 92
             parse_codex_cli_version(b"codex-cli 0.146.27").unwrap(),
             (0, 146, 27)
         );
-        validate_supported_codex_release(b"codex-cli 0.146.0\n").unwrap();
-        assert!(validate_supported_codex_release(b"codex-cli 0.146.1\n").is_err());
-        assert!(validate_supported_codex_release(b"codex-cli 0.146.27\n").is_err());
-        assert!(validate_supported_codex_release(b"codex-cli 0.145.9\n").is_err());
-        assert!(validate_supported_codex_release(b"codex-cli 0.147.0\n").is_err());
+        for supported in [
+            b"codex-cli 0.145.0\n".as_slice(),
+            b"codex-cli 0.145.9\n",
+            b"codex-cli 0.146.27\n",
+            b"codex-cli 0.147.0\n",
+            b"codex-cli 1.0.0\n",
+        ] {
+            validate_supported_codex_release(supported).unwrap();
+        }
+        for unsupported in [b"codex-cli 0.144.0\n".as_slice(), b"codex-cli 0.144.999\n"] {
+            assert!(validate_supported_codex_release(unsupported).is_err());
+        }
+        assert!(codex_version_is_supported("0.145.0"));
+        assert!(codex_version_is_supported("0.146.1"));
+        assert!(!codex_version_is_supported("0.144.999"));
+        assert!(!codex_version_is_supported("0.145.0-beta.1"));
+        assert!(codex_version_has_verified_code_mode_shape("0.145.0"));
+        assert!(codex_version_has_verified_code_mode_shape("0.146.0"));
+        assert!(!codex_version_has_verified_code_mode_shape("0.145.1"));
+        assert!(!codex_version_has_verified_code_mode_shape("0.146.27"));
+        assert!(!codex_version_has_verified_code_mode_shape("0.144.999"));
+        assert!(!codex_version_has_verified_code_mode_shape("0.147.0"));
+        assert!(!codex_version_has_verified_code_mode_shape("1.0.0"));
         for invalid in [
             b"codex 0.146.0\n".as_slice(),
             b"codex-cli 0.146.0-beta\n",
@@ -5761,7 +6065,7 @@ exit 92
     }
 
     #[test]
-    fn generated_schema_must_advertise_exactly_the_supported_event_set() {
+    fn generated_schema_must_advertise_every_required_event() {
         let mut properties = serde_json::Map::new();
         for event in HOOK_EVENTS {
             properties.insert(event.to_string(), json!({"type": "array"}));
@@ -5779,7 +6083,7 @@ exit 92
         let mut extra = schema.clone();
         extra["definitions"]["ManagedHooksRequirements"]["properties"]["PostToolUseFailure"] =
             json!({"type": "array"});
-        assert!(validate_hook_schema_bytes(&serde_json::to_vec(&extra).unwrap()).is_err());
+        validate_hook_schema_bytes(&serde_json::to_vec(&extra).unwrap()).unwrap();
 
         let mut missing = schema;
         missing["definitions"]["ManagedHooksRequirements"]["properties"]
@@ -5908,6 +6212,85 @@ exit 92
 
         atomic_write_private(&hooks, b"{}\n", false).unwrap();
         assert!(!cached_bundle_matches_disk(&paths, &bundle).unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn status_preserves_registration_and_attested_install_across_helper_version_drift() {
+        let (temp, paths, installed_bundle) = fixture_bundle();
+        write_attestation(&paths, &installed_bundle).unwrap();
+        write_cached_bundle(&paths, &installed_bundle);
+
+        let current_helper = temp.path().join("abtop-current");
+        executable_file(&current_helper, b"new helper bytes");
+        let current_bundle = render_bundle(&current_helper, &paths.plugin_data_root).unwrap();
+        assert_ne!(
+            installed_bundle.plugin_version,
+            current_bundle.plugin_version
+        );
+
+        let config_text = format!(
+            "[marketplaces.{MARKETPLACE_NAME}]\nsource_type = \"local\"\nsource = {:?}\n\n[plugins.\"{PLUGIN_ID}\"]\nenabled = true\n",
+            paths.marketplace_root.to_string_lossy()
+        );
+        let config = toml::from_str::<toml::Value>(&config_text).unwrap();
+
+        let exact_error =
+            inspect_config_state_from_config(&paths, Some(&current_bundle), &config).unwrap_err();
+        assert!(exact_error
+            .to_string()
+            .contains("unexpected file or capability in cached plugin versions"));
+
+        let mut details = Vec::new();
+        let state =
+            inspect_status_config_state(&paths, Some(&current_bundle), &config, &mut details);
+        assert!(state.marketplace_registered);
+        assert!(state.plugin_configured);
+        assert!(state.plugin_installed);
+        assert!(state.plugin_enabled);
+        assert_eq!(
+            state.installed_version,
+            Some(installed_bundle.plugin_version.clone())
+        );
+        assert!(details.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn status_does_not_promote_a_malformed_stale_cache_payload() {
+        let (temp, paths, installed_bundle) = fixture_bundle();
+        write_attestation(&paths, &installed_bundle).unwrap();
+        write_cached_bundle(&paths, &installed_bundle);
+        atomic_write_private(
+            &cache_version_path(&paths, &installed_bundle.plugin_version).join("unexpected"),
+            b"unexpected",
+            false,
+        )
+        .unwrap();
+
+        let current_helper = temp.path().join("abtop-current");
+        executable_file(&current_helper, b"new helper bytes");
+        let current_bundle = render_bundle(&current_helper, &paths.plugin_data_root).unwrap();
+        let config_text = format!(
+            "[marketplaces.{MARKETPLACE_NAME}]\nsource_type = \"local\"\nsource = {:?}\n\n[plugins.\"{PLUGIN_ID}\"]\nenabled = true\n",
+            paths.marketplace_root.to_string_lossy()
+        );
+        let config = toml::from_str::<toml::Value>(&config_text).unwrap();
+
+        let mut details = Vec::new();
+        let state =
+            inspect_status_config_state(&paths, Some(&current_bundle), &config, &mut details);
+        assert!(state.marketplace_registered);
+        assert!(state.plugin_configured);
+        assert!(state.plugin_enabled);
+        assert!(!state.plugin_installed);
+        assert_eq!(state.installed_version, None);
+        assert!(details
+            .iter()
+            .any(|detail| detail.contains("installed plugin version inspection failed")));
+        assert!(details
+            .iter()
+            .any(|detail| detail.contains("Codex plugin installation inspection failed")));
     }
 
     #[test]

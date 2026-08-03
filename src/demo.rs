@@ -614,6 +614,7 @@ pub fn populate_demo(app: &mut App) {
             seven_day_resets_at: Some(now_secs() + 5 * 24 * 3600),
             seven_day_window_minutes: Some(10_080),
             updated_at: Some(now_secs() - 10),
+            windows: Vec::new(),
         },
         RateLimitInfo {
             source: "codex".into(),
@@ -624,6 +625,7 @@ pub fn populate_demo(app: &mut App) {
             seven_day_resets_at: Some(now_secs() + 6 * 24 * 3600),
             seven_day_window_minutes: Some(10_080),
             updated_at: Some(now_secs() - 5),
+            windows: Vec::new(),
         },
     ];
 

@@ -32,10 +32,92 @@ pub struct FileAccess {
 /// Maximum file access entries kept per session to bound memory.
 pub const MAX_FILE_ACCESSES: usize = 1000;
 
+/// Maximum UTF-8 byte length accepted for a quota window identity.
+pub const MAX_RATE_LIMIT_WINDOW_ID_BYTES: usize = 128;
+
+/// Maximum UTF-8 byte length accepted for a quota window display label.
+pub const MAX_RATE_LIMIT_WINDOW_LABEL_BYTES: usize = 128;
+
+/// Source that supplied one account-level quota window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum RateLimitProvenance {
+    /// Data emitted directly by the provider integration.
+    #[default]
+    Native,
+    /// Data returned by the optional CodexBar integration.
+    CodexBar,
+}
+
+/// One bounded account-level quota window.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitWindow {
+    /// Stable source-owned identity used to merge matching windows.
+    pub id: String,
+    /// Short user-facing window label.
+    pub label: String,
+    /// Used quota percentage (0-100).
+    pub used_pct: f64,
+    /// Reset timestamp in epoch seconds, when reported by the source.
+    pub resets_at: Option<u64>,
+    /// Window duration in minutes, when reported by the source.
+    pub window_minutes: Option<u64>,
+    /// Integration that supplied this window.
+    pub provenance: RateLimitProvenance,
+}
+
+impl RateLimitWindow {
+    /// Build a window only when its owned identity and label are safely bounded.
+    ///
+    /// IDs are rejected rather than truncated because truncation could merge
+    /// distinct source windows under the same identity.
+    pub fn try_new(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        used_pct: f64,
+        resets_at: Option<u64>,
+        window_minutes: Option<u64>,
+        provenance: RateLimitProvenance,
+    ) -> Option<Self> {
+        let id = id.into();
+        let label = label.into();
+        if id.is_empty()
+            || id.len() > MAX_RATE_LIMIT_WINDOW_ID_BYTES
+            || id.chars().any(is_unsafe_quota_text_char)
+            || label.is_empty()
+            || label.len() > MAX_RATE_LIMIT_WINDOW_LABEL_BYTES
+            || label.chars().any(is_unsafe_quota_text_char)
+            || !used_pct.is_finite()
+            || !(0.0..=100.0).contains(&used_pct)
+            || window_minutes == Some(0)
+        {
+            return None;
+        }
+
+        Some(Self {
+            id,
+            label,
+            used_pct,
+            resets_at,
+            window_minutes,
+            provenance,
+        })
+    }
+}
+
+fn is_unsafe_quota_text_char(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+        )
+}
+
 /// Account-level rate limit info (shared across all sessions).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RateLimitInfo {
-    /// "claude" or "codex"
+    /// Canonical provider ID, such as "claude", "codex", or "grok".
     pub source: String,
     /// 5-hour window usage percentage (0-100)
     pub five_hour_pct: Option<f64>,
@@ -54,6 +136,11 @@ pub struct RateLimitInfo {
     pub seven_day_window_minutes: Option<u64>,
     /// When this data was last updated
     pub updated_at: Option<u64>,
+    /// Authoritative ordered quota windows from all available integrations.
+    ///
+    /// The legacy five-hour and seven-day fields remain populated for API
+    /// compatibility, but new consumers should prefer this collection.
+    pub windows: Vec<RateLimitWindow>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,7 +150,11 @@ pub enum SessionStatus {
     Thinking,
     /// A tool, background terminal, or active child is doing work
     Executing,
-    /// An exact provider signal says the session needs user input or approval
+    /// Exact terminal evidence proves activity, but cannot distinguish model
+    /// generation from tool execution
+    Working,
+    /// Exact provider or terminal evidence says the session needs user input
+    /// or approval
     Waiting,
     /// Process is alive, but no model turn, tool, or user interaction is active
     Idle,
@@ -81,7 +172,10 @@ pub enum SessionStatus {
 impl SessionStatus {
     /// Returns true for states where the agent is actively doing work.
     pub fn is_active(&self) -> bool {
-        matches!(self, SessionStatus::Thinking | SessionStatus::Executing)
+        matches!(
+            self,
+            SessionStatus::Thinking | SessionStatus::Executing | SessionStatus::Working
+        )
     }
 }
 
@@ -154,6 +248,14 @@ pub enum StatusReason {
     HookTurnOpen,
     /// A Codex stop hook and rollout terminal event agree that the turn ended.
     HookTurnComplete,
+    /// Herdr's private terminal detector reports a visible Codex blocker.
+    HerdrScreenBlocked,
+    /// Herdr's private terminal detector reports visible Codex activity.
+    HerdrScreenWorking,
+    /// Herdr's private terminal detector reports the live Codex composer idle.
+    HerdrScreenIdle,
+    /// Herdr reports work, but Codex evidence cannot classify that activity.
+    HerdrWorkingUnrefined,
     #[default]
     Unavailable,
 }
@@ -190,6 +292,10 @@ impl StatusReason {
             Self::HookSubagentActive => "Codex hook subagent active",
             Self::HookTurnOpen => "Codex hook turn open",
             Self::HookTurnComplete => "Codex hook turn complete",
+            Self::HerdrScreenBlocked => "Herdr screen needs attention",
+            Self::HerdrScreenWorking => "Herdr screen working",
+            Self::HerdrScreenIdle => "Herdr screen idle",
+            Self::HerdrWorkingUnrefined => "Herdr work type unavailable",
             Self::Unavailable => "evidence unavailable",
         }
     }
@@ -404,9 +510,9 @@ pub struct AgentSession {
     /// turn has already been closed (no tools currently in flight).
     /// Used to animate the timeline bar for the running tool(s).
     pub pending_since_ms: u64,
-    /// True when the provider exposes a pending interaction that needs a user
-    /// response. Codex interaction candidates remain false here because its
-    /// current hook contract cannot prove prompt resolution.
+    /// True when exact provider or terminal evidence exposes a pending
+    /// interaction that needs a user response. Codex hook candidates alone
+    /// remain false because their contract cannot prove prompt resolution.
     pub awaiting_input: bool,
     /// Unix-epoch ms of the most recent `user` line (prompt or tool_result)
     /// that has not yet been followed by an assistant response. Zero when
@@ -424,7 +530,7 @@ pub struct AgentSession {
 
 impl AgentSession {
     /// Keep the compatibility flag exactly aligned with the lifecycle enum.
-    /// Waiting is reserved for a provider-confirmed actionable interaction.
+    /// Waiting is reserved for an exactly observed actionable interaction.
     pub fn enforce_status_contract(&mut self) {
         self.awaiting_input = matches!(self.status, SessionStatus::Waiting);
     }
@@ -460,6 +566,7 @@ impl AgentSession {
                 .last()
                 .map(String::as_str)
                 .or(Some("executing")),
+            SessionStatus::Working => Some("working"),
             SessionStatus::Waiting => Some("waiting for user input"),
             SessionStatus::Idle => Some("idle"),
             SessionStatus::RateLimited => Some("rate limited"),
@@ -528,6 +635,100 @@ fn truncate_string(s: &mut String, max_bytes: usize) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rate_limit_window_provenance_has_stable_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&RateLimitProvenance::Native).unwrap(),
+            r#""native""#
+        );
+        assert_eq!(
+            serde_json::to_string(&RateLimitProvenance::CodexBar).unwrap(),
+            r#""codexbar""#
+        );
+    }
+
+    #[test]
+    fn rate_limit_info_default_preserves_legacy_fields_and_empty_windows() {
+        let value = serde_json::to_value(RateLimitInfo::default()).unwrap();
+        assert_eq!(value["source"], "");
+        assert!(value["five_hour_pct"].is_null());
+        assert!(value["seven_day_pct"].is_null());
+        assert_eq!(value["windows"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn rate_limit_window_serializes_all_public_fields() {
+        let window = RateLimitWindow::try_new(
+            "codex-spark-weekly",
+            "Codex Spark Weekly",
+            12.5,
+            Some(1_800_000_000),
+            Some(10_080),
+            RateLimitProvenance::CodexBar,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(window).unwrap(),
+            serde_json::json!({
+                "id": "codex-spark-weekly",
+                "label": "Codex Spark Weekly",
+                "used_pct": 12.5,
+                "resets_at": 1_800_000_000_u64,
+                "window_minutes": 10_080,
+                "provenance": "codexbar"
+            })
+        );
+    }
+
+    #[test]
+    fn rate_limit_window_rejects_unbounded_or_unsafe_identity_fields() {
+        let make = |id: String, label: String| {
+            RateLimitWindow::try_new(id, label, 1.0, None, None, RateLimitProvenance::Native)
+        };
+
+        assert!(make(String::new(), "Five hours".into()).is_none());
+        assert!(make("primary".into(), String::new()).is_none());
+        assert!(make(
+            "x".repeat(MAX_RATE_LIMIT_WINDOW_ID_BYTES + 1),
+            "Five hours".into()
+        )
+        .is_none());
+        assert!(make(
+            "primary".into(),
+            "x".repeat(MAX_RATE_LIMIT_WINDOW_LABEL_BYTES + 1)
+        )
+        .is_none());
+        assert!(make("primary\nsecondary".into(), "Five hours".into()).is_none());
+        assert!(make("primary".into(), "Five\thours".into()).is_none());
+        assert!(make("primary".into(), "Five \u{202E}hours".into()).is_none());
+
+        let bounded_unicode_label = "ą".repeat(MAX_RATE_LIMIT_WINDOW_LABEL_BYTES / 2);
+        assert!(make("primary".into(), bounded_unicode_label).is_some());
+    }
+
+    #[test]
+    fn rate_limit_window_rejects_invalid_measurements() {
+        let make = |used_pct, window_minutes| {
+            RateLimitWindow::try_new(
+                "primary",
+                "Five hours",
+                used_pct,
+                None,
+                window_minutes,
+                RateLimitProvenance::Native,
+            )
+        };
+
+        assert!(make(f64::NAN, Some(300)).is_none());
+        assert!(make(f64::INFINITY, Some(300)).is_none());
+        assert!(make(-0.1, Some(300)).is_none());
+        assert!(make(100.1, Some(300)).is_none());
+        assert!(make(50.0, Some(0)).is_none());
+        assert!(make(0.0, None).is_some());
+        assert!(make(100.0, Some(300)).is_some());
+    }
+
     fn make_session(input: u64, output: u64, cache_read: u64, cache_create: u64) -> AgentSession {
         AgentSession {
             agent_cli: "claude",
@@ -586,8 +787,12 @@ mod tests {
     }
 
     #[test]
-    fn only_thinking_and_executing_are_active() {
-        for status in [SessionStatus::Thinking, SessionStatus::Executing] {
+    fn thinking_executing_and_working_are_active() {
+        for status in [
+            SessionStatus::Thinking,
+            SessionStatus::Executing,
+            SessionStatus::Working,
+        ] {
             assert!(status.is_active(), "{status:?}");
         }
         for status in [
@@ -615,6 +820,23 @@ mod tests {
     }
 
     #[test]
+    fn herdr_status_reasons_are_stable_and_content_free() {
+        let cases = [
+            (StatusReason::HerdrScreenBlocked, "HerdrScreenBlocked"),
+            (StatusReason::HerdrScreenWorking, "HerdrScreenWorking"),
+            (StatusReason::HerdrScreenIdle, "HerdrScreenIdle"),
+            (StatusReason::HerdrWorkingUnrefined, "HerdrWorkingUnrefined"),
+        ];
+        for (reason, wire_name) in cases {
+            assert!(reason.as_str().starts_with("Herdr "));
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{wire_name}\"")
+            );
+        }
+    }
+
+    #[test]
     fn status_owned_task_labels_override_stale_provider_text() {
         let mut session = make_session(0, 0, 0, 0);
         session.current_tasks.push("Edit stale.rs".into());
@@ -625,16 +847,20 @@ mod tests {
         session.status = SessionStatus::Thinking;
         assert_eq!(session.display_task(), Some("thinking"));
 
+        session.status = SessionStatus::Working;
+        assert_eq!(session.display_task(), Some("working"));
+
         session.status = SessionStatus::RateLimited;
         assert_eq!(session.display_task(), Some("rate limited"));
     }
 
     #[test]
-    fn non_executing_task_labels_never_leak_stale_work() {
+    fn status_owned_task_labels_never_leak_stale_work() {
         let mut session = make_session(0, 0, 0, 0);
         session.current_tasks.push("Edit stale.rs".into());
 
         for (status, expected) in [
+            (SessionStatus::Working, "working"),
             (SessionStatus::Waiting, "waiting for user input"),
             (SessionStatus::Idle, "idle"),
             (SessionStatus::Unknown, "status evidence unavailable"),
@@ -659,6 +885,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<SessionStatus>("\"Error\"").unwrap(),
             SessionStatus::Error
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionStatus::Working).unwrap(),
+            "\"Working\""
         );
     }
 
@@ -717,6 +947,7 @@ mod tests {
         for status in [
             SessionStatus::Thinking,
             SessionStatus::Executing,
+            SessionStatus::Working,
             SessionStatus::Idle,
             SessionStatus::Unknown,
             SessionStatus::RateLimited,

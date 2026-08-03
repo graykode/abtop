@@ -47,11 +47,11 @@ pub(crate) fn run_from_environment(args: Vec<OsString>) -> io::Result<()> {
     let ingest_marker_id = ingest_guard.marker_id()?.to_owned();
 
     let helper_digest = parse_private_args(&args)?;
-    let (parsed, (store, process, integration)) =
-        parse_before_preflight(io::stdin().lock(), || {
-            ingress.reclaim_stale_artifacts_after_drain(observed_at_ms)?;
-            attest_hook_environment(&plugin_data, &ingress, &helper_digest)
-        })?;
+    let parsed = parse_and_drain_hook_input_outcome(io::stdin().lock())?;
+    ingress.reclaim_stale_artifacts_after_drain(observed_at_ms, Some(&ingest_marker_id))?;
+    let parsed = parsed?;
+    let (store, process, integration) =
+        attest_hook_environment(&plugin_data, &ingress, &helper_digest)?;
     let event = parsed.into_event(process, integration, observed_at_ms, ingest_marker_id)?;
     store.fold(event)?;
     ingest_guard.succeed()?;
@@ -301,6 +301,7 @@ impl ParsedHookInput {
 /// hook writer is still holding the other end of the pipe. The hard byte cap
 /// bounds adversarial or broken producers; ordinary large ignored fields do
 /// not allocate an aggregate input buffer and are accepted up to that cap.
+#[cfg(all(test, unix))]
 fn parse_before_preflight<R, F, T>(reader: R, preflight: F) -> io::Result<(ParsedHookInput, T)>
 where
     R: Read,
@@ -310,12 +311,25 @@ where
     // JSON object before it can wait for us to exit; hashing executables or
     // probing process ancestry first can leave both processes blocked on a
     // full stdin pipe until Codex's one-second hook timeout fires.
-    let parsed = parse_and_drain_hook_input(reader)?;
+    let parsed = parse_and_drain_hook_input_outcome(reader)??;
     let verified = preflight()?;
     Ok((parsed, verified))
 }
 
+#[cfg(test)]
 fn parse_and_drain_hook_input<R: Read>(reader: R) -> io::Result<ParsedHookInput> {
+    parse_and_drain_hook_input_outcome(reader)?
+}
+
+/// Return the parse result only after the bounded input reached EOF.
+///
+/// Keeping the parse error nested lets the ingest path perform content-free
+/// maintenance after a malformed but fully drained payload, without running
+/// maintenance when an oversized or broken producer prevented a complete
+/// drain.
+fn parse_and_drain_hook_input_outcome<R: Read>(
+    reader: R,
+) -> io::Result<io::Result<ParsedHookInput>> {
     let mut reader = BoundedHookReader::new(reader, MAX_HOOK_STREAM_BYTES);
     let parsed = {
         let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
@@ -329,7 +343,7 @@ fn parse_and_drain_hook_input<R: Read>(reader: R) -> io::Result<ParsedHookInput>
         return Err(invalid_data("hook input exceeds its streaming bound"));
     }
     drain_result?;
-    parsed
+    Ok(parsed)
 }
 
 struct BoundedHookReader<R> {

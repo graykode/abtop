@@ -30,7 +30,9 @@ Sessions are discovered from local process and file state across macOS, Linux, a
 - [Library / JSON snapshot](#library--json-snapshot)
 - [Privacy](#privacy)
 
-Collection reads local state and needs no API keys or provider authentication.
+Collection reads local state and needs no API keys. The disabled-by-default CodexBar
+quota integration may use CodexBar's configured automatic local, web, OAuth, or API
+sources when explicitly enabled.
 The normal TUI and `--once` can invoke the installed Claude CLI to generate session
 titles; see [Privacy](#privacy) for the exact data boundary. Optional Codex hook
 integration records only bounded, content-free lifecycle metadata. It never participates
@@ -86,7 +88,8 @@ programs enable the following features:
 | OpenCode sessions | A `sqlite3` CLI on `PATH` with `-readonly` and `-json` support |
 | Claude account quota | `bash` and `python3` in Claude Code's hook environment |
 | Generated session titles | An installed `claude` CLI; the normal TUI and `--once` may invoke `claude --print` |
-| Codex lifecycle audit and exit correlation (macOS/Linux) | Native `codex-cli` 0.146.0 with the stable, enabled `hooks` and `plugins` features and the exact supported 11-event generated hook schema |
+| Codex lifecycle audit and exit correlation (macOS/Linux) | Stable native `codex-cli` 0.145.0 or newer with enabled `hooks` and `plugins` features and all 11 required generated hook events |
+| Optional CodexBar quotas | A `codexbar` CLI on `PATH`; collection remains disabled until explicitly enabled |
 | Project dirty-file counts | `git` on `PATH` |
 | Full Unix process, open-file, port, and MCP discovery | `ps` and `lsof` |
 | `abtop --update` | `curl` and `sh` |
@@ -122,12 +125,47 @@ unavailable when the provider does not supply it.
 
 `abtop --setup` is Claude-only. It does not inspect or change Codex configuration.
 
+### Optional CodexBar quotas
+
+Enable **CodexBar quotas** in the `c` configuration overlay to show quota data for all
+providers enabled in CodexBar, or set the existing compatibility key:
+
+```toml
+codexbar_quota_fallback = true
+```
+
+This opt-in integration runs CodexBar's normal configured usage command with bounded
+JSON output and a timeout. It honors CodexBar's enabled providers and automatic source
+selection, which may use existing local, authenticated web, OAuth, or API access. abtop
+does not select accounts or inspect credentials. It retains only bounded quota-window
+metadata and sanitized diagnostics; account email, organization, credits, pace
+summaries, dashboard data, raw errors, and arbitrary provider text are discarded.
+
+Every returned primary, secondary, tertiary, and extra quota window is eligible for
+display. Fresh native Claude and Codex windows win for overlapping slots; CodexBar
+fills missing or stale native windows and contributes every non-overlapping window.
+When a plan shifts a standard window between built-in slot names, exact duration and
+reset metadata prevents that same limit from appearing twice; custom windows remain
+distinct.
+One provider failure does not discard successful providers, and a sanitized unavailable
+card identifies an enabled provider whose CodexBar source failed.
+
+The Quota panel uses an adaptive provider grid, marks CodexBar-only data with `·CB`
+and mixed native/CodexBar data with `·MIX`, and reports explicit overflow when all
+windows cannot fit. `--once` and `--json` retain the complete bounded provider/window
+set. The configuration overlay reports `off`, `checking`, `active`, `partial`, or
+`unavailable`; `abtop --json` exposes provider state, provenance, freshness, and fixed
+sanitized error categories under `codexbar_quota`. Poll failures are non-fatal, and
+CodexBar values remain in memory rather than being written into native quota caches.
+
 ### Codex lifecycle audit and exit correlation
 
 The integration records content-free lifecycle boundaries for auditing and exact
-process-exit correlation. Codex 0.146.0 cannot attest the effective hook engine of a
-live thread, so setup does not make live Codex `Thinking`, `Executing`, `Waiting`, or
-`Idle` rows available; those rows remain non-actionable `Unknown / Unavailable`.
+process-exit correlation. Supported Codex releases cannot attest the effective hook engine of a
+live thread. Exact supported hook/rollout shapes may nevertheless provide conservative,
+non-actionable heuristic `Thinking`, `Executing`, or `Idle`; exactly correlated Herdr
+terminal state may additionally provide `Waiting`, `Idle`, refined work, or generic
+`Working` when activity is exact but its kind cannot be refined safely.
 
 Native hook integration is currently supported on macOS and Linux. Windows still gets
 Codex process, rollout, token, context, and quota metadata, but its live lifecycle status
@@ -152,13 +190,15 @@ codex fork
 codex --yolo
 ```
 
-Setup supports exactly `codex-cli` 0.146.0. It also requires the native feature list to
+Setup supports stable `codex-cli` 0.145.0 and newer releases. It also requires the native feature list to
 contain the exact `hooks stable true` and `plugins stable true` rows, and verifies that
 the uppercase `ManagedHooksRequirements.properties` in generated
-`v2/ConfigRequirementsReadResponse.json` are exactly the declared 11-event set. Older,
-newer, or structurally different releases fail closed until that contract is audited;
+`v2/ConfigRequirementsReadResponse.json` contain all 11 required events. Additional
+events are allowed; older releases or releases missing a required capability fail closed;
 if plugin installation cannot complete, setup attempts a lost-update-safe rollback of
 legacy profile edits and preserves any concurrent editor save rather than overwriting it.
+Run setup again after updating Codex so the selected release's features and generated
+schema are checked before starting a fresh native Codex session.
 
 Restart Codex after setup. If Codex asks for a trust review, approve only the 11 hooks
 attributed to `abtop@abtop-local`; setup never writes trusted hook hashes itself. A
@@ -169,8 +209,9 @@ trusts and enables all 11 exact hooks. Run
 [Codex Hook Integration](#codex-hook-integration) for its status and privacy limits.
 After replacing or updating the abtop binary, run `abtop --setup-codex` again: the exact
 helper digest is part of the hook identity, so old integration state deliberately becomes
-`Unknown` until the new plugin copy is installed, reviewed, and loaded by a fresh Codex
-session.
+unavailable for hook-refined status until the new plugin copy is installed, reviewed, and
+loaded by a fresh Codex session. An independently exact Herdr terminal may still report
+generic `Working`, `Waiting`, or `Idle` during that interval.
 
 ## Command Reference
 
@@ -197,14 +238,33 @@ The three Codex administration commands are exact singleton invocations. They re
 exit code 0 on success, exit code 1 when setup/uninstall fails or integration status is
 not ready, and exit code 2 for invalid command-line usage.
 
+The repository also includes a fail-closed agent-tui integration harness:
+
+```bash
+scripts/agent-tui-e2e.sh \
+  --suite codexbar \
+  --abtop "$PWD/target/release/abtop"
+```
+
+The deterministic `codexbar` suite uses an empty isolated Codex home, a fixed mixed
+multi-provider response (including a sanitized provider failure), private agent-tui
+state, and a Quota-only abtop configuration. The
+`codex-status` suite additionally requires a healthy, already reviewed hook integration
+and an already trusted Git workspace; it starts two bounded authenticated Codex turns in an
+exact disposable Herdr session and validates `Idle → Exec → Idle` plus Enter-to-focus.
+It never approves hooks or touches Herdr's default session. Controlled artifacts are
+retained with private permissions at the path printed on exit.
+
 Integration status audits the exact bundle and trust/enablement recorded in base
 `$CODEX_HOME/config.toml`; it is not an attestation of a live thread's in-memory hook
 engine. Profiles, command-line or per-thread overrides, project/config-lock layers,
-managed/cloud policy, and live reload can differ. Codex 0.146.0 exposes no
+managed/cloud policy, and live reload can differ. Supported Codex releases expose no
 thread/PID/generation-bound proof of the effective hook engine, so a healthy setup or
-status result is installation readiness only: every live Codex `Think`, `Exec`, and
-`Idle` candidate remains non-actionable `Unknown`. Only the independently validated
-process-exit transition described below can promote to heuristic `Done`.
+status result is installation readiness only. Exact supported lifecycle shapes may
+display non-actionable heuristic `Think`, `Exec`, or `Idle`, but do not authorize PID
+actions. Herdr terminal evidence is independently correlated and does not upgrade the
+plugin audit. Only the validated process-exit transition described below reports
+heuristic `Done`.
 
 ## Codex Hook Integration
 
@@ -220,9 +280,9 @@ $CODEX_HOME/abtop/marketplace/
     └── scripts/abtop-codex-hook.{sh,cmd}
 ```
 
-Before committing the integration, setup requires exactly `codex-cli` 0.146.0,
-exact `hooks stable true` and `plugins stable true` feature rows, and an exact match for
-the supported 11-event contract in
+Before committing the integration, setup requires stable `codex-cli` 0.145.0 or newer,
+exact `hooks stable true` and `plugins stable true` feature rows, and all events from
+the required 11-event contract in
 `v2/ConfigRequirementsReadResponse.json`'s uppercase
 `ManagedHooksRequirements.properties`. It then registers the marketplace and plugin by
 invoking the exact lexical `codex` entry selected from `PATH` whose execution proved that
@@ -258,8 +318,8 @@ reader channels and a kill-on-close Job Object when assignment succeeds, with di
 child termination as a fallback. Mutating plugin commands are bracketed by checks of
 the exact selected Codex executable identity and fail if it changes.
 
-The plugin subscribes, without matchers, to the exact 11-event set validated for Codex
-0.146.0:
+The plugin subscribes, without matchers, to the same 11-event set validated for every
+supported Codex release:
 
 | Session and turn | Tools and interaction | Subagents and compaction |
 | ---------------- | --------------------- | ------------------------ |
@@ -269,14 +329,18 @@ Each hook is synchronous, silent, and limited to one second, so it can delay the
 corresponding Codex edge by at most that configured timeout. The helper parses at most
 4 MiB as a stream, materializes only bounded lifecycle fields, discards every other JSON
 value, and attempts to drain malformed input. The launcher and helper absorb all errors
-and produce no stdout or stderr. Monitoring therefore fails open for Codex itself: an
-unavailable or outdated abtop reduces monitoring confidence but cannot deny or alter the
-agent action after the bounded hook returns.
+and produce no stdout or stderr. After its bounded dispatch attempt, the launcher always
+exits with code zero regardless of helper success, failure, or absence. Monitoring
+therefore fails open for Codex itself: an unavailable or outdated abtop reduces
+monitoring confidence but cannot deny or alter the agent action.
 
-Setup does not add `PostToolUseFailure`, because Codex 0.146.0 does not advertise that
-event for plugins. It also leaves existing user hooks, `notify`, OpenTelemetry, and
+Setup does not add `PostToolUseFailure`; additional events advertised by newer Codex
+releases do not expand abtop's installed hook set automatically. Setup also leaves existing user hooks, `notify`, OpenTelemetry, and
 other plugins unchanged. Do not bypass hook trust globally. After setup, restart plain
-native Codex and review only the 11 hooks shown for `abtop@abtop-local`.
+native Codex and review only the 11 hooks shown for `abtop@abtop-local`. Only sessions
+started after that restart use the currently installed and reviewed helper identity;
+older live sessions retain untrusted integration state and cannot supply hook-refined
+status.
 
 No shell integration is installed. Setup removes only the exact legacy blocks delimited
 by `# >>> abtop managed codex >>>` and `# <<< abtop managed codex <<<`; missing blocks
@@ -319,13 +383,14 @@ scheduled for removal in 0.7. New scripts and documentation must always invoke
 
 The numbered panels can be toggled with `1`–`7`; their visibility is persisted.
 For orientation, press `?` for help, `/` to filter sessions, `c` for configuration,
-`Enter` to jump to an actionable terminal, and `x` twice to confirm a session kill. See
+`Enter` to jump through exact Herdr session identity or actionable PID ownership, and
+`x` twice to confirm a session kill. See
 [Key Bindings](#key-bindings) for the complete controls.
 
 | Panel | Contents |
 | ----- | -------- |
 | **1 Context** | Token-rate history and per-session context-window gauges when reliable window data exists. |
-| **2 Quota** | Account-level Claude and Codex quota windows and reset times. Other providers do not expose a reliable local quota source. |
+| **2 Quota** | Account-level quota windows and reset times from native Claude/Codex sources plus every provider enabled through the optional CodexBar integration. |
 | **3 Tokens** | Input, output, cache, turn, and selected-session token history. |
 | **4 Projects** | Project branch and dirty-file counts collected through `git`. |
 | **5 Ports** | Agent child listeners, conflicts, and ports orphaned after their parent session exits. |
@@ -349,13 +414,14 @@ navigation.
 
 ### Terminal Jump
 
-Press `Enter` to focus the terminal running an actionable selected agent. abtop supports
+Press `Enter` to focus the selected agent terminal. abtop supports
 Herdr 0.7.0 or newer, cmux, tmux, and iTerm2 on macOS. When abtop runs inside
 Herdr, it can jump to agents in any pane, tab, or workspace in the same Herdr
 session; no additional setup is required. Unsupported environments do nothing. iTerm2
-can request macOS Automation permission on first use. Before jumping, abtop freshly
-revalidates the provider process and its exact process incarnation; `Unknown`, `Done`,
-and otherwise non-actionable rows cannot be targeted.
+can request macOS Automation permission on first use. Herdr first matches one exact
+native provider/session reference, so an exact row can be focused even when its
+lifecycle status is `Unknown` or `Done`. When no exact reference exists, all backends
+retain the existing actionable PID and fresh process-incarnation requirements.
 
 ```bash
 tmux new -s work
@@ -379,9 +445,9 @@ unavailable. Provider-specific caveats and evidence authorities are explained in
 | Session discovery | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Token tracking | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Context window % | ✅ | ✅ | ⚠ estimated | ⚠ local data | ⚠ local config |
-| Status detection | ⚠ mixed evidence | ⚠ exact exit only | ⚠ limited | ✅ | ⚠ mixed evidence |
-| Current task | ✅ | ❌ live unavailable | ⚠ generic | ✅ | ✅ |
-| Account quota | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Status detection | ⚠ mixed evidence | ⚠ conservative heuristics | ⚠ limited | ✅ | ⚠ mixed evidence |
+| Current task | ✅ | ⚠ generic/refined | ⚠ generic | ✅ | ✅ |
+| Account quota | ✅ | ✅ | ❌ | ⚠ CodexBar | ⚠ CodexBar |
 | Git status | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Children / ports | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Subagents | ✅ | ✅ | ❌ | ✅ | ✅ |
@@ -396,6 +462,7 @@ it. UI labels and their JSON enum values are:
 | -- | ---- | ------- |
 | `◉ Think` | `Thinking` | A model turn is open and no tool is currently running. |
 | `● Exec` | `Executing` | A tool, task, subagent, background terminal, or verified active child is working. |
+| `◐ Work` | `Working` | Exact terminal evidence proves activity, but its kind cannot be classified safely. |
 | `◌ Wait` | `Waiting` | An explicit unresolved approval or question requires user action. It wins over concurrent background work. |
 | `○ Idle` | `Idle` | The live session has no active model, tool, task, or interaction work. |
 | `? Unknown` | `Unknown` | Ownership or lifecycle proof is missing, stale, malformed, disconnected, contradictory, or otherwise insufficient. |
@@ -404,16 +471,17 @@ it. UI labels and their JSON enum values are:
 | `✓ Done` | `Done` | A verified process exit has been observed. |
 
 After ownership and lifecycle validation, precedence is `Waiting` > `RateLimited` >
-`Error` > `Executing` > `Thinking` > `Idle`. abtop never turns elapsed time, low CPU, or
-an old transcript timestamp into `Wait`. `Unknown` is the fail-closed result when that
-precedence cannot be applied safely; `Done` is terminal exit evidence.
+`Error` > `Executing` > `Thinking` > `Working` > `Idle`. `Working` is used only when
+exact activity cannot be refined to `Thinking` or `Executing`. abtop never turns elapsed
+time, low CPU, or an old transcript timestamp into `Wait`. `Unknown` is the fail-closed
+result when that precedence cannot be applied safely; `Done` is terminal exit evidence.
 
 Each row also carries one of these evidence authorities:
 
 | Authority | Meaning |
 | --------- | ------- |
 | `Provider` | Exact provider lifecycle data. Codex hook evidence is never promoted to this authority. |
-| `Heuristic` | A local-file or process inference that is useful but not provider-authoritative. |
+| `Heuristic` | A local-file, process, or exactly correlated terminal inference that is useful but not provider-authoritative. |
 | `Unavailable` | No sufficiently reliable current source exists. |
 
 The evidence record includes a machine-readable reason, observation and status-since
@@ -428,10 +496,12 @@ detail shows the same line when terminal width permits; `--json` always includes
 complete current fields and latest five content-free samples. Fields ending in `_ms`
 use Unix epoch milliseconds.
 
-Process actions fail closed too. `Unknown` and `Done` rows, `Unavailable` evidence, a
+Process actions fail closed too. `Working`, `Unknown`, and `Done` rows, `Unavailable` evidence, a
 missing exact process identity, or a failed fresh PID/provider revalidation disables
-both kill and terminal jump. Kimi is stricter: even a non-`Unknown` heuristic row is
-non-actionable; its process actions require `Provider` authority. The first `x` records
+kill and PID-based terminal jump. An exact Herdr native session reference is separate
+focus-only authority and never enables kill. Kimi is stricter for PID actions: even a
+non-`Unknown` heuristic row is non-actionable; its process actions require `Provider`
+authority. The first `x` records
 an exact-session confirmation and a matching second press within two seconds performs
 the kill. A Grok confirmation reports how many logical sessions share the target PID.
 
@@ -442,8 +512,10 @@ a bounded, content-free, non-actionable in-memory tombstone through the exact bo
 even if the source state later disappears. A temporarily unavailable hook-state scan
 may preserve an existing tombstone but cannot create one; a fresh collector that first
 sees an already-gone process, or sees only a reused numeric PID, cannot fabricate
-`Done`. Other providers can disappear immediately after verified exit. Historical
-Codex rollouts never create PID-zero `Done` rows.
+`Done`. Once an exact process scan confirms it is gone, a hook-only generation without
+that observed transition is omitted instead of remaining as a PID-zero `Unknown` row or
+being relabeled `Done`. Other providers can disappear immediately after verified exit.
+Historical Codex rollouts never create PID-zero `Done` rows.
 
 ### Claude Code
 
@@ -455,9 +527,11 @@ would otherwise look idle, fails closed to `Unknown`. Account quota requires the
 [Claude setup](#claude-account-quota) hook.
 
 Quota values older than ten minutes remain visible but are dimmed and omit their reset
-countdown. The panel has one Claude column: if several Claude roots contain quota files,
-the first discovered value is used, with `~/.claude` checked before the environment and
-additional roots.
+countdown. The panel has one Claude provider card: if several Claude roots contain quota
+files, the newest complete valid native sample is used as one account; equally dated or
+undated samples preserve discovery order, with `~/.claude` checked before the environment
+and additional roots. When CodexBar quotas are enabled, fresh native Claude windows retain
+precedence over overlapping CodexBar windows.
 
 ### Codex CLI
 
@@ -467,29 +541,44 @@ edges; rollouts supply session identity, project/model metadata, tokens, context
 summaries, and subagent relationships. Rollout ordering, mtime, token activity, CPU use,
 child activity, and incomplete tool records never establish live status by themselves.
 
-Codex 0.146.0 exposes no thread/PID/generation-bound attestation of the effective hook
+Supported Codex releases expose no thread/PID/generation-bound attestation of the effective hook
 engine after profile, project/config-lock, managed/cloud, command-line, per-thread, and
 live-reload layers are applied. Base trust, enablement, bundle integrity, individual hook
-events, and rollout correlation therefore cannot prove complete live coverage. abtop
-retains the bounded lifecycle candidates for audit and exit correlation, but production
-live Codex rows are always non-actionable `Unknown / Unavailable`; they never promote to
-`Thinking`, `Executing`, or `Idle`.
+events, and rollout correlation therefore cannot prove complete live coverage. Exact,
+supported process/session/hook/rollout shapes may still supply conservative
+`Heuristic` display states, but every live Codex row remains non-actionable.
+
+When Codex runs inside Herdr, abtop can supplement those shapes with Herdr's private
+terminal detector. It accepts only a stable `herdr:codex` session-ID match bracketed
+around `pane process-info`, with the exact native Codex PID and process incarnation.
+Herdr `blocked` reports `Waiting`, Herdr `idle` reports `Idle`, and Herdr `working`
+reports `Thinking` or `Executing` only when exact Codex lifecycle evidence classifies
+the work. Otherwise the same exact, stable activity reports generic
+`Working / Heuristic` with reason `HerdrWorkingUnrefined`. Missing Herdr, failed snapshot
+bracketing, duplicate matches, pane movement, PID reuse, malformed output, and timeouts
+remain `Unknown`; terminal titles and screen content are never ingested.
 
 The independent exit proof still requires exact process-incarnation, session,
 configuration, and event correlation. The matched process-owned root rollout must report
-exact `cli_version = "0.146.0"`, and every discovered descendant rollout must report that
-same version. Missing, different, child-only, or descendant-mismatched version metadata
+a stable `cli_version` of 0.145.0 or newer, and every discovered descendant rollout must
+report that same version. Missing, older, malformed, child-only, or descendant-mismatched version metadata
 cannot seed exit proof. abtop applies this deliberately strict matrix:
 
 | Evidence | Codex status |
 | -------- | ------------ |
 | A previously observed exact live PID/start ↔ supported-version rollout-tree binding, followed by that same process incarnation changing from live to gone | `Done / Heuristic` for 30 seconds |
-| Any otherwise complete lifecycle shape that would suggest root model work, child model work, or turn completion | `Unknown / Unavailable`; effective live hook coverage is unattested |
+| Exact supported root turn with no tool or active child | `Thinking / Heuristic`, non-actionable |
+| Exact supported active direct-child model work with a complete child set | `Executing / Heuristic`, non-actionable |
+| Exact supported stop plus matching rollout completion and a clean tree | `Idle / Heuristic`, non-actionable |
+| Stable Herdr `blocked` or `idle` with exact session/PID/incarnation correlation | `Waiting / Heuristic` or `Idle / Heuristic`, non-actionable |
+| Stable Herdr `working` plus exact root-turn, root-tool, or direct-child evidence | `Thinking / Heuristic` or `Executing / Heuristic`, non-actionable |
+| Stable Herdr `working` with exact session/PID/incarnation correlation but no safe lifecycle refinement | `Working / Heuristic` with `HerdrWorkingUnrefined`, non-actionable |
 | A root `PreToolUse`/open rollout tool, any child with an open tool, `PermissionRequest`, or a `request_user_input` candidate | `Unknown / Unavailable`; Codex may be executing or waiting for approval |
 | Any `SessionStart`, including startup, resume, clear, and compact | Generation evidence only; never sufficient for `Idle` |
 | Rollout `stream_error`/`error`, failed `task_complete`, an unparseable open descriptor, or a nonterminal extra root tree | `Unknown / Unavailable`; invalid rollout lifecycle cannot seed new exit proof |
 | A child `PreToolUse`/open tool or any direct-child active/terminal/provisional mismatch | `Unknown / Unavailable`; incomplete child lifecycle never proves live work or rest |
 | Missing/different root or descendant `cli_version`; delayed, aborted, stale, duplicate, mismatched, or unsupported active/non-direct child lifecycle; missing/out-of-order hooks; uncovered or hosted tools; a relevant process descendant when root inactivity is required; malformed/stale state; configuration drift; or ambiguous ownership | `Unknown / Unavailable` |
+| A hook-only generation whose exact process incarnation is confirmed gone without this collector having observed the required live-to-gone transition | Omitted; never retained as PID-zero `Unknown` and never fabricated as `Done` |
 
 Codex queues startup, resume, and clear `SessionStart` hooks into the next turn,
 immediately before `UserPromptSubmit`; those sources reset to a clean generation. A
@@ -501,11 +590,10 @@ remains `Unknown`.
 `Stop` and `SubagentStop` are provisional candidates: another hook may block a stop, and
 the same root or child can continue in the same turn. Later matching activity reopens
 that actor. A provisional child stop closes only when the exact child rollout later
-reaches `task_complete`; continued child model work remains an internal lifecycle
-candidate only. The public live row stays `Unknown` in every case. Neither
-`SessionStart` nor `Stop` alone proves `Idle`.
+reaches `task_complete`; continued child model work is promoted only from a complete,
+exact direct-child set. Neither `SessionStart` nor `Stop` alone proves `Idle`.
 
-Codex 0.146.0 does not expose enough prompt-display and resolution lifecycle to
+Supported Codex releases do not expose enough prompt-display and resolution lifecycle to
 distinguish approval/question waits safely. Therefore those states are intentionally
 `Unknown`, never guessed as `Wait`, `Exec`, or `Idle`: observing a
 `PermissionRequest` or question candidate does not prove when the displayed interaction
@@ -533,9 +621,11 @@ removing that same marker, closing the fold/delete crash window. Valid commit pr
 survive clean startup, resume, and clear boundaries; a reused fixed fallback basename
 therefore cannot impersonate another invocation. Legacy basename-only proofs fail
 closed. A timeout, crash,
-malformed input, or helper that never starts therefore leaves evidence that poisons
-affected generations to `Unknown` instead of preserving stale work. Fault artifacts are
-bounded. Before generation state can be deleted, the writer persists its first GC-side
+malformed input, or helper that never starts therefore leaves evidence that poisons a
+live affected generation to `Unknown` instead of preserving stale work. Once its exact
+process incarnation is confirmed gone, the collector omits that unproven generation as
+described above. Fault artifacts are bounded. Before generation state can be deleted,
+the writer persists its first GC-side
 confirmation that the exact process incarnation is gone. That maintenance observation
 does not authorize `Done`; it preserves an observation opportunity for the collector.
 Deletion requires a later writer pass strictly more than 30 seconds afterward plus a
@@ -556,16 +646,19 @@ delete failure evidence.
 JSON and detail views make the distinction auditable with content-free reasons such as
 `HookToolOpen`, `HookSubagentActive`, `HookTurnOpen`, `HookTurnComplete`,
 `HookInteractionResolutionUnavailable`, `HookEventGap`, `HookConfigChanged`,
-`HookStateMalformed`, and `HookIntegrationUnverified`. Hook evidence always has
-`connection_generation = 0`.
+`HookStateMalformed`, `HookIntegrationUnverified`, `HerdrScreenBlocked`,
+`HerdrScreenWorking`, `HerdrScreenIdle`, and `HerdrWorkingUnrefined`. Hook and Herdr
+evidence always use `connection_generation = 0`.
 
 The helper binds each hook event to the nearest eligible native Codex ancestor and its
 exact process start identity. Shared daemon hooks, app-server/MCP/Desktop/remote-control
 hosts, PID ambiguity, and session/action ownership ambiguity fail closed. An unknown or
-inactionable row cannot be killed or terminal-jumped. Codex without the plugin remains
-discoverable for rollout metrics but has `Unknown` live status. When plain Codex uses a
-local or remote shared app-server daemon, its hooks run below that shared host instead
-of the client TUI, so abtop cannot bind them to the client PID and deliberately reports
+inactionable row cannot be killed or terminal-jumped. Codex without the abtop plugin
+remains discoverable for rollout metrics; an exactly correlated Herdr terminal can
+still provide `Waiting`, `Idle`, or generic `Working`; only `Thinking` and `Executing`
+require exact current-helper lifecycle refinement. When plain Codex uses a local or
+remote shared app-server daemon, its hooks
+run below that shared host instead of the client TUI, so uncorrelated status remains
 `Unknown`.
 
 Windows uses that unmanaged behavior too: rollout and process metadata remain available,
@@ -635,8 +728,9 @@ For custom Grok or Kimi homes, launch abtop with the same `GROK_HOME` or
 `KIMI_CODE_HOME` environment as the agent. abtop also attempts a platform-specific read
 of candidate process environments, but operating-system permissions can prevent that
 fallback. Grok and Kimi context percentages appear only when their signals or model
-configuration provide a reliable window. The account-quota panel remains limited to
-Claude and Codex.
+configuration provide a reliable window. Their account quota is unavailable from the
+native session collectors, but can appear when each provider is enabled and succeeds
+in the optional CodexBar integration.
 
 ## Themes
 
@@ -676,14 +770,18 @@ abtop uses the platform config directory returned by the operating system:
 | macOS | `~/Library/Application Support/abtop/config.toml` |
 | Windows | `%APPDATA%\abtop\config.toml` |
 
-Configuration is loaded at launch. Theme and panel-visibility changes made in the TUI
-are written back immediately; unrelated and unknown lines are preserved. The `M`
+Configuration is loaded at launch. Theme, panel-visibility, and CodexBar quota
+changes made in the TUI are written back immediately; unrelated and unknown lines are preserved. The `M`
 MCP-session suppression toggle is runtime-only and is not stored.
 
 Supported keys are:
 
 ```toml
 theme = "btop"
+
+# Optional quotas for all providers enabled in CodexBar.
+# The legacy key name is retained for configuration compatibility.
+codexbar_quota_fallback = false
 
 # Hide specific agent CLIs from the TUI (case-insensitive).
 # Supported IDs: claude, codex, opencode, grok, kimi.
@@ -704,9 +802,11 @@ show_sessions = true
 show_mcp = true
 ```
 
-For example, use `hidden_agents = ["codex", "grok"]` to hide those providers or
-`claude_config_dirs = ["~/.claude-personal", "~/.claude-work-team"]` to add profile
-roots.
+For example, use `hidden_agents = ["codex", "grok"]` to hide those session collectors
+or `claude_config_dirs = ["~/.claude-personal", "~/.claude-work-team"]` to add profile
+roots. Account-level quota collection is independent of session visibility, so an
+explicitly enabled CodexBar integration remains active when any corresponding session
+provider is hidden.
 
 Codex hook integration is intentionally separate from this platform config. It lives
 under the active `CODEX_HOME` and is managed with `--setup-codex`,
@@ -717,7 +817,7 @@ under the active `CODEX_HOME` and is managed with `--setup-codex`,
 | Key | Action |
 | --- | ------ |
 | `↑`/`↓`, `k`/`j` | Select the previous or next visible session. |
-| `Enter` | Jump to the selected actionable session terminal after fresh process validation. |
+| `Enter` | Jump by exact Herdr session identity, or by actionable PID after fresh validation. |
 | `/` | Enter session-filter input mode. Type to filter, use `Backspace` to delete, `Enter` to keep the filter and leave input mode, or `Esc` to clear it. |
 | `x` | Request a kill confirmation; press `x` again within two seconds to kill the same freshly validated session/process incarnation. |
 | `X` | Freshly rescan and validate, then kill all processes still owning displayed orphan ports. |
@@ -766,8 +866,9 @@ use abtop::app::App;
 use abtop::{config, theme::Theme};
 
 let cfg = config::load_config();
-let mut app = App::new_with_config_and_claude_dirs(
+let mut app = App::new_with_config_and_claude_dirs_and_codexbar(
     Theme::default(), &cfg.hidden_agents, cfg.panels, &cfg.claude_config_dirs,
+    cfg.codexbar_quota_fallback,
 );
 app.tick_no_summaries();
 let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
@@ -781,8 +882,16 @@ is a reference consumer: a local-first web dashboard built on exactly this API.
 
 abtop collectors read local files and local process/open-file metadata, including the
 Claude, Codex, OpenCode, Grok, and Kimi Code session stores. They need no provider API
-keys and do not send collected records to provider APIs. abtop starts no Codex relay or
-daemon, attaches to no Codex daemon, and uses no provider API or transport credential.
+keys and do not send collected session records to provider APIs. Normal collection
+starts no Codex relay or daemon, attaches to no Codex daemon, and uses no provider API
+or transport credential. The disabled-by-default CodexBar integration is the explicit
+exception: its short-lived, bounded command uses CodexBar's enabled providers and
+automatic sources, which may access existing local, authenticated web, OAuth, or API
+sessions. abtop never reads or stores those credentials. It retains only bounded quota
+windows, provenance, freshness, and fixed sanitized diagnostics—never account identity,
+email, organization, credits, pace summaries, dashboard data, raw errors, or arbitrary
+provider text.
+
 Native Codex can independently choose a shared local or remote app-server daemon; those
 sessions deliberately remain `Unknown`. Codex otherwise continues to run directly with
 the caller's executable, arguments, standard streams, and environment; abtop does not
@@ -802,8 +911,9 @@ PID/start incarnations, lifecycle faults/open sets, and at most 128 content-free
 Codex plugin data directories use mode `0700` and files use mode `0600` on Unix. State
 writes reject symlinks and ownership mismatches, lock updates, and atomically replace a
 same-directory file. Malformed input, event gaps, changed hook/helper identities,
-unsafe paths, stale state, or ambiguous native-process ancestry become sticky `Unknown`
-evidence. The launch marker is created before the helper starts, adopted and enriched
+unsafe paths, stale state, or ambiguous native-process ancestry become sticky failure
+evidence and keep an affected live generation `Unknown` unless exact Herdr evidence
+provides one of its independent states. The launch marker is created before the helper starts, adopted and enriched
 before validation, and removed only after its basename and fresh random 128-bit
 per-adoption commit ID are durably committed by a successful fold. The POSIX launcher
 normally allocates a unique `launch-<shell-pid>-pending.<16-alphanumeric-nonce>` marker;
@@ -823,7 +933,9 @@ The collector separately requires an already observed exact supported live-to-go
 transition and retains a bounded, content-free, non-actionable 30-second in-memory
 tombstone, so proven `Done` survives later source-state disappearance. A collector whose
 first observation is already gone, numeric-PID reuse without exact incarnation
-continuity, or an unavailable scan cannot create that proof. Once its payload is drained,
+continuity, or an unavailable scan cannot create that proof. Once the exact incarnation
+is confirmed gone, an unproven hook-only generation is omitted instead of displayed as
+PID-zero `Unknown`. Once its payload is drained,
 each later ingest can reclaim strictly
 older-than-24-hour temporary files, malformed or abandoned fixed-slot markers, and
 ordinary faults only from a complete validated state snapshot that remains unchanged
@@ -871,7 +983,8 @@ abtop uses the operating system's cache directory:
 | Windows | `%LOCALAPPDATA%\abtop\` |
 
 The directory can contain `summaries.json` and `codex-rate-limits.json`. The latter
-stores only the last locally observed Codex account quota windows and timestamps.
+stores only the last locally observed native Codex account quota windows and timestamps.
+CodexBar values for every provider remain in memory and are never written to this cache.
 Codex hook lifecycle state is kept separately at
 `${CODEX_HOME:-~/.codex}/plugins/data/abtop-abtop-local`; it contains only the bounded
 content-free fields described above.
