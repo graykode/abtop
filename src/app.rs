@@ -149,6 +149,8 @@ pub struct App {
     pub help_open: bool,
     /// View leader overlay (`v`) visibility.
     pub view_open: bool,
+    /// Skip optional Kimi quota refreshes when Kimi is hidden.
+    kimi_quota_enabled: bool,
 }
 
 impl App {
@@ -172,6 +174,7 @@ impl App {
         let mut collector =
             MultiCollector::with_hidden_and_claude_config_dirs(hidden_agents, claude_config_dirs);
         collector.set_mcp_suppress(true);
+        let kimi_quota_enabled = !hidden_agents.iter().any(|h| h.eq_ignore_ascii_case("kimi"));
         Self {
             sessions: Vec::new(),
             selected: 0,
@@ -215,6 +218,7 @@ impl App {
             agent_aggregate: AgentAggregate::default(),
             help_open: false,
             view_open: false,
+            kimi_quota_enabled,
         }
     }
 
@@ -495,6 +499,12 @@ impl App {
     /// retry session summaries. Equivalent to [`App::tick_no_summaries`] followed
     /// by [`App::drain_and_retry_summaries`].
     pub fn tick(&mut self) {
+        // Only runs a companion previously installed by the explicit
+        // `abtop --setup` flow. It is non-blocking and omitted from headless
+        // snapshots and hidden Kimi configurations.
+        if self.kimi_quota_enabled {
+            crate::setup::maybe_refresh_kimi_quota();
+        }
         self.tick_no_summaries();
         self.drain_and_retry_summaries();
     }
@@ -1002,6 +1012,7 @@ fn is_supported_agent_command(cmd: &str) -> bool {
     crate::collector::process::cmd_has_binary(cmd, "claude")
         || crate::collector::process::cmd_has_binary(cmd, "codex")
         || crate::collector::process::cmd_has_binary(cmd, "opencode")
+        || crate::collector::process::cmd_has_binary(cmd, "kimi")
 }
 
 fn is_killable_agent_command(cmd: &str) -> bool {
@@ -1097,10 +1108,11 @@ mod tests {
     }
 
     #[test]
-    fn supported_agent_command_accepts_opencode() {
+    fn supported_agent_command_accepts_all_collectors() {
         assert!(is_supported_agent_command("/usr/local/bin/claude"));
         assert!(is_supported_agent_command("codex --resume abc"));
         assert!(is_supported_agent_command("/opt/homebrew/bin/opencode"));
+        assert!(is_supported_agent_command("/usr/local/bin/kimi"));
         assert!(!is_supported_agent_command("node server.js"));
     }
 

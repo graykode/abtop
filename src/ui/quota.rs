@@ -14,7 +14,7 @@ use super::{btop_block_active, fmt_tokens, grad_at, make_gradient, remaining_bar
 const STALE_SECS: u64 = 600;
 
 /// Fixed source order so columns stay stable across runs.
-const SOURCES: &[&str] = &["claude", "codex"];
+const SOURCES: &[&str] = &["claude", "codex", "kimi"];
 
 pub(crate) fn draw_quota_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     draw_quota_panel_active(f, app, area, theme, false);
@@ -45,7 +45,7 @@ pub(crate) fn draw_quota_panel_active(
     let ticks_per_min = 30usize;
     let tokens_per_min: f64 = rates.iter().rev().take(ticks_per_min).sum();
 
-    // Split into side-by-side columns: one per known source (CLAUDE | CODEX).
+    // Split into side-by-side columns: one per known quota source.
     // Columns are always rendered so the panel layout stays stable even when a
     // source has no data yet.
     let num_sources = SOURCES.len() as u16;
@@ -105,11 +105,14 @@ fn draw_source_column(
     theme: &Theme,
 ) {
     let col_w_usize = area.width as usize;
+    let compact = area.width < 11;
     let bar_w = col_w_usize.saturating_sub(10).clamp(2, 8);
 
     let Some(rl) = rl else {
         let hint = if source.eq_ignore_ascii_case("claude") {
             t("quota.abtop_setup")
+        } else if source.eq_ignore_ascii_case("kimi") {
+            t("quota.kimi_setup")
         } else {
             t("quota.run_codex")
         };
@@ -176,27 +179,35 @@ fn draw_source_column(
         };
         let c = grad_at(cpu_grad, used_pct);
         let label_5h = format_window_label(rl.five_hour_window_minutes, t("quota.5h"));
-        let mut s = vec![styled_label(
-            format!(" {}", label_5h).as_str(),
-            theme.graph_text,
-        )];
-        s.extend(remaining_bar(remaining, bar_w, cpu_grad, theme.meter_bg));
-        s.push(Span::styled(
-            format!(" {:>3.0}%", remaining),
-            Style::default().fg(c),
-        ));
-        lines.push(Line::from(s));
-        // Always reserve the row so both columns line up vertically;
-        // when there's nothing meaningful to show (stale source or the
-        // cached reset moment is past), render it blank.
-        lines.push(Line::from(Span::styled(
-            if reset.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", reset)
-            },
-            Style::default().fg(theme.graph_text),
-        )));
+        if compact {
+            lines.push(Line::from(vec![
+                styled_label(format!("{} ", label_5h).as_str(), theme.graph_text),
+                Span::styled(format!("{remaining:.0}%"), Style::default().fg(c)),
+            ]));
+            lines.push(Line::default());
+        } else {
+            let mut s = vec![styled_label(
+                format!(" {}", label_5h).as_str(),
+                theme.graph_text,
+            )];
+            s.extend(remaining_bar(remaining, bar_w, cpu_grad, theme.meter_bg));
+            s.push(Span::styled(
+                format!(" {:>3.0}%", remaining),
+                Style::default().fg(c),
+            ));
+            lines.push(Line::from(s));
+            // Always reserve the row so both columns line up vertically;
+            // when there's nothing meaningful to show (stale source or the
+            // cached reset moment is past), render it blank.
+            lines.push(Line::from(Span::styled(
+                if reset.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", reset)
+                },
+                Style::default().fg(theme.graph_text),
+            )));
+        }
     }
     if let Some(used_pct) = rl.seven_day_pct {
         let remaining = (100.0 - used_pct).clamp(0.0, 100.0);
@@ -208,28 +219,41 @@ fn draw_source_column(
             String::new()
         };
         let c = grad_at(cpu_grad, used_pct);
-        let label_7d = format_window_label(rl.seven_day_window_minutes, t("quota.7d"));
-        let mut s = vec![styled_label(
-            format!(" {}", label_7d).as_str(),
-            theme.graph_text,
-        )];
-        s.extend(remaining_bar(remaining, bar_w, cpu_grad, theme.meter_bg));
-        s.push(Span::styled(
-            format!(" {:>3.0}%", remaining),
-            Style::default().fg(c),
-        ));
-        lines.push(Line::from(s));
-        // Always reserve the row so both columns line up vertically;
-        // when there's nothing meaningful to show (stale source or the
-        // cached reset moment is past), render it blank.
-        lines.push(Line::from(Span::styled(
-            if reset.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", reset)
-            },
-            Style::default().fg(theme.graph_text),
-        )));
+        let fallback = if source.eq_ignore_ascii_case("kimi") {
+            t("quota.plan")
+        } else {
+            t("quota.7d")
+        };
+        let label_7d = format_window_label(rl.seven_day_window_minutes, fallback);
+        if compact {
+            lines.push(Line::from(vec![
+                styled_label(format!("{} ", label_7d).as_str(), theme.graph_text),
+                Span::styled(format!("{remaining:.0}%"), Style::default().fg(c)),
+            ]));
+            lines.push(Line::default());
+        } else {
+            let mut s = vec![styled_label(
+                format!(" {}", label_7d).as_str(),
+                theme.graph_text,
+            )];
+            s.extend(remaining_bar(remaining, bar_w, cpu_grad, theme.meter_bg));
+            s.push(Span::styled(
+                format!(" {:>3.0}%", remaining),
+                Style::default().fg(c),
+            ));
+            lines.push(Line::from(s));
+            // Always reserve the row so both columns line up vertically;
+            // when there's nothing meaningful to show (stale source or the
+            // cached reset moment is past), render it blank.
+            lines.push(Line::from(Span::styled(
+                if reset.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", reset)
+                },
+                Style::default().fg(theme.graph_text),
+            )));
+        }
     }
 
     f.render_widget(Paragraph::new(lines), area);

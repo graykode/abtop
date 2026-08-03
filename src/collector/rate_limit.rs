@@ -2,16 +2,17 @@ use crate::model::RateLimitInfo;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-/// File written by the StatusLine hook: ~/.claude/abtop-rate-limits.json
-const CLAUDE_RATE_FILE: &str = "abtop-rate-limits.json";
+/// Shared filename written by the Claude hook and optional Kimi companion.
+const RATE_LIMIT_FILE: &str = "abtop-rate-limits.json";
 
 /// Cached Codex rate limit: ~/.cache/abtop/codex-rate-limits.json
 const CODEX_CACHE_FILE: &str = "codex-rate-limits.json";
 
+/// Provider-written hook data older than this is no longer reliable.
+const HOOK_STALE_SECS: u64 = 600;
+
 #[derive(Debug, Deserialize)]
 struct RateLimitFile {
-    #[serde(default)]
-    source: String,
     #[serde(default)]
     five_hour: Option<WindowInfo>,
     #[serde(default)]
@@ -30,9 +31,11 @@ struct WindowInfo {
     window_minutes: Option<u64>,
 }
 
-/// Read rate limit info from all known Claude config directories.
-/// Checks the default ~/.claude, CLAUDE_CONFIG_DIR if set, and any
-/// additional directories discovered from running Claude processes.
+/// Read account-level rate limits from local cache files.
+///
+/// Claude data comes from its StatusLine hook. Kimi data comes from the
+/// optional companion installed by `abtop --setup`; this reader never performs
+/// network or credential operations itself.
 pub fn read_rate_limits(extra_dirs: &[PathBuf]) -> Vec<RateLimitInfo> {
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -51,13 +54,41 @@ pub fn read_rate_limits(extra_dirs: &[PathBuf]) -> Vec<RateLimitInfo> {
         if !dir.is_dir() || !seen.insert(dir.clone()) {
             continue;
         }
-        let path = dir.join(CLAUDE_RATE_FILE);
-        if let Some(info) = read_rate_file(&path, "claude") {
+        let path = dir.join(RATE_LIMIT_FILE);
+        if let Some(info) = read_rate_file(&path, "claude", true) {
+            results.push(info);
+        }
+    }
+
+    // Keep the last valid Kimi value visible when a refresh fails. The quota
+    // panel dims cache data older than ten minutes, so users can distinguish a
+    // stale value without losing the last known account state entirely.
+    for dir in kimi_config_dirs() {
+        if !dir.is_dir() || !seen.insert(dir.clone()) {
+            continue;
+        }
+        let path = dir.join(RATE_LIMIT_FILE);
+        if let Some(info) = read_rate_file(&path, "kimi", false) {
             results.push(info);
         }
     }
 
     results
+}
+
+fn kimi_config_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(dir) = std::env::var("KIMI_CODE_HOME") {
+        let path = PathBuf::from(dir);
+        if !path.as_os_str().is_empty() {
+            dirs.push(path);
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".kimi-code"));
+        dirs.push(home.join(".kimi"));
+    }
+    dirs
 }
 
 /// Read cached Codex rate limit (fallback when no live session provides one).
@@ -66,7 +97,7 @@ pub fn read_rate_limits(extra_dirs: &[PathBuf]) -> Vec<RateLimitInfo> {
 /// known value regardless of file age — the UI shows "N m ago" for staleness.
 pub fn read_codex_cache() -> Option<RateLimitInfo> {
     let path = codex_cache_path()?;
-    read_rate_file(&path, "codex")
+    read_rate_file(&path, "codex", false)
 }
 
 /// Write Codex rate limit to cache file (atomic: write temp + rename).
@@ -126,19 +157,38 @@ fn codex_cache_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("abtop").join(CODEX_CACHE_FILE))
 }
 
-fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
+fn read_rate_file(path: &Path, default_source: &str, reject_stale: bool) -> Option<RateLimitInfo> {
     let content = std::fs::read_to_string(path).ok()?;
     let file: RateLimitFile = serde_json::from_str(&content).ok()?;
+
+    if reject_stale
+        && file.updated_at.is_some_and(|updated_at| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            now.saturating_sub(updated_at) > HOOK_STALE_SECS
+        })
+    {
+        return None;
+    }
 
     // Reject if both windows are absent
     if file.five_hour.is_none() && file.seven_day.is_none() {
         return None;
     }
 
-    let source = if file.source.is_empty() {
-        default_source.to_string()
+    // The cache location determines the provider. Do not allow malformed or
+    // hand-edited JSON to impersonate another quota column via `source`.
+    let source = default_source.to_string();
+
+    // Kimi's long window is the account billing/subscription period, not a
+    // fixed seven-day window. Leave it unlengthed unless the companion reports
+    // a concrete duration so the UI can label it as the plan period.
+    let default_long_window = if source.eq_ignore_ascii_case("kimi") {
+        None
     } else {
-        file.source
+        Some(10_080)
     };
 
     Some(RateLimitInfo {
@@ -156,7 +206,63 @@ fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
             .seven_day
             .as_ref()
             .and_then(|w| w.window_minutes)
-            .or(file.seven_day.as_ref().map(|_| 10_080)),
+            .or(file.seven_day.as_ref().and(default_long_window)),
         updated_at: file.updated_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn write_rate_file(path: &Path, updated_at: u64) {
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"source":"claude","five_hour":{{"used_percentage":25.0,"resets_at":0}},"updated_at":{updated_at}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_stale_hook_data() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(RATE_LIMIT_FILE);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        write_rate_file(&path, now.saturating_sub(HOOK_STALE_SECS + 1));
+
+        assert!(read_rate_file(&path, "claude", true).is_none());
+    }
+
+    #[test]
+    fn codex_cache_can_keep_stale_data() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(CODEX_CACHE_FILE);
+        write_rate_file(&path, 1);
+
+        assert!(read_rate_file(&path, "codex", false).is_some());
+    }
+
+    #[test]
+    fn kimi_cache_keeps_stale_data_and_does_not_invent_a_weekly_window() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(RATE_LIMIT_FILE);
+        std::fs::write(
+            &path,
+            r#"{"source":"kimi","five_hour":{"used_percentage":40.0,"resets_at":10,"window_minutes":300},"seven_day":{"used_percentage":32.0,"resets_at":20},"updated_at":1}"#,
+        )
+        .unwrap();
+
+        let info = read_rate_file(&path, "kimi", false).expect("stale Kimi cache is retained");
+        assert_eq!(info.five_hour_pct, Some(40.0));
+        assert_eq!(info.five_hour_window_minutes, Some(300));
+        assert_eq!(info.seven_day_pct, Some(32.0));
+        assert_eq!(info.seven_day_window_minutes, None);
+        assert!(read_rate_file(&path, "kimi", true).is_none());
+    }
 }
