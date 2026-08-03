@@ -20,7 +20,8 @@ English is mandatory for all project-facing work and communication.
 src/
 ├── main.rs                 # Entry, terminal setup, event loop, --setup flag
 ├── app.rs                  # App state, tick logic, key handling, summary generation
-├── setup.rs                # abtop --setup: Claude StatusLine + Kimi usages companion
+├── setup.rs                # Claude StatusLine + optional Kimi quota companion
+├── kimi_usages.py          # Explicitly installed Kimi quota helper
 ├── ui/
 │   └── mod.rs              # All panels in single file: header, context, quota,
 │                           # tokens, projects, ports, sessions, footer
@@ -31,7 +32,7 @@ src/
 │   ├── opencode.rs         # OpenCode: session discovery via ps + SQLite DB parsing
 │   ├── kimi.rs             # Kimi Code: ps+cwd → sessions/wire.jsonl
 │   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
-│   └── rate_limit.rs       # Local rate-limit file reads (Claude/Kimi hook JSON)
+│   └── rate_limit.rs       # Local Claude/Kimi quota file reads + Codex cache
 └── model/
     ├── mod.rs              # Re-exports
     └── session.rs          # AgentSession, SessionStatus, RateLimitInfo,
@@ -77,7 +78,7 @@ Panel rendering priority (top to bottom):
 
 Panel descriptions:
 - **¹context**: Left = token rate braille sparkline (200-point history). Right = per-session context % bars with yellow/red warning.
-- **²quota**: Claude + Codex rate limit gauges side-by-side (5h and 7d windows with reset countdown). Quota is intentionally limited to Claude and Codex; do not add an OpenCode row unless OpenCode exposes a reliable account-level provider rate-limit source.
+- **²quota**: Claude + Codex + Kimi rate limit gauges side-by-side. Kimi's long window is the account plan period rather than a fixed seven-day window. Do not add an OpenCode row unless OpenCode exposes a reliable account-level provider rate-limit source.
 - **³tokens**: Total token breakdown (in/out/cache) + per-turn sparkline for selected session.
 - **projects** (always visible): Per-project git branch + added/modified file counts.
 - **⁴ports**: Agent-spawned open ports + orphan ports (from dead sessions). Conflict detection.
@@ -85,7 +86,7 @@ Panel descriptions:
 
 ## Data Sources
 
-All read-only from local filesystem + `ps` + `lsof`. No API calls, no auth.
+Session monitoring is read-only from the local filesystem plus `ps` and `lsof`. The explicitly installed Kimi quota companion is the only provider-API/auth exception.
 
 ### 1. Claude Code session discovery: process + config-root mapping
 
@@ -172,13 +173,21 @@ Rate limits extracted from `token_count` events:
 - Discover running `opencode` processes via shared `ps` data.
 - Read recent sessions from OpenCode's SQLite DB through `sqlite3 -readonly -json`.
 - Match live PIDs to DB sessions by process cwd. OpenCode does not expose a PID/session mapping, so when multiple DB rows share one cwd, only live PIDs should be assigned and older rows should not be shown as live duplicates.
-- OpenCode contributes session/token/project/port data, but not quota data. Quota remains Claude + Codex only.
+- OpenCode contributes session/token/project/port data, but not quota data.
 
-### 5. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
+### 5. Kimi Code sessions: `~/.kimi-code/sessions/`
+- Discover running `kimi` processes via shared `ps` data.
+- Resolve PID → cwd locally (`/proc` on Linux, `sysinfo` on Windows, cached `lsof` on macOS).
+- Map cwd to Kimi workspaces and select the newest matching live session directories.
+- Parse `agents/main/wire.jsonl` incrementally for tokens, model, context, and current tools.
+- `KIMI_CODE_HOME` overrides the default `~/.kimi-code` data root.
+- Kimi contributes session/token/project/port data. Account quota comes only from the optional companion described below.
+
+### 6. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
 - `agent-{hash}.jsonl` — same JSONL format as main transcript
 - `agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
 
-### 6. Process tree: `ps` + `lsof`
+### 7. Process tree: `ps` + `lsof`
 ```bash
 ps -eo pid,ppid,rss,%cpu,command    # All processes
 lsof -i -P -n -sTCP:LISTEN         # Open ports
@@ -186,48 +195,39 @@ lsof -i -P -n -sTCP:LISTEN         # Open ports
 - Build parent→children map from ppid
 - Map listening PID → parent agent PID → session
 
-### 7. Git status per project
+### 8. Git status per project
 ```bash
 git -C {cwd} status --porcelain     # added/modified file counts
 ```
 
-### 8. Memory status
+### 9. Memory status
 - Path: `~/.claude/projects/{encoded-path}/memory/`
 - Count files in directory + lines in `MEMORY.md`
 
-### 9. Rate limit (account quota)
+### 10. Rate limits (account quota)
 
-abtop **never** calls provider APIs for quota. It only reads local JSON files
-written by companion hooks/scripts (`abtop --setup`).
+Quota is account-level and is not present in session transcript JSONL.
 
-**Claude Code** — StatusLine mechanism:
-- Installs `~/.claude/abtop-statusline.sh` and registers it in `~/.claude/settings.json`
-- Writes `~/.claude/abtop-rate-limits.json` on each Claude response
+**Claude Code** uses its StatusLine mechanism. `abtop --setup` creates `~/.claude/abtop-statusline.sh`, registers it in `~/.claude/settings.json`, and the hook writes `~/.claude/abtop-rate-limits.json` after Claude responses.
 
-**Kimi Code** — companion script (no StatusLine equivalent):
-- Auto-installs `~/.kimi-code/abtop-usages.sh` when credentials exist
-- Cold start (file missing or ≥10 min old): run companion once with ≤5s wait so first quota paint is filled
-- Warm refresh: background spawn (~2 min throttle) when file is merely stale
-- Script does OAuth + `api.kimi.com/coding/v1/usages`; writes `~/.kimi-code/abtop-rate-limits.json`
-- Out of the box after `kimi login` — no cron / manual `--setup` required (setup still works)
+**Kimi Code** has no reliable local account-quota file. `abtop --setup` explicitly installs `~/.kimi-code/abtop-usages.sh` (or under `KIMI_CODE_HOME`). While the full TUI runs, abtop may execute that already-installed companion in the background at most once every two minutes. The companion uses the existing `kimi login` OAuth credentials, refreshes them when necessary, calls `https://api.kimi.com/coding/v1/usages`, and atomically writes `abtop-rate-limits.json`. It requires `python3`. The TUI never auto-installs the helper, never blocks on refresh, reaps every helper process, and never invokes it from `--once`, `--json`, or when Kimi is hidden.
 
-**Codex** — still extracted from local rollout JSONL `token_count` events (no setup).
+**Codex** quota comes from local `token_count` events and is cached under `~/.cache/abtop/`.
 
-Shared file format read by abtop:
+File format read by abtop:
 ```json
 {
   "source": "claude",
-  "five_hour": { "used_percentage": 35.0, "resets_at": 1774715000, "window_minutes": 300 },
+  "five_hour": { "used_percentage": 35.0, "resets_at": 1774715000 },
   "seven_day": { "used_percentage": 12.0, "resets_at": 1775320000 },
   "updated_at": 1774714400
 }
 ```
-- UI dims stale data (> 10 minutes old).
-- Account-level metric, shared across all sessions of that agent.
+- Claude hook data older than ten minutes is rejected. Kimi's last valid cache remains visible but is dimmed after ten minutes so transient refresh failures do not erase the gauge.
+- Account-level metrics are shared across all sessions of that provider.
 - Show "—" when not configured or data unavailable.
-- OpenCode: no quota row (no reliable local account-level source).
 
-### 10. Other files
+### 11. Other files
 - `~/.claude/stats-cache.json` — daily aggregates. Only updated on `/stats`, NOT real-time.
 - `~/.claude/history.jsonl` — prompt history with sessionId.
 
@@ -400,13 +400,9 @@ abtop reads transcripts, prompts, tool inputs, and memory files. These may conta
 - **`--once` output**: redact file contents from tool_use inputs. Show tool name + file path only, not content.
 - **TUI mode**: show tool name + first arg (file path), never show file contents or prompt text in session list.
 - **Session discovery is local-only**: filesystem + `ps` / `lsof`. No abtop-owned API keys.
-- **Network exceptions** (optional local helpers; abtop still never uploads transcripts):
-  - Summary generation shells out to `claude --print` (may use the user's Claude API).
-  - Kimi account quota: when Kimi is not hidden and `~/.kimi-code/credentials/kimi-code.json`
-    exists, the TUI may run `~/.kimi-code/abtop-usages.sh`, which calls Moonshot OAuth/usages
-    APIs using the user's existing Kimi login and writes only usage percentages to
-    `abtop-rate-limits.json`. Disable with `hidden_agents = ["kimi"]` or by not logging in.
-    Requires `python3` on PATH for the companion script.
+- **Network exceptions**:
+  - Summary generation calls `claude --print` locally; Claude may use its API.
+  - After explicit `abtop --setup`, the Kimi quota companion uses the existing Kimi OAuth login and sends only an authenticated quota request to Kimi. It never receives transcript or prompt content from abtop.
 
 ## Gotchas
 
@@ -424,7 +420,7 @@ abtop reads transcripts, prompts, tool inputs, and memory files. These may conta
 - **Undocumented internals**: all data sources are Claude Code/Codex implementation details, not stable APIs. Schema may change without notice. Defensive parsing with `serde(default)` everywhere.
 - **Terminal size**: minimum 80x24. Panels degrade gracefully when small (context panel hidden first).
 - **PID reuse in port cache**: invalidate cached ports when the set of tracked PIDs changes.
-- **Rate limit staleness**: reject rate limit data older than 10 minutes.
+- **Rate limit staleness**: reject Claude hook data older than 10 minutes; retain and dim stale Kimi cache data.
 - **`/clear` + multi-PID same cwd**: after `/clear`, Claude Code mints a new `sessionId` + `.jsonl` without rewriting `sessions/{PID}.json`. abtop overrides the stale sid by picking the newest transcript in the project dir, but this heuristic can't disambiguate ownership when two live `claude` PIDs share a cwd — so the override is disabled in that case and both sessions keep their original sid until exit. Use separate worktrees if live tracking is needed on both simultaneously.
 - **Kimi multi-PID same cwd**: sessions are matched newest-first per workspace; two live `kimi` PIDs in one cwd claim the two newest session dirs. Prefer separate workspaces if both must be tracked precisely.
-- **Kimi quota companion**: may refresh OAuth tokens in place under `credentials/kimi-code.json` (same file Kimi CLI uses).
+- **Kimi quota companion**: optional, installed only by `abtop --setup`, and may refresh the same OAuth credentials file used by Kimi Code.

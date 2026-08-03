@@ -17,16 +17,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///    `updatedAt`), claiming one session per live PID when several share a cwd
 /// 4. Parse `agents/main/wire.jsonl` for tokens, model, current tool, etc.
 ///
-/// Account quota is **not** fetched here. Like Claude, abtop only reads a local
-/// file (`~/.kimi-code/abtop-rate-limits.json`). When Kimi credentials exist,
-/// the TUI auto-installs/spawns `abtop-usages.sh` in the background to refresh
-/// that file — network stays out of process. See `setup::maybe_refresh_kimi_quota`.
-///
 /// Config root: `~/.kimi-code` (override with `KIMI_CODE_HOME`).
 pub struct KimiCollector {
     config_root: PathBuf,
     /// Cached workspace id → root path (from workspaces.json).
     workspace_roots: HashMap<String, String>,
+    /// Cached PID → cwd mapping. On macOS this avoids running one `lsof`
+    /// process per Kimi session on every fast tick.
+    process_cwds: HashMap<u32, String>,
     /// Cached wire parse state keyed by session id.
     wire_cache: HashMap<String, WireState>,
     /// Version string from `~/.kimi-code/updates/latest.json` (best-effort).
@@ -94,11 +92,14 @@ struct WorkspaceEntry {
 impl KimiCollector {
     pub fn new() -> Self {
         let config_root = std::env::var("KIMI_CODE_HOME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".kimi-code"));
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".kimi-code"));
         Self {
             config_root,
             workspace_roots: HashMap::new(),
+            process_cwds: HashMap::new(),
             wire_cache: HashMap::new(),
             version: String::new(),
         }
@@ -113,6 +114,7 @@ impl KimiCollector {
 
     fn collect_sessions(&mut self, shared: &SharedProcessData) -> Vec<AgentSession> {
         if !self.config_root.is_dir() {
+            self.process_cwds.clear();
             return vec![];
         }
 
@@ -123,13 +125,16 @@ impl KimiCollector {
 
         let kimi_pids = find_kimi_pids(&shared.process_info);
         if kimi_pids.is_empty() {
+            self.process_cwds.clear();
             return vec![];
         }
+
+        self.refresh_process_cwds(&kimi_pids, shared.slow_tick);
 
         // Group live PIDs by cwd.
         let mut pids_by_cwd: HashMap<String, Vec<u32>> = HashMap::new();
         for pid in kimi_pids {
-            let Some(cwd) = get_process_cwd(pid) else {
+            let Some(cwd) = self.process_cwds.get(&pid).cloned() else {
                 continue;
             };
             if cwd.len() < 2 {
@@ -236,7 +241,7 @@ impl KimiCollector {
                 };
 
                 let current_tasks = if !wire.current_task.is_empty()
-                    && matches!(status, SessionStatus::Executing | SessionStatus::Thinking)
+                    && matches!(status, SessionStatus::Executing)
                 {
                     vec![wire.current_task.clone()]
                 } else if matches!(status, SessionStatus::Waiting) {
@@ -341,6 +346,24 @@ impl KimiCollector {
 
         sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
         sessions
+    }
+
+    fn refresh_process_cwds(&mut self, pids: &[u32], force: bool) {
+        let live: HashSet<u32> = pids.iter().copied().collect();
+        self.process_cwds.retain(|pid, _| live.contains(pid));
+
+        for &pid in pids {
+            if force || !self.process_cwds.contains_key(&pid) {
+                match process::get_process_cwd(pid) {
+                    Some(cwd) => {
+                        self.process_cwds.insert(pid, cwd);
+                    }
+                    None => {
+                        self.process_cwds.remove(&pid);
+                    }
+                }
+            }
+        }
     }
 
     fn parse_wire_incremental(&mut self, session_id: &str, path: &Path) -> WireState {
@@ -453,7 +476,10 @@ fn apply_wire_event(state: &mut WireState, value: &Value) {
                 state.total_cache_read = state.total_cache_read.saturating_add(cache_read);
                 state.total_cache_create = state.total_cache_create.saturating_add(cache_create);
                 state.turn_count = state.turn_count.saturating_add(1);
-                let turn_tokens = input + output + cache_create;
+                let turn_tokens = input
+                    .saturating_add(output)
+                    .saturating_add(cache_read)
+                    .saturating_add(cache_create);
                 state.token_history.push(turn_tokens);
                 if state.token_history.len() > 200 {
                     let drain = state.token_history.len() - 200;
@@ -515,6 +541,7 @@ fn apply_wire_event(state: &mut WireState, value: &Value) {
                     state.pending_tools = state.pending_tools.saturating_sub(1);
                     if state.pending_tools == 0 {
                         state.pending_since_ms = 0;
+                        state.current_task.clear();
                     }
                 }
                 "step.end" => {
@@ -565,6 +592,9 @@ fn format_tool_task(event: &Value) -> String {
             .get("command")
             .and_then(|v| v.as_str())
             .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("")
             .to_string(),
         "Read" | "Write" | "Edit" | "read" | "write" | "edit" => args
             .get("file_path")
@@ -580,7 +610,6 @@ fn format_tool_task(event: &Value) -> String {
             .to_string(),
         "Agent" => args
             .get("description")
-            .or_else(|| args.get("prompt"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
@@ -593,7 +622,9 @@ fn format_tool_task(event: &Value) -> String {
             }
         }
     };
-    let arg = truncate_str(&super::sanitize_terminal_text(&arg), 80);
+    let arg = super::sanitize_terminal_text(&arg);
+    let arg = super::redact_secrets(&arg);
+    let arg = truncate_str(&arg, 40);
     if arg.is_empty() {
         name.to_string()
     } else {
@@ -689,7 +720,7 @@ fn find_workspace_id_by_scan(config_root: &Path, cwd: &str) -> Option<String> {
             for sub in subs.flatten() {
                 let state_path = sub.path().join("state.json");
                 if let Some(state) = read_state_file(&state_path) {
-                    if paths_equal(&state.work_dir, cwd) {
+                    if process::paths_equal(&state.work_dir, cwd) {
                         return Some(wd_id);
                     }
                 }
@@ -740,27 +771,7 @@ fn stub_session(
     let proc = process_info.get(&pid);
     let mem_mb = proc.map(|p| p.rss_kb / 1024).unwrap_or(0);
     let project_name = process::last_path_segment(cwd).unwrap_or("?").to_string();
-    // Build a minimal SharedProcessData-like children walk.
-    let mut children = Vec::new();
-    let mut stack: Vec<u32> = children_map.get(&pid).cloned().unwrap_or_default();
-    let mut visited = HashSet::new();
-    while let Some(cpid) = stack.pop() {
-        if !visited.insert(cpid) {
-            continue;
-        }
-        if let Some(cproc) = process_info.get(&cpid) {
-            let port = ports.get(&cpid).and_then(|v| v.first().copied());
-            children.push(ChildProcess {
-                pid: cpid,
-                command: cproc.command.clone(),
-                mem_kb: cproc.rss_kb,
-                port,
-            });
-        }
-        if let Some(gc) = children_map.get(&cpid) {
-            stack.extend(gc);
-        }
-    }
+    let children = collect_children_from_maps(pid, process_info, children_map, ports);
     AgentSession {
         agent_cli: "kimi",
         pid,
@@ -803,15 +814,29 @@ fn stub_session(
 }
 
 fn collect_children(pid: u32, shared: &SharedProcessData) -> Vec<ChildProcess> {
+    collect_children_from_maps(
+        pid,
+        &shared.process_info,
+        &shared.children_map,
+        &shared.ports,
+    )
+}
+
+fn collect_children_from_maps(
+    pid: u32,
+    process_info: &HashMap<u32, process::ProcInfo>,
+    children_map: &HashMap<u32, Vec<u32>>,
+    ports: &HashMap<u32, Vec<u16>>,
+) -> Vec<ChildProcess> {
     let mut children = Vec::new();
-    let mut stack: Vec<u32> = shared.children_map.get(&pid).cloned().unwrap_or_default();
+    let mut stack: Vec<u32> = children_map.get(&pid).cloned().unwrap_or_default();
     let mut visited = HashSet::new();
     while let Some(cpid) = stack.pop() {
         if !visited.insert(cpid) {
             continue;
         }
-        if let Some(cproc) = shared.process_info.get(&cpid) {
-            let port = shared.ports.get(&cpid).and_then(|v| v.first().copied());
+        if let Some(cproc) = process_info.get(&cpid) {
+            let port = ports.get(&cpid).and_then(|v| v.first().copied());
             children.push(ChildProcess {
                 pid: cpid,
                 command: cproc.command.clone(),
@@ -819,7 +844,7 @@ fn collect_children(pid: u32, shared: &SharedProcessData) -> Vec<ChildProcess> {
                 port,
             });
         }
-        if let Some(gc) = shared.children_map.get(&cpid) {
+        if let Some(gc) = children_map.get(&cpid) {
             stack.extend(gc);
         }
     }
@@ -867,61 +892,6 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-#[cfg(target_os = "windows")]
-fn paths_equal(a: &str, b: &str) -> bool {
-    let norm = |s: &str| {
-        s.replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase()
-    };
-    norm(a) == norm(b)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn paths_equal(a: &str, b: &str) -> bool {
-    a == b
-}
-
-/// Get the current working directory of a process.
-#[cfg(target_os = "linux")]
-fn get_process_cwd(pid: u32) -> Option<String> {
-    fs::read_link(format!("/proc/{}/cwd", pid))
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
-}
-
-#[cfg(target_os = "windows")]
-fn get_process_cwd(pid: u32) -> Option<String> {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let mut sys = System::new();
-    let pid = Pid::from_u32(pid);
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
-        false,
-        ProcessRefreshKind::new().with_cwd(UpdateKind::Always),
-    );
-    sys.process(pid)
-        .and_then(|p| p.cwd())
-        .map(|p| p.to_string_lossy().into_owned())
-}
-
-#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
-fn get_process_cwd(pid: u32) -> Option<String> {
-    use std::process::Command;
-    let output = Command::new("lsof")
-        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .find(|l| l.starts_with('n') && l.len() > 1)
-        .map(|l| l[1..].to_string())
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -965,6 +935,7 @@ mod tests {
         assert_eq!(state.total_output, 50);
         assert_eq!(state.total_cache_read, 1000);
         assert_eq!(state.turn_count, 1);
+        assert_eq!(state.token_history, vec![1150]);
         assert_eq!(state.last_context_tokens, 1100);
         assert_eq!(state.model, "kimi-code/k3");
 
@@ -989,6 +960,31 @@ mod tests {
         });
         apply_wire_event(&mut state, &result);
         assert_eq!(state.pending_tools, 0);
+        assert!(state.current_task.is_empty());
+    }
+
+    #[test]
+    fn tool_task_redacts_secrets_and_uses_only_first_command_line() {
+        let tool = serde_json::json!({
+            "name": "Bash",
+            "args": {"command": "curl -H 'Authorization: Bearer secret-token' example.com\necho leaked"}
+        });
+
+        let task = format_tool_task(&tool);
+        assert!(task.starts_with("Bash curl"));
+        assert!(task.contains("[REDACTED]"));
+        assert!(!task.contains("secret-token"));
+        assert!(!task.contains("echo leaked"));
+    }
+
+    #[test]
+    fn agent_task_never_falls_back_to_prompt_text() {
+        let tool = serde_json::json!({
+            "name": "Agent",
+            "args": {"prompt": "private prompt contents"}
+        });
+
+        assert_eq!(format_tool_task(&tool), "Agent");
     }
 
     #[test]
@@ -1019,6 +1015,7 @@ mod tests {
         let mut collector = KimiCollector {
             config_root: dir.path().to_path_buf(),
             workspace_roots: HashMap::new(),
+            process_cwds: HashMap::new(),
             wire_cache: HashMap::new(),
             version: String::new(),
         };
@@ -1077,5 +1074,78 @@ mod tests {
         .unwrap();
         let map = load_workspace_roots(dir.path());
         assert_eq!(map.get("wd_x").map(String::as_str), Some("/home/u/proj"));
+    }
+
+    #[test]
+    fn collects_live_session_from_local_process_and_wire_state() {
+        let dir = tempdir().unwrap();
+        let cwd = "/tmp/kimi-project";
+        let session_dir = dir
+            .path()
+            .join("sessions")
+            .join("wd_demo")
+            .join("session_live");
+        let agent_dir = session_dir.join("agents").join("main");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            dir.path().join("workspaces.json"),
+            format!(r#"{{"workspaces":{{"wd_demo":{{"root":"{cwd}"}}}}}}"#),
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("state.json"),
+            format!(
+                r#"{{"createdAt":"2026-08-03T00:00:00Z","updatedAt":"2026-08-03T00:00:01Z","title":"Local Kimi session","workDir":"{cwd}"}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            agent_dir.join("wire.jsonl"),
+            concat!(
+                "{\"type\":\"usage.record\",\"model\":\"kimi-code/k3\",\"usage\":{\"inputOther\":10,\"output\":5,\"inputCacheRead\":100,\"inputCacheCreation\":2},\"usageScope\":\"turn\",\"time\":1}\n",
+                "{\"type\":\"context.append_loop_event\",\"event\":{\"type\":\"tool.call\",\"name\":\"Read\",\"args\":{\"file_path\":\"src/main.rs\"}},\"time\":2}\n"
+            ),
+        )
+        .unwrap();
+
+        let pid = 42;
+        let mut collector = KimiCollector {
+            config_root: dir.path().to_path_buf(),
+            workspace_roots: HashMap::new(),
+            process_cwds: HashMap::from([(pid, cwd.to_string())]),
+            wire_cache: HashMap::new(),
+            version: "0.6.0".to_string(),
+        };
+        let shared = SharedProcessData {
+            process_info: HashMap::from([(
+                pid,
+                process::ProcInfo {
+                    pid,
+                    ppid: 1,
+                    rss_kb: 2048,
+                    cpu_pct: 0.0,
+                    command: "/usr/local/bin/kimi".to_string(),
+                },
+            )]),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: false,
+            mcp_server_pids: HashSet::new(),
+            mcp_owned_rollouts: HashSet::new(),
+            mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::new(),
+        };
+
+        let sessions = collector.collect_sessions(&shared);
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.pid, pid);
+        assert_eq!(session.session_id, "session_live");
+        assert_eq!(session.cwd, cwd);
+        assert_eq!(session.model, "kimi-code/k3");
+        assert_eq!(session.status, SessionStatus::Executing);
+        assert_eq!(session.current_tasks, vec!["Read src/main.rs"]);
+        assert_eq!(session.total_tokens(), 117);
+        assert_eq!(session.token_history, vec![117]);
     }
 }

@@ -60,9 +60,10 @@ pub(crate) fn redact_secrets(s: &str) -> String {
     let mut result = s.to_string();
     for pat in PATTERNS {
         while let Some(pos) = result.find(pat) {
-            let end = result[pos..]
+            let secret_start = pos + pat.len();
+            let end = result[secret_start..]
                 .find(char::is_whitespace)
-                .map(|i| pos + i)
+                .map(|i| secret_start + i)
                 .unwrap_or(result.len());
             result.replace_range(pos..end, "[REDACTED]");
         }
@@ -510,6 +511,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn redact_secrets_removes_bearer_token_value() {
+        let redacted = redact_secrets("Authorization: Bearer secret-token next");
+        assert_eq!(redacted, "Authorization: [REDACTED] next");
+    }
+
+    #[test]
+    fn redact_secrets_removes_prefixed_token_value() {
+        let redacted = redact_secrets("token=sk-proj-secret next");
+        assert_eq!(redacted, "token=[REDACTED] next");
+    }
+
+    #[test]
     fn with_hidden_empty_keeps_all_collectors() {
         let mc = MultiCollector::with_hidden(&[]);
         assert_eq!(mc.collectors.len(), 4);
@@ -518,6 +531,12 @@ mod tests {
     #[test]
     fn with_hidden_codex_drops_codex_only() {
         let mc = MultiCollector::with_hidden(&["codex".to_string()]);
+        assert_eq!(mc.collectors.len(), 3);
+    }
+
+    #[test]
+    fn with_hidden_kimi_drops_kimi_only() {
+        let mc = MultiCollector::with_hidden(&["kimi".to_string()]);
         assert_eq!(mc.collectors.len(), 3);
     }
 

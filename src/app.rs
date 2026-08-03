@@ -149,7 +149,7 @@ pub struct App {
     pub help_open: bool,
     /// View leader overlay (`v`) visibility.
     pub view_open: bool,
-    /// When false (`hidden_agents` includes "kimi"), skip the Kimi usages companion.
+    /// Skip optional Kimi quota refreshes when Kimi is hidden.
     kimi_quota_enabled: bool,
 }
 
@@ -498,15 +498,10 @@ impl App {
     /// Full refresh used by the TUI: collect monitored data, then generate and
     /// retry session summaries. Equivalent to [`App::tick_no_summaries`] followed
     /// by [`App::drain_and_retry_summaries`].
-    ///
-    /// Also may refresh Kimi quota via the local companion when credentials
-    /// exist (cold start: short blocking run; warm: background spawn). See
-    /// [`crate::setup::maybe_refresh_kimi_quota`].
     pub fn tick(&mut self) {
-        // Before the local rate-limit read inside tick_no_summaries so a
-        // cold-start write is visible on this same tick. Kept out of
-        // tick_no_summaries so headless consumers never get network-side jobs.
-        // Skipped when `hidden_agents` includes "kimi".
+        // Only runs a companion previously installed by the explicit
+        // `abtop --setup` flow. It is non-blocking and omitted from headless
+        // snapshots and hidden Kimi configurations.
         if self.kimi_quota_enabled {
             crate::setup::maybe_refresh_kimi_quota();
         }
@@ -514,11 +509,12 @@ impl App {
         self.drain_and_retry_summaries();
     }
 
-    /// Refresh all monitored data WITHOUT spawning background jobs.
+    /// Refresh all monitored data WITHOUT spawning background summary jobs.
     ///
-    /// Unlike [`App::tick`], this never shells out to `claude --print` (session
-    /// summaries) and never spawns the Kimi usages companion. Headless consumers
-    /// (e.g. the web snapshot API) call this so they only read local state.
+    /// `tick` additionally calls [`App::drain_and_retry_summaries`], which
+    /// shells out to `claude --print` to generate session titles. Headless
+    /// consumers (e.g. the web snapshot API) call this variant so they never
+    /// spawn subprocesses or consume the user's Claude quota.
     pub fn tick_no_summaries(&mut self) {
         self.collector.set_mcp_suppress(self.mcp_suppress_sessions);
         self.sessions = self.collector.collect();
@@ -553,7 +549,6 @@ impl App {
         if self.rate_limits.is_empty() || self.rate_limit_counter >= 5 {
             self.rate_limit_counter = 0;
             let extra_dirs = self.collector.all_config_dirs();
-            // Local files only (Claude/Kimi hook JSON + Codex cache/live).
             self.rate_limits = read_rate_limits(&extra_dirs);
             // Merge live rate limits from agent collectors (e.g. Codex JSONL parsing)
             self.rate_limits.extend(self.collector.agent_rate_limits());
@@ -1113,10 +1108,11 @@ mod tests {
     }
 
     #[test]
-    fn supported_agent_command_accepts_opencode() {
+    fn supported_agent_command_accepts_all_collectors() {
         assert!(is_supported_agent_command("/usr/local/bin/claude"));
         assert!(is_supported_agent_command("codex --resume abc"));
         assert!(is_supported_agent_command("/opt/homebrew/bin/opencode"));
+        assert!(is_supported_agent_command("/usr/local/bin/kimi"));
         assert!(!is_supported_agent_command("node server.js"));
     }
 

@@ -14,7 +14,7 @@ Sessions are discovered from local process/file state, so multiple active profil
 - Agent spawned a server and forgot to kill it? Orphan port detection.
 - Context window filling up? Per-session % bars with warnings.
 
-Session monitoring is local-only (filesystem + `ps` / `lsof`). abtop does not take its own API keys; Kimi account quota reuses your existing `kimi login` credentials via a local companion script.
+Session monitoring is read-only and local. Optional Kimi quota support is enabled explicitly with `abtop --setup`; its companion reuses the user's existing Kimi login and never reads session content.
 
 ## Install
 
@@ -53,7 +53,7 @@ Pre-built binaries for all platforms are available on the [GitHub Releases](http
 abtop                    # Launch TUI
 abtop --once             # Print snapshot and exit
 abtop --json             # Print one JSON snapshot and exit (for scripts/tools)
-abtop --setup            # Install Claude StatusLine + Kimi usages companions
+abtop --setup            # Install Claude and Kimi quota companions
 abtop --theme dracula    # Launch with a specific theme
 abtop --mouse            # Enable mouse click/scroll navigation
 ```
@@ -82,17 +82,17 @@ tmux new -s work
 | Context Window %  |     ✅      |    ✅     |    ❌    |    ✅     |
 | Status Detection  |     ✅      |    ✅     |    ✅    |    ✅     |
 | Current Task      |     ✅      |    ✅     |    ❌    |    ✅     |
-| Rate Limit        |     ✅      |    ✅     |    ❌    |    ✅     |
+| Rate Limit        |     ✅      |    ✅     |    ❌    |   ✅*    |
 | Git Status        |     ✅      |    ✅     |    ✅    |    ✅     |
 | Children / Ports  |     ✅      |    ✅     |    ✅    |    ✅     |
 | Subagents         |     ✅      |    ❌     |    ❌    |   names*  |
 | Memory Status     |     ✅      |    ❌     |    ❌    |    ❌     |
 
-\*Kimi lists subagent names from session state; per-subagent tokens/status are not polled yet.
+\*Kimi lists subagent names from session state; per-subagent tokens/status are not polled yet. Kimi quota requires `abtop --setup`, `python3`, a working network connection, and an existing `kimi login`.
 
 OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
 
-Kimi Code sessions are discovered from live `kimi` processes and `~/.kimi-code/sessions/**/wire.jsonl` (override root with `KIMI_CODE_HOME`). Account quota reuses your existing `kimi login` file (`credentials/kimi-code.json`): a local companion script (`abtop-usages.sh`, needs `python3`) writes `abtop-rate-limits.json`; the TUI may run that script automatically (brief wait on cold start, then background refresh). Hide Kimi entirely with `hidden_agents = ["kimi"]`.
+Kimi Code sessions are discovered from live `kimi` processes and `~/.kimi-code/sessions/**/wire.jsonl` (override root with `KIMI_CODE_HOME`). Because Kimi does not write account quota locally, `abtop --setup` can explicitly install `~/.kimi-code/abtop-usages.sh`. The TUI then runs that companion in the background every two minutes; it reuses the existing Kimi OAuth login, calls Kimi's usage endpoint, and writes only quota percentages and reset times to `abtop-rate-limits.json`. Headless snapshots never run the companion. Hide Kimi sessions and quota refreshes with `hidden_agents = ["kimi"]`.
 
 ## Themes
 

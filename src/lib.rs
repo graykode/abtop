@@ -100,7 +100,7 @@ pub fn run() -> io::Result<()> {
         return run_update();
     }
 
-    // --setup flag: configure StatusLine hook and exit
+    // --setup flag: configure optional quota companions and exit
     if std::env::args().any(|a| a == "--setup") {
         setup::run_setup();
         return Ok(());

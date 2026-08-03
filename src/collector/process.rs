@@ -395,6 +395,65 @@ pub fn last_path_segment(s: &str) -> Option<&str> {
     segment
 }
 
+/// Compare local filesystem paths using the host platform's path semantics.
+#[cfg(target_os = "windows")]
+pub fn paths_equal(a: &str, b: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    normalize(a) == normalize(b)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn paths_equal(a: &str, b: &str) -> bool {
+    a == b
+}
+
+/// Get the current working directory of a process.
+/// Uses `/proc` on Linux, `sysinfo` on Windows, and `lsof` on other Unix hosts.
+#[cfg(target_os = "linux")]
+pub fn get_process_cwd(pid: u32) -> Option<String> {
+    fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "windows")]
+pub fn get_process_cwd(pid: u32) -> Option<String> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let mut sys = System::new();
+    let pid = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        false,
+        ProcessRefreshKind::new().with_cwd(UpdateKind::Always),
+    );
+    sys.process(pid)
+        .and_then(|p| p.cwd())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+pub fn get_process_cwd(pid: u32) -> Option<String> {
+    // `-a` ANDs the PID and cwd selectors; without it, lsof also returns cwd
+    // entries for unrelated processes.
+    let output = Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| line.starts_with('n') && line.len() > 1)
+        .map(|line| line[1..].to_string())
+}
+
 /// Check if a command string has a given binary name in executable position.
 /// Checks the first two argv tokens only (covers direct invocation and
 /// interpreter-wrapped scripts like `node /path/to/codex ...`).
