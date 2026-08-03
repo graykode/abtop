@@ -2,8 +2,10 @@ use crate::model::RateLimitInfo;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-/// File written by the StatusLine hook: ~/.claude/abtop-rate-limits.json
-const CLAUDE_RATE_FILE: &str = "abtop-rate-limits.json";
+/// Shared filename written by companion hooks for Claude and Kimi.
+/// Claude: `~/.claude/abtop-rate-limits.json` (StatusLine)
+/// Kimi:   `~/.kimi-code/abtop-rate-limits.json` (`abtop --setup` usages script)
+const RATE_LIMIT_FILE: &str = "abtop-rate-limits.json";
 
 /// Cached Codex rate limit: ~/.cache/abtop/codex-rate-limits.json
 const CODEX_CACHE_FILE: &str = "codex-rate-limits.json";
@@ -30,34 +32,66 @@ struct WindowInfo {
     window_minutes: Option<u64>,
 }
 
-/// Read rate limit info from all known Claude config directories.
-/// Checks the default ~/.claude, CLAUDE_CONFIG_DIR if set, and any
-/// additional directories discovered from running Claude processes.
+/// Read account-level rate limits from local hook files only.
+///
+/// - Claude: `~/.claude/abtop-rate-limits.json` (+ CLAUDE_CONFIG_DIR / discovered dirs)
+/// - Kimi:   `~/.kimi-code/abtop-rate-limits.json` (+ KIMI_CODE_HOME)
+///
+/// abtop never contacts provider APIs. Companion scripts write these files:
+/// Claude StatusLine, and for Kimi an auto-spawned `abtop-usages.sh` when
+/// credentials exist (also installable via `abtop --setup`).
 pub fn read_rate_limits(extra_dirs: &[PathBuf]) -> Vec<RateLimitInfo> {
     let mut results = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    // Collect candidate directories: defaults + discovered
-    let mut dirs = Vec::new();
+    // Claude config roots
+    let mut claude_dirs = Vec::new();
     if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".claude"));
+        claude_dirs.push(home.join(".claude"));
     }
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        dirs.push(PathBuf::from(dir));
+        claude_dirs.push(PathBuf::from(dir));
     }
-    dirs.extend_from_slice(extra_dirs);
+    claude_dirs.extend_from_slice(extra_dirs);
 
-    for dir in dirs {
+    for dir in claude_dirs {
         if !dir.is_dir() || !seen.insert(dir.clone()) {
             continue;
         }
-        let path = dir.join(CLAUDE_RATE_FILE);
+        let path = dir.join(RATE_LIMIT_FILE);
         if let Some(info) = read_rate_file(&path, "claude") {
             results.push(info);
         }
     }
 
+    // Kimi Code config root (local file written by abtop-usages.sh)
+    for dir in kimi_config_dirs() {
+        if !dir.is_dir() || !seen.insert(dir.clone()) {
+            continue;
+        }
+        let path = dir.join(RATE_LIMIT_FILE);
+        if let Some(info) = read_rate_file(&path, "kimi") {
+            results.push(info);
+        }
+    }
+
     results
+}
+
+fn kimi_config_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(dir) = std::env::var("KIMI_CODE_HOME") {
+        let p = PathBuf::from(dir);
+        if !p.as_os_str().is_empty() {
+            dirs.push(p);
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".kimi-code"));
+        // Legacy kimi-cli home, if a user points the companion script there.
+        dirs.push(home.join(".kimi"));
+    }
+    dirs
 }
 
 /// Read cached Codex rate limit (fallback when no live session provides one).
@@ -141,6 +175,16 @@ fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
         file.source
     };
 
+    // Default window lengths when the hook omits window_minutes:
+    // Claude/Codex-style 5h + 7d; Kimi short window is also 5h (300 min).
+    let default_short = 300;
+    let default_long = if source.eq_ignore_ascii_case("kimi") {
+        // Kimi's top-level `usage` window is account-period, not fixed 7d.
+        None
+    } else {
+        Some(10_080)
+    };
+
     Some(RateLimitInfo {
         source,
         five_hour_pct: file.five_hour.as_ref().map(|w| w.used_percentage),
@@ -149,14 +193,53 @@ fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
             .five_hour
             .as_ref()
             .and_then(|w| w.window_minutes)
-            .or(file.five_hour.as_ref().map(|_| 300)),
+            .or(file.five_hour.as_ref().map(|_| default_short)),
         seven_day_pct: file.seven_day.as_ref().map(|w| w.used_percentage),
         seven_day_resets_at: file.seven_day.as_ref().map(|w| w.resets_at),
         seven_day_window_minutes: file
             .seven_day
             .as_ref()
             .and_then(|w| w.window_minutes)
-            .or(file.seven_day.as_ref().map(|_| 10_080)),
+            .or(file.seven_day.as_ref().and(default_long)),
         updated_at: file.updated_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn reads_kimi_hook_file_from_kimi_code_home() {
+        let dir = tempdir().unwrap();
+        let kimi_home = dir.path().join(".kimi-code");
+        std::fs::create_dir_all(&kimi_home).unwrap();
+        let path = kimi_home.join(RATE_LIMIT_FILE);
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            r#"{{"source":"kimi","five_hour":{{"used_percentage":34.0,"resets_at":1785746704,"window_minutes":300}},"seven_day":{{"used_percentage":31.0,"resets_at":1786067104}},"updated_at":1785739503}}"#
+        )
+        .unwrap();
+
+        // Temporarily point home-like discovery via KIMI_CODE_HOME.
+        let prev = std::env::var_os("KIMI_CODE_HOME");
+        std::env::set_var("KIMI_CODE_HOME", &kimi_home);
+        let results = read_rate_limits(&[]);
+        match prev {
+            Some(v) => std::env::set_var("KIMI_CODE_HOME", v),
+            None => std::env::remove_var("KIMI_CODE_HOME"),
+        }
+
+        let kimi = results
+            .iter()
+            .find(|r| r.source.eq_ignore_ascii_case("kimi"))
+            .expect("kimi rate limit present");
+        assert!((kimi.five_hour_pct.unwrap() - 34.0).abs() < 0.01);
+        assert_eq!(kimi.five_hour_window_minutes, Some(300));
+        assert!((kimi.seven_day_pct.unwrap() - 31.0).abs() < 0.01);
+        assert!(kimi.seven_day_window_minutes.is_none());
+    }
 }
