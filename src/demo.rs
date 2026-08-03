@@ -1,7 +1,8 @@
 use crate::app::App;
 use crate::model::{
     AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, OrphanPort,
-    RateLimitInfo, SessionStatus, SubAgent, ToolCall,
+    RateLimitInfo, SessionStatus, StatusAuthority, StatusEvidence, StatusObservation, StatusReason,
+    SubAgent, ToolCall,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,33 @@ fn now_secs() -> u64 {
     now_ms() / 1000
 }
 
+fn demo_status_evidence(
+    status: SessionStatus,
+    authority: StatusAuthority,
+    reason: StatusReason,
+    status_since_ms: u64,
+    observed_at_ms: u64,
+) -> StatusEvidence {
+    let mut evidence = StatusEvidence::default();
+    evidence.observe(StatusObservation::new(
+        status,
+        authority,
+        reason,
+        status_since_ms,
+        0,
+    ));
+    if observed_at_ms > status_since_ms {
+        evidence.observe(StatusObservation::new(
+            status,
+            authority,
+            reason,
+            observed_at_ms,
+            0,
+        ));
+    }
+    evidence
+}
+
 pub fn populate_demo(app: &mut App) {
     let now = now_ms();
 
@@ -24,11 +52,19 @@ pub fn populate_demo(app: &mut App) {
         AgentSession {
             agent_cli: "claude",
             pid: 7336,
+            action_process_incarnation: None,
             session_id: "a1b2c3d4-5678-9abc-def0-111111111111".into(),
             cwd: "/Users/demo/webshop".into(),
             project_name: "webshop".into(),
             started_at: now - 2 * 3600 * 1000, // 2h ago
             status: SessionStatus::Executing,
+            status_evidence: demo_status_evidence(
+                SessionStatus::Executing,
+                StatusAuthority::Provider,
+                StatusReason::ProviderExecuting,
+                now - 6_000,
+                now,
+            ),
             model: "claude-opus-4-6".into(),
             effort: String::new(),
             context_percent: 72.0,
@@ -197,6 +233,7 @@ pub fn populate_demo(app: &mut App) {
                 },
             ],
             pending_since_ms: now - 6_000, // 6s ago => bar animates
+            awaiting_input: false,
             thinking_since_ms: 0,
             config_root: "~/.claude".into(),
             file_accesses: vec![
@@ -255,11 +292,19 @@ pub fn populate_demo(app: &mut App) {
         AgentSession {
             agent_cli: "claude",
             pid: 8840,
+            action_process_incarnation: None,
             session_id: "b2c3d4e5-6789-abcd-ef01-222222222222".into(),
             cwd: "/Users/demo/ml-pipeline".into(),
             project_name: "ml-pipeline".into(),
             started_at: now - 47 * 60 * 1000, // 47m ago
             status: SessionStatus::Waiting,
+            status_evidence: demo_status_evidence(
+                SessionStatus::Waiting,
+                StatusAuthority::Provider,
+                StatusReason::ProviderWaitingUserInput,
+                now - 30_000,
+                now,
+            ),
             model: "claude-sonnet-4-6".into(),
             effort: String::new(),
             context_percent: 91.0,
@@ -305,6 +350,7 @@ pub fn populate_demo(app: &mut App) {
             initial_prompt: "Add batch inference endpoint with GPU scheduling".into(),
             tool_calls: vec![],
             pending_since_ms: 0,
+            awaiting_input: true,
             thinking_since_ms: 0,
             config_root: "~/.claude-work".into(),
             file_accesses: vec![],
@@ -312,11 +358,19 @@ pub fn populate_demo(app: &mut App) {
         AgentSession {
             agent_cli: "claude",
             pid: 9102,
+            action_process_incarnation: None,
             session_id: "c3d4e5f6-789a-bcde-f012-333333333333".into(),
             cwd: "/Users/demo/api-server".into(),
             project_name: "api-server".into(),
             started_at: now - 15 * 60 * 1000, // 15m ago
             status: SessionStatus::Executing,
+            status_evidence: demo_status_evidence(
+                SessionStatus::Executing,
+                StatusAuthority::Provider,
+                StatusReason::ProviderExecuting,
+                now - 90_000,
+                now,
+            ),
             model: "claude-haiku-4-5".into(),
             effort: String::new(),
             context_percent: 42.0,
@@ -402,25 +456,31 @@ pub fn populate_demo(app: &mut App) {
                 ToolCall {
                     name: "Bash".into(),
                     arg: "npm run dev".into(),
-                    duration_ms: 1500,
+                    duration_ms: 0,
                 },
             ],
-            pending_since_ms: 0,
-            // Model is generating its next reply - virtual "Thinking" row
-            // animates. 1s offset keeps the bar visibly growing against the
-            // session's 2.8s max tool duration before it caps at 100%.
-            thinking_since_ms: now - 1_000,
+            pending_since_ms: now - 90_000,
+            awaiting_input: false,
+            thinking_since_ms: 0,
             config_root: "~/.claude".into(),
             file_accesses: vec![],
         },
         AgentSession {
             agent_cli: "codex",
             pid: 8901,
+            action_process_incarnation: None,
             session_id: "d4e5f6a7-89ab-cdef-0123-444444444444".into(),
             cwd: "/Users/demo/data-viz".into(),
             project_name: "data-viz".into(),
             started_at: now - 5 * 60 * 1000, // 5m ago
-            status: SessionStatus::Thinking,
+            status: SessionStatus::Unknown,
+            status_evidence: demo_status_evidence(
+                SessionStatus::Unknown,
+                StatusAuthority::Unavailable,
+                StatusReason::OwnershipUnconfirmed,
+                now,
+                now,
+            ),
             model: "gpt-5.4".into(),
             effort: "medium".into(),
             context_percent: 18.0,
@@ -429,7 +489,7 @@ pub fn populate_demo(app: &mut App) {
             total_cache_read: 85_000,
             total_cache_create: 12_000,
             turn_count: 6,
-            current_tasks: vec!["Write src/charts/heatmap.py".into()],
+            current_tasks: vec!["authoritative status unavailable".into()],
             mem_mb: 64,
             version: "0.116.0".into(),
             git_branch: "feat/heatmap".into(),
@@ -463,6 +523,7 @@ pub fn populate_demo(app: &mut App) {
             initial_prompt: "Create interactive heatmap component with D3.js".into(),
             tool_calls: vec![],
             pending_since_ms: 0,
+            awaiting_input: false,
             thinking_since_ms: 0,
             config_root: "~/.codex".into(),
             file_accesses: vec![],
@@ -470,11 +531,19 @@ pub fn populate_demo(app: &mut App) {
         AgentSession {
             agent_cli: "opencode",
             pid: 9500,
+            action_process_incarnation: None,
             session_id: "ses_e5f6a7b8-9abc-def0-1234-555555555555".into(),
             cwd: "/Users/demo/infra".into(),
             project_name: "infra".into(),
             started_at: now - 8 * 60 * 1000, // 8m ago
-            status: SessionStatus::Thinking,
+            status: SessionStatus::Idle,
+            status_evidence: demo_status_evidence(
+                SessionStatus::Idle,
+                StatusAuthority::Heuristic,
+                StatusReason::CollectorInference,
+                now - 60_000,
+                now,
+            ),
             model: "ollama/qwen3:14b".into(),
             effort: String::new(),
             context_percent: 35.0,
@@ -483,7 +552,7 @@ pub fn populate_demo(app: &mut App) {
             total_cache_read: 0,
             total_cache_create: 0,
             turn_count: 9,
-            current_tasks: vec!["thinking...".into()],
+            current_tasks: vec![],
             mem_mb: 156,
             version: "1.4.0".into(),
             git_branch: "main".into(),
@@ -505,6 +574,7 @@ pub fn populate_demo(app: &mut App) {
             initial_prompt: "Refactor Terraform modules for multi-region".into(),
             tool_calls: vec![],
             pending_since_ms: 0,
+            awaiting_input: false,
             thinking_since_ms: 0,
             config_root: "~/.local/share/opencode".into(),
             file_accesses: vec![],
@@ -544,6 +614,7 @@ pub fn populate_demo(app: &mut App) {
             seven_day_resets_at: Some(now_secs() + 5 * 24 * 3600),
             seven_day_window_minutes: Some(10_080),
             updated_at: Some(now_secs() - 10),
+            windows: Vec::new(),
         },
         RateLimitInfo {
             source: "codex".into(),
@@ -554,6 +625,7 @@ pub fn populate_demo(app: &mut App) {
             seven_day_resets_at: Some(now_secs() + 6 * 24 * 3600),
             seven_day_window_minutes: Some(10_080),
             updated_at: Some(now_secs() - 5),
+            windows: Vec::new(),
         },
     ];
 
@@ -584,4 +656,69 @@ pub fn populate_demo(app: &mut App) {
         load1: 1.8,
     });
     app.agent_aggregate = crate::host_info::AgentAggregate::from_sessions(&app.sessions);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn demo_app() -> App {
+        let mut app = App::new_with_config(
+            crate::theme::Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        populate_demo(&mut app);
+        app
+    }
+
+    #[test]
+    fn demo_status_evidence_matches_every_displayed_status() {
+        let app = demo_app();
+
+        for session in &app.sessions {
+            let evidence = &session.status_evidence;
+            let latest = evidence
+                .observations
+                .last()
+                .expect("every demo row has status evidence");
+            assert_eq!(latest.status, session.status, "{}", session.session_id);
+            assert_eq!(latest.authority, evidence.authority);
+            assert_eq!(latest.reason, evidence.reason);
+            assert_eq!(latest.observed_at_ms, evidence.observed_at_ms);
+            assert_eq!(latest.connection_generation, evidence.connection_generation);
+            assert!(evidence.status_since_ms <= evidence.observed_at_ms);
+            assert_eq!(
+                session.awaiting_input,
+                session.status == SessionStatus::Waiting
+            );
+        }
+    }
+
+    #[test]
+    fn demo_codex_obeys_unmanaged_unknown_contract() {
+        let app = demo_app();
+        let codex = app
+            .sessions
+            .iter()
+            .find(|session| session.agent_cli == "codex")
+            .expect("demo includes Codex");
+
+        assert_eq!(codex.status, SessionStatus::Unknown);
+        assert_eq!(
+            codex.status_evidence.authority,
+            StatusAuthority::Unavailable
+        );
+        assert_eq!(
+            codex.status_evidence.reason,
+            StatusReason::OwnershipUnconfirmed
+        );
+        assert!(!codex.awaiting_input);
+        assert_eq!(codex.pending_since_ms, 0);
+        assert_eq!(codex.thinking_since_ms, 0);
+        assert_eq!(
+            codex.current_tasks,
+            vec!["authoritative status unavailable".to_string()]
+        );
+    }
 }

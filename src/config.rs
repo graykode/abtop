@@ -27,26 +27,27 @@ impl Default for PanelVisibility {
 
 pub struct AppConfig {
     pub theme: String,
-    /// Agent CLI names to exclude from the TUI (e.g. ["codex"] to hide Codex).
+    /// Opt-in integration that asks the local CodexBar CLI for quotas from its
+    /// configured providers. The legacy field name is retained for compatibility.
+    pub codexbar_quota_fallback: bool,
+    /// Agent CLI names to exclude from the TUI: claude, codex, opencode, grok,
+    /// or kimi (matched case-insensitively).
     /// Matched case-insensitively against each collector's agent_cli identifier.
     pub hidden_agents: Vec<String>,
     /// Additional Claude config directories to scan for sessions.
     /// Useful for multi-profile setups that use separate CLAUDE_CONFIG_DIR roots.
     pub claude_config_dirs: Vec<PathBuf>,
     pub panels: PanelVisibility,
-    /// UI language override. Empty string means auto-detect from `LANG`.
-    /// Recognized values: "en", "zh" (anything starting with "zh" maps to Simplified Chinese).
-    pub language: String,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme: "btop".to_string(),
+            codexbar_quota_fallback: false,
             hidden_agents: Vec::new(),
             claude_config_dirs: Vec::new(),
             panels: PanelVisibility::default(),
-            language: String::new(),
         }
     }
 }
@@ -96,7 +97,9 @@ fn parse_config_body(content: &str) -> AppConfig {
             let val = val.trim_matches('"').trim_matches('\'');
             match key {
                 "theme" => config.theme = val.to_string(),
-                "language" => config.language = val.to_string(),
+                "codexbar_quota_fallback" => {
+                    config.codexbar_quota_fallback = parse_bool(val).unwrap_or(false)
+                }
                 "show_context" => config.panels.context = parse_bool(val).unwrap_or(true),
                 "show_quota" => config.panels.quota = parse_bool(val).unwrap_or(true),
                 "show_tokens" => config.panels.tokens = parse_bool(val).unwrap_or(true),
@@ -168,6 +171,10 @@ pub fn save_panel_visibility(panels: &PanelVisibility) -> Result<(), String> {
         ("show_sessions", panels.sessions.to_string()),
         ("show_mcp", panels.mcp.to_string()),
     ])
+}
+
+pub fn save_codexbar_quota_fallback(enabled: bool) -> Result<(), String> {
+    write_with_updates(&[("codexbar_quota_fallback", enabled.to_string())])
 }
 
 /// Read the config, replace or append each (key, value) pair, write it back.
@@ -316,12 +323,26 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_language_replaces_existing() {
-        let before = "theme = \"btop\"\nlanguage = \"en\"\n";
-        let updates: Vec<(&str, String)> = vec![("language", "\"zh\"".to_string())];
-        let after = rewrite_kv_lines(before, &updates);
+    fn codexbar_quota_fallback_is_opt_in_and_persistable() {
+        assert!(!parse_config_body("").codexbar_quota_fallback);
+        assert!(parse_config_body("codexbar_quota_fallback = true\n").codexbar_quota_fallback);
+        let rewritten = rewrite_kv_lines(
+            "theme = \"btop\"\n",
+            &[("codexbar_quota_fallback", "true".to_string())],
+        );
+        assert!(rewritten.contains("codexbar_quota_fallback = true"));
+    }
+
+    #[test]
+    fn legacy_language_key_is_ignored_and_preserved_by_other_updates() {
+        let cfg = parse_config_body("theme = \"btop\"\nlanguage = \"zh\"\n");
+        assert_eq!(cfg.theme, "btop");
+
+        let after = rewrite_kv_lines(
+            "theme = \"btop\"\nlanguage = \"zh\"\n",
+            &theme_update("nord"),
+        );
+        assert!(after.contains("theme = \"nord\""));
         assert!(after.contains("language = \"zh\""));
-        assert!(!after.contains("language = \"en\""));
-        assert!(after.contains("theme = \"btop\""));
     }
 }

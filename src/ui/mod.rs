@@ -477,7 +477,11 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
         n += 1;
     }
     if mid_h > 0 {
-        constraints[n] = Constraint::Length(mid_h);
+        constraints[n] = if sessions_h == 0 {
+            Constraint::Min(mid_h)
+        } else {
+            Constraint::Length(mid_h)
+        };
         n += 1;
     }
     if sessions_h > 0 {
@@ -1009,8 +1013,8 @@ mod tests {
 
     #[test]
     fn fmt_age_buckets() {
-        // t() defaults to English when ABTOP_LANG is unset, so the strings
-        // here match the en-US locale values for `time.{s,m,h,d}_ago`.
+        // The centralized catalog is English, so these strings match the
+        // values for `time.{s,m,h,d}_ago`.
         assert_eq!(fmt_age(5), "5s ago");
         assert_eq!(fmt_age(59), "59s ago");
         assert_eq!(fmt_age(60), "1m ago");
@@ -1355,6 +1359,40 @@ mod tests {
                 "desktop should render {label}\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn quota_only_desktop_expands_mid_row_and_pins_footer() {
+        let panels = PanelVisibility {
+            context: false,
+            quota: true,
+            tokens: false,
+            projects: false,
+            ports: false,
+            sessions: false,
+            mcp: false,
+        };
+        let app = App::new_with_config(Theme::default(), &[], panels);
+        let layout = desktop_layout(&app, Rect::new(0, 0, 160, 48));
+
+        assert!(layout.context.is_none());
+        assert!(layout.sessions.is_none());
+        assert_eq!(
+            layout.mid,
+            [(NarrowSection::Quota, Rect::new(0, 1, 160, 46))]
+        );
+        assert_eq!(layout.footer, Rect::new(0, 47, 160, 1));
+    }
+
+    #[test]
+    fn sessions_keep_first_claim_over_the_fixed_mid_row() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        let layout = desktop_layout(&app, Rect::new(0, 0, 160, 40));
+
+        assert_eq!(layout.mid.first().unwrap().1.height, 8);
+        assert!(layout.sessions.unwrap().height >= 8);
+        assert_eq!(layout.footer, Rect::new(0, 39, 160, 1));
     }
 
     fn render_demo(width: u16, height: u16) -> String {

@@ -140,6 +140,7 @@ pub fn run_setup() {
         }
     }
 
-    println!("\n  done! rate limit data will appear in abtop after the next Claude response.");
-    println!("  restart any running Claude Code sessions to activate.");
+    println!("\n  ✓ Claude StatusLine setup complete.");
+    println!("  Rate limit data will appear in abtop after the next Claude response.");
+    println!("  Restart any running Claude Code sessions to activate.");
 }

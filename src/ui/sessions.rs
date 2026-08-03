@@ -133,31 +133,27 @@ pub(crate) fn draw_sessions_panel_active(
         let selected = i == app.selected;
         let marker = if selected { "►" } else { " " };
 
-        let (agent_label, agent_color) = match session.agent_cli {
-            "claude" => ("*CC", Color::Rgb(217, 119, 87)), // #D97757 terracotta
-            "codex" => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
-            "opencode" => ("#OC", Color::Rgb(74, 222, 128)), // #4ADE80 emerald
-            other => {
-                let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
-                (
-                    Box::leak(fallback.into_boxed_str()) as &str,
-                    theme.inactive_fg,
-                )
-            }
-        };
+        let (agent_label, agent_color) = agent_badge(session.agent_cli, theme);
 
         let (status_icon_str, status_color) = match &session.status {
             crate::model::SessionStatus::Thinking => (t("sess.think"), theme.proc_misc),
             crate::model::SessionStatus::Executing => (t("sess.exec"), theme.hi_fg),
+            crate::model::SessionStatus::Working => (t("sess.work"), theme.proc_misc),
             crate::model::SessionStatus::Waiting => (t("sess.wait"), grad_at(&proc_grad, 50.0)),
+            crate::model::SessionStatus::Idle => (t("sess.idle"), theme.inactive_fg),
             crate::model::SessionStatus::Unknown => (t("sess.unknown"), theme.inactive_fg),
             crate::model::SessionStatus::RateLimited => (t("sess.rate"), theme.status_fg),
+            crate::model::SessionStatus::Error => (t("sess.error"), grad_at(&proc_grad, 100.0)),
             crate::model::SessionStatus::Done => (t("sess.done"), theme.inactive_fg),
         };
 
         let is_1m = session.context_window >= 1_000_000 || session.model.contains("[1m]");
         let model_short = shorten_model(&session.model, is_1m);
-        let ctx_color = grad_at(&proc_grad, session.context_percent);
+        let ctx_color = if session.context_window == 0 {
+            theme.inactive_fg
+        } else {
+            grad_at(&proc_grad, session.context_percent)
+        };
 
         let is_done = matches!(session.status, crate::model::SessionStatus::Done);
         let row_style = if selected {
@@ -171,11 +167,7 @@ pub(crate) fn draw_sessions_panel_active(
             Style::default()
         };
 
-        let sid_short = if session.session_id.len() >= 8 {
-            &session.session_id[..8]
-        } else {
-            &session.session_id
-        };
+        let sid_short: String = session.session_id.chars().take(8).collect();
 
         let summary_col = app.session_summary(session);
 
@@ -195,7 +187,7 @@ pub(crate) fn draw_sessions_panel_active(
         )));
         if show_session_id {
             cells.push(Cell::from(Span::styled(
-                truncate_str(sid_short, session_w as usize),
+                truncate_str(&sid_short, session_w as usize),
                 Style::default().fg(theme.session_id),
             )));
         }
@@ -226,7 +218,7 @@ pub(crate) fn draw_sessions_panel_active(
             )));
         }
         cells.push(Cell::from(Span::styled(
-            format!("{:.0}%", session.context_percent),
+            context_percent_label(session),
             Style::default().fg(ctx_color),
         )));
         if show_tokens {
@@ -267,11 +259,7 @@ pub(crate) fn draw_sessions_panel_active(
         let task_cells: Vec<Cell> = (0..total_cols)
             .map(|j| {
                 if j == summary_idx {
-                    let task_text = session
-                        .current_tasks
-                        .last()
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
+                    let task_text = session.display_task().unwrap_or("");
                     Cell::from(Span::styled(
                         task_row_text(task_text, w.saturating_sub(24) as usize),
                         Style::default().fg(theme.graph_text),
@@ -557,7 +545,7 @@ pub(crate) fn draw_sessions_panel_active(
 
         // Always show SESSION header (task) at top, then children/subagents/timeline/file_audit below
         let session_header_h: u16 = {
-            let mut h = 1u16; // SESSION title
+            let mut h = 2u16; // SESSION title + status evidence
             if !session.initial_prompt.is_empty() {
                 h += 1;
             }
@@ -584,11 +572,7 @@ pub(crate) fn draw_sessions_panel_active(
         // SESSION header — always rendered
         {
             let mut lines = Vec::new();
-            let sid_short = if session.session_id.len() >= 8 {
-                &session.session_id[..8]
-            } else {
-                &session.session_id
-            };
+            let sid_short: String = session.session_id.chars().take(8).collect();
             let session_ref = if header_area.width <= 80 {
                 format!("►{} · {}", sid_short, session.project_name)
             } else {
@@ -602,6 +586,13 @@ pub(crate) fn draw_sessions_panel_active(
                 Style::default()
                     .fg(theme.title)
                     .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                truncate_str(
+                    &format!(" {}", status_evidence_text(session)),
+                    header_area.width as usize,
+                ),
+                Style::default().fg(theme.graph_text),
             )));
             if !session.initial_prompt.is_empty() {
                 let max_w = (header_area.width as usize).saturating_sub(9);
@@ -988,6 +979,112 @@ fn task_row_text(task_text: &str, max_width: usize) -> String {
     truncate_str(&format!("└─ {task_text}"), max_width)
 }
 
+fn status_evidence_text(session: &AgentSession) -> String {
+    use crate::model::{SessionStatus, MAX_VISIBLE_STATUS_OBSERVATIONS};
+
+    let evidence = &session.status_evidence;
+    let sample_start = evidence
+        .observations
+        .len()
+        .saturating_sub(MAX_VISIBLE_STATUS_OBSERVATIONS);
+    let samples = evidence.observations[sample_start..]
+        .iter()
+        .map(|sample| match sample.status {
+            SessionStatus::Thinking => "Think",
+            SessionStatus::Executing => "Exec",
+            SessionStatus::Working => "Work",
+            SessionStatus::Waiting => "Wait",
+            SessionStatus::Idle => "Idle",
+            SessionStatus::Unknown => "Unknown",
+            SessionStatus::RateLimited => "Rate",
+            SessionStatus::Error => "Error",
+            SessionStatus::Done => "Done",
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let samples = if samples.is_empty() {
+        "—".to_string()
+    } else {
+        samples
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let age = if evidence.status_since_ms == 0 {
+        String::new()
+    } else {
+        format!(
+            " · {} {}",
+            t("detail.since").as_str(),
+            fmt_compact_age(now_ms.saturating_sub(evidence.status_since_ms))
+        )
+    };
+    let observed = if evidence.observed_at_ms == 0 {
+        "—".to_string()
+    } else {
+        format!(
+            "{} ago",
+            fmt_compact_age(now_ms.saturating_sub(evidence.observed_at_ms))
+        )
+    };
+    let generation = if evidence.connection_generation == 0 {
+        "—".to_string()
+    } else {
+        evidence.connection_generation.to_string()
+    };
+
+    format!(
+        "{} {} · {} · {} {} · {} {} · [{}] · {} {}{}",
+        t("detail.evidence").as_str(),
+        evidence.authority.as_str(),
+        evidence.reason.as_str(),
+        t("detail.observed").as_str(),
+        observed,
+        t("detail.generation").as_str(),
+        generation,
+        samples,
+        evidence.consecutive_matching,
+        t("detail.matching").as_str(),
+        age,
+    )
+}
+
+fn fmt_compact_age(age_ms: u64) -> String {
+    let seconds = age_ms / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+/// Return the three-cell provider badge used by the session table. Unknown
+/// provider IDs are truncated into an owned label instead of leaking one
+/// allocation on every render.
+fn agent_badge(agent_cli: &str, theme: &Theme) -> (String, Color) {
+    match agent_cli {
+        "claude" => ("*CC".into(), Color::Rgb(217, 119, 87)), // terracotta
+        "codex" => (">CD".into(), Color::Rgb(122, 157, 255)), // periwinkle
+        "opencode" => ("#OC".into(), Color::Rgb(74, 222, 128)), // emerald
+        "grok" => ("xGR".into(), theme.title),
+        "kimi" => ("☾KM".into(), Color::Rgb(167, 139, 250)), // violet
+        other => (truncate_str(&other.to_uppercase(), 3), theme.inactive_fg),
+    }
+}
+
+fn context_percent_label(session: &AgentSession) -> String {
+    if session.context_window == 0 {
+        "—".into()
+    } else {
+        format!("{:.0}%", session.context_percent)
+    }
+}
+
 pub(crate) fn shorten_model(model: &str, is_1m: bool) -> String {
     // "claude-opus-4-6" → "opus4.6", "claude-sonnet-4-6" → "sonnet4.6", "claude-haiku-4-5" → "haiku4.5"
     let s = model.strip_prefix("claude-").unwrap_or(model);
@@ -1061,14 +1158,7 @@ fn draw_timeline(
     scroll: usize,
 ) {
     let tool_calls = &session.tool_calls;
-    let is_thinking = session.thinking_since_ms > 0
-        && matches!(
-            session.status,
-            crate::model::SessionStatus::Thinking
-                | crate::model::SessionStatus::Executing
-                | crate::model::SessionStatus::Waiting
-                | crate::model::SessionStatus::Unknown
-        );
+    let is_thinking = timeline_has_live_thinking(session);
     if tool_calls.is_empty() && !is_thinking {
         return;
     }
@@ -1082,18 +1172,17 @@ fn draw_timeline(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    let has_live_tool = timeline_has_live_tool(session);
     let live_duration = |tc: &crate::model::ToolCall| -> u64 {
         if tc.duration_ms > 0 {
             tc.duration_ms
-        } else if session.pending_since_ms > 0 {
+        } else if has_live_tool {
             now_ms.saturating_sub(session.pending_since_ms)
         } else {
             0
         }
     };
-    let is_pending = |tc: &crate::model::ToolCall| -> bool {
-        tc.duration_ms == 0 && session.pending_since_ms > 0
-    };
+    let is_pending = |tc: &crate::model::ToolCall| -> bool { tc.duration_ms == 0 && has_live_tool };
     let thinking_duration = if is_thinking {
         now_ms.saturating_sub(session.thinking_since_ms)
     } else {
@@ -1247,6 +1336,18 @@ fn draw_timeline(
     f.render_widget(Paragraph::new(lines), area);
 }
 
+fn timeline_has_live_thinking(session: &AgentSession) -> bool {
+    session.thinking_since_ms > 0
+        && matches!(
+            session.status,
+            crate::model::SessionStatus::Thinking | crate::model::SessionStatus::Executing
+        )
+}
+
+fn timeline_has_live_tool(session: &AgentSession) -> bool {
+    session.pending_since_ms > 0 && matches!(session.status, crate::model::SessionStatus::Executing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1254,6 +1355,29 @@ mod tests {
     use crate::model::SessionStatus;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn grok_and_kimi_badges_are_three_cells_wide() {
+        let theme = Theme::default();
+        let (grok, _) = agent_badge("grok", &theme);
+        let (kimi, _) = agent_badge("kimi", &theme);
+
+        assert_eq!(grok, "xGR");
+        assert_eq!(kimi, "☾KM");
+        assert_eq!(UnicodeWidthStr::width(grok.as_str()), 3);
+        assert_eq!(UnicodeWidthStr::width(kimi.as_str()), 3);
+    }
+
+    #[test]
+    fn unavailable_context_ignores_stale_percentage() {
+        let mut session = test_session("grok-session", "project");
+        session.agent_cli = "grok";
+        session.context_window = 0;
+        session.context_percent = 91.0;
+
+        assert_eq!(context_percent_label(&session), "—");
+    }
 
     #[test]
     fn codex_exec_command_uses_bash_color() {
@@ -1272,16 +1396,177 @@ mod tests {
     }
 
     #[test]
+    fn idle_and_waiting_rows_render_distinct_status_and_task_labels() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut idle = test_session("idle1111", "idle-project");
+        idle.status = SessionStatus::Idle;
+        idle.current_tasks = vec!["Edit stale-idle.rs".into()];
+        let mut waiting = test_session("wait2222", "wait-project");
+        waiting.awaiting_input = true;
+        waiting.current_tasks = vec!["Edit stale.rs".into()];
+        app.sessions = vec![idle, waiting];
+
+        let backend = TestBackend::new(120, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_sessions_panel(
+                    f,
+                    &app,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 120,
+                        height: 16,
+                    },
+                    &app.theme,
+                )
+            })
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains(&t("sess.idle")),
+            "idle status missing\n{text}"
+        );
+        assert!(
+            text.contains(&t("sess.wait")),
+            "wait status missing\n{text}"
+        );
+        assert!(text.contains("└─ idle"), "idle task missing\n{text}");
+        assert!(
+            text.contains("└─ waiting for user inp"),
+            "actionable wait task missing\n{text}"
+        );
+        assert!(
+            !text.contains("Edit stale-idle.rs"),
+            "stale idle task leaked\n{text}"
+        );
+        assert!(!text.contains("Edit stale.rs"), "stale task leaked\n{text}");
+    }
+
+    #[test]
+    fn working_row_renders_generic_status_and_task_labels() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut session = test_session("work1111", "work-project");
+        session.status = SessionStatus::Working;
+        session.current_tasks = vec!["Edit stale-working.rs".into()];
+        app.sessions = vec![session];
+
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_sessions_panel(
+                    f,
+                    &app,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 120,
+                        height: 12,
+                    },
+                    &app.theme,
+                )
+            })
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(
+            text.contains(&t("sess.work")),
+            "work status missing\n{text}"
+        );
+        assert!(text.contains("└─ working"), "work task missing\n{text}");
+        assert!(
+            !text.contains("Edit stale-working.rs"),
+            "stale work task leaked\n{text}"
+        );
+    }
+
+    #[test]
+    fn timeline_animates_only_active_statuses() {
+        let mut session = test_session("timeline", "project");
+        session.pending_since_ms = 10;
+        session.thinking_since_ms = 10;
+
+        for status in [
+            SessionStatus::Working,
+            SessionStatus::Waiting,
+            SessionStatus::Idle,
+            SessionStatus::Unknown,
+            SessionStatus::RateLimited,
+            SessionStatus::Error,
+            SessionStatus::Done,
+        ] {
+            session.status = status;
+            assert!(!timeline_has_live_thinking(&session));
+            assert!(!timeline_has_live_tool(&session));
+        }
+
+        session.status = SessionStatus::Thinking;
+        assert!(timeline_has_live_thinking(&session));
+        assert!(!timeline_has_live_tool(&session));
+
+        session.status = SessionStatus::Executing;
+        assert!(timeline_has_live_thinking(&session));
+        assert!(timeline_has_live_tool(&session));
+    }
+
+    #[test]
+    fn status_evidence_detail_shows_the_latest_five_samples() {
+        use crate::model::{StatusAuthority, StatusObservation, StatusReason};
+
+        let mut session = test_session("evidence", "project");
+        session.status = SessionStatus::Idle;
+        for observed_at_ms in 1..=7 {
+            session.status_evidence.observe(StatusObservation::new(
+                SessionStatus::Idle,
+                StatusAuthority::Provider,
+                StatusReason::ProviderIdle,
+                observed_at_ms,
+                2,
+            ));
+        }
+
+        let text = status_evidence_text(&session);
+        assert!(text.contains("EVIDENCE provider"), "{text}");
+        assert!(text.contains("provider idle"), "{text}");
+        assert!(text.contains("observed"), "{text}");
+        assert!(text.contains("generation 2"), "{text}");
+        assert!(text.contains("[Idle Idle Idle Idle Idle]"), "{text}");
+        assert!(text.contains("7 matching"), "{text}");
+    }
+
+    #[test]
+    fn working_status_uses_generic_history_name() {
+        use crate::model::{StatusAuthority, StatusObservation, StatusReason};
+
+        let mut session = test_session("working", "project");
+        session.status = SessionStatus::Working;
+        session.status_evidence.observe(StatusObservation::new(
+            SessionStatus::Working,
+            StatusAuthority::Heuristic,
+            StatusReason::HerdrWorkingUnrefined,
+            1,
+            0,
+        ));
+
+        assert!(status_evidence_text(&session).contains("[Work]"));
+    }
+
+    #[test]
     fn codex_non_1m_context_window_does_not_show_1m_suffix() {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         app.sessions.push(AgentSession {
             agent_cli: "codex",
             pid: 42,
+            action_process_incarnation: None,
             session_id: "codex-session".into(),
             cwd: "/tmp/project".into(),
             project_name: "project".into(),
             started_at: 0,
             status: SessionStatus::Waiting,
+            status_evidence: crate::model::StatusEvidence::default(),
             model: "gpt-5".into(),
             effort: String::new(),
             context_percent: 58.7,
@@ -1309,6 +1594,7 @@ mod tests {
             chat_messages: Vec::new(),
             tool_calls: Vec::new(),
             pending_since_ms: 0,
+            awaiting_input: false,
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: String::new(),
@@ -1429,11 +1715,13 @@ mod tests {
         AgentSession {
             agent_cli: "claude",
             pid: 42,
+            action_process_incarnation: None,
             session_id: session_id.into(),
             cwd: format!("/tmp/{project_name}"),
             project_name: project_name.into(),
             started_at: 0,
             status: SessionStatus::Waiting,
+            status_evidence: crate::model::StatusEvidence::default(),
             model: "claude-opus-4-6".into(),
             effort: String::new(),
             context_percent: 10.0,
@@ -1461,6 +1749,7 @@ mod tests {
             chat_messages: Vec::new(),
             tool_calls: Vec::new(),
             pending_since_ms: 0,
+            awaiting_input: false,
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: "~/.claude".into(),

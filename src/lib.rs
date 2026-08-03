@@ -18,7 +18,8 @@
 //!
 //! Enum wire formats are part of the snapshot contract: variants such as
 //! [`model::SessionStatus`] serialize as their CamelCase names (`"Thinking"`,
-//! `"Executing"`, …) and chat roles serialize as `"user"` / `"assistant"`.
+//! `"Executing"`, `"Working"`, `"Idle"`, …) and chat roles serialize as `"user"` /
+//! `"assistant"`.
 //! These strings are stable and won't be renamed without a major version bump.
 //!
 //! # Threading model
@@ -36,11 +37,12 @@
 //! use abtop::{config, theme::Theme};
 //!
 //! let cfg = config::load_config();
-//! let mut app = App::new_with_config_and_claude_dirs(
+//! let mut app = App::new_with_config_and_claude_dirs_and_codexbar(
 //!     Theme::default(),
 //!     &cfg.hidden_agents,
 //!     cfg.panels,
 //!     &cfg.claude_config_dirs,
+//!     cfg.codexbar_quota_fallback,
 //! );
 //! loop {
 //!     app.tick_no_summaries();                // refresh without spawning `claude --print`
@@ -52,9 +54,12 @@
 //! ```
 
 pub mod app;
+mod codex_compat;
+mod codex_hooks;
 pub mod collector;
 pub mod config;
 pub mod demo;
+mod herdr;
 pub mod host_info;
 pub mod jump;
 pub mod locale;
@@ -67,50 +72,150 @@ pub mod ui;
 use app::{App, JumpOutcome};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    MouseButton, MouseEvent, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, stdout};
 use std::time::Duration;
 
-/// Construct a headless `App` from loaded config + theme. Shared by the
-/// `--json` and `--once` entry points.
-fn build_app(theme: theme::Theme, cfg: &config::AppConfig) -> App {
-    App::new_with_config_and_claude_dirs(
-        theme,
-        &cfg.hidden_agents,
-        cfg.panels,
-        &cfg.claude_config_dirs,
-    )
+// The collector enforces a 15-second process timeout. One-shot modes wait one
+// additional second so they observe the sanitized terminal result instead of
+// racing the worker and serializing a stale `checking` state.
+const CODEXBAR_ONESHOT_WAIT: Duration = Duration::from_secs(16);
+
+/// Construct a headless `App`. Demo mode deliberately ignores user-specific
+/// visibility and discovery settings so its snapshots remain reproducible.
+fn build_app(theme: theme::Theme, cfg: &config::AppConfig, demo_mode: bool) -> App {
+    if demo_mode {
+        App::new_with_config_and_claude_dirs(theme, &[], config::PanelVisibility::default(), &[])
+    } else {
+        App::new_with_config_and_claude_dirs_and_codexbar(
+            theme,
+            &cfg.hidden_agents,
+            cfg.panels,
+            &cfg.claude_config_dirs,
+            cfg.codexbar_quota_fallback,
+        )
+    }
 }
 
 pub fn run() -> io::Result<()> {
+    let raw_args = std::env::args_os().skip(1).collect::<Vec<_>>();
+
+    // Hook launchers must never print, block the provider on an error, or
+    // enter the TUI. Any invocation beginning with this private flag is
+    // consumed here and exits successfully, including malformed arguments.
+    if raw_args
+        .first()
+        .is_some_and(|argument| argument == OsStr::new("--codex-hook-ingest"))
+    {
+        codex_hooks::ingest_silently(raw_args[1..].to_vec());
+        return Ok(());
+    }
+
+    match codex_dispatch(raw_args.clone()) {
+        CodexDispatch::NotRequested => {}
+        CodexDispatch::Help => {
+            print_codex_launcher_help();
+            return Ok(());
+        }
+        CodexDispatch::Invalid(message) => {
+            eprintln!("{message}");
+            eprintln!("usage: abtop codex -- [LEGACY_FORWARDED_ARGS...]");
+            std::process::exit(2);
+        }
+        CodexDispatch::Launch(args) => {
+            let exit_code = codex_compat::run(args)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            return Ok(());
+        }
+    }
+
+    // Native Codex plugin administration is separate from Claude's --setup.
+    match codex_admin_dispatch(raw_args.clone()) {
+        CodexAdminDispatch::NotRequested => {}
+        CodexAdminDispatch::Invalid => {
+            eprintln!(
+                "usage: abtop --setup-codex | --uninstall-codex | --codex-integration-status"
+            );
+            std::process::exit(2);
+        }
+        CodexAdminDispatch::Setup => {
+            match codex_hooks::plugin::setup() {
+                Ok(report) => print_codex_setup_report(&report),
+                Err(error) => {
+                    eprintln!("Codex plugin setup failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+        CodexAdminDispatch::Uninstall => {
+            match codex_hooks::plugin::uninstall() {
+                Ok(report) => print_codex_uninstall_report(&report),
+                Err(error) => {
+                    eprintln!("Codex plugin uninstall failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+        CodexAdminDispatch::Status => {
+            match codex_hooks::plugin::status() {
+                Ok(status) => {
+                    print_codex_integration_status(&status);
+                    if !status.healthy {
+                        std::process::exit(1);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Codex integration status failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    // --setup is deliberately a Claude-only exact singleton.
+    if raw_args.iter().any(|a| a == OsStr::new("--setup")) {
+        if raw_args.as_slice() != [OsString::from("--setup")] {
+            eprintln!("usage: abtop --setup");
+            std::process::exit(2);
+        }
+        setup::run_setup();
+        return Ok(());
+    }
+
     // --version / -V flag: print version and exit
-    if std::env::args().any(|a| a == "--version" || a == "-V") {
+    if raw_args
+        .iter()
+        .any(|a| a == OsStr::new("--version") || a == OsStr::new("-V"))
+    {
         println!("abtop {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
     // --update flag: self-update via GitHub releases installer
-    if std::env::args().any(|a| a == "--update") {
+    if raw_args.iter().any(|a| a == OsStr::new("--update")) {
         return run_update();
-    }
-
-    // --setup flag: configure StatusLine hook and exit
-    if std::env::args().any(|a| a == "--setup") {
-        setup::run_setup();
-        return Ok(());
     }
 
     // Load config once; it drives both the default theme and the hidden-agents list.
     let cfg = config::load_config();
 
-    // --theme flag > config file > default
-    let initial_theme = std::env::args()
+    let demo_mode = std::env::args().any(|a| a == "--demo");
+
+    // --theme flag > config file > default. Demo mode ignores the persisted
+    // theme when no explicit override is supplied.
+    let explicit_theme = std::env::args()
         .position(|a| a == "--theme")
         .map(|pos| {
             let val = std::env::args().nth(pos + 1);
@@ -137,10 +242,15 @@ pub fn run() -> io::Result<()> {
                 );
                 std::process::exit(1);
             })
-        })
-        .or_else(|| theme::Theme::by_name(&cfg.theme));
+        });
+    let initial_theme = explicit_theme.or_else(|| {
+        if demo_mode {
+            None
+        } else {
+            theme::Theme::by_name(&cfg.theme)
+        }
+    });
 
-    let demo_mode = std::env::args().any(|a| a == "--demo");
     let exit_on_jump = std::env::args().any(|a| a == "--exit-on-jump");
     let mouse_capture = should_enable_mouse_capture(std::env::args());
 
@@ -149,11 +259,12 @@ pub fn run() -> io::Result<()> {
     // manual check of the web snapshot API; the web tool uses the library
     // `App::to_snapshot` directly rather than shelling out to this.
     if std::env::args().any(|a| a == "--json") {
-        let mut app = build_app(initial_theme.unwrap_or_default(), &cfg);
+        let mut app = build_app(initial_theme.unwrap_or_default(), &cfg, demo_mode);
         if demo_mode {
             demo::populate_demo(&mut app);
         } else {
             app.tick_no_summaries();
+            app.wait_for_initial_codexbar_quota(CODEXBAR_ONESHOT_WAIT);
         }
         match serde_json::to_string_pretty(&app.to_snapshot(2000)) {
             Ok(json) => {
@@ -169,7 +280,7 @@ pub fn run() -> io::Result<()> {
 
     // --once flag: print snapshot and exit
     if std::env::args().any(|a| a == "--once") {
-        let mut app = build_app(initial_theme.unwrap_or_default(), &cfg);
+        let mut app = build_app(initial_theme.unwrap_or_default(), &cfg, demo_mode);
         if demo_mode {
             demo::populate_demo(&mut app);
         } else {
@@ -183,6 +294,11 @@ pub fn run() -> io::Result<()> {
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
+            // Summary generation can take long enough for lifecycle state to
+            // change. Recollect once without scheduling another summary job so
+            // the printed status reflects the end of the wait, not its start.
+            app.tick_no_summaries();
+            app.wait_for_initial_codexbar_quota(CODEXBAR_ONESHOT_WAIT);
         }
         print_snapshot(&app);
         return Ok(());
@@ -196,15 +312,7 @@ pub fn run() -> io::Result<()> {
     }
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let app_result = run_app(
-        &mut terminal,
-        demo_mode,
-        initial_theme,
-        exit_on_jump,
-        &cfg.hidden_agents,
-        cfg.panels,
-        &cfg.claude_config_dirs,
-    );
+    let app_result = run_app(&mut terminal, demo_mode, initial_theme, exit_on_jump, &cfg);
 
     // Always attempt both cleanup steps regardless of app result
     let r1 = if mouse_capture {
@@ -217,6 +325,214 @@ pub fn run() -> io::Result<()> {
 
     // Return app error first, then cleanup errors
     app_result.and(r1).and(r2).and(r3)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CodexDispatch {
+    NotRequested,
+    Help,
+    Launch(Vec<OsString>),
+    Invalid(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CodexAdminDispatch {
+    NotRequested,
+    Setup,
+    Uninstall,
+    Status,
+    Invalid,
+}
+
+fn codex_admin_dispatch<I>(args: I) -> CodexAdminDispatch
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let args: Vec<_> = args.into_iter().collect();
+    let requested = args.iter().any(|argument| {
+        matches!(
+            argument.to_str(),
+            Some("--setup-codex" | "--uninstall-codex" | "--codex-integration-status")
+        )
+    });
+    if !requested {
+        return CodexAdminDispatch::NotRequested;
+    }
+    match args.as_slice() {
+        [argument] if argument == OsStr::new("--setup-codex") => CodexAdminDispatch::Setup,
+        [argument] if argument == OsStr::new("--uninstall-codex") => CodexAdminDispatch::Uninstall,
+        [argument] if argument == OsStr::new("--codex-integration-status") => {
+            CodexAdminDispatch::Status
+        }
+        _ => CodexAdminDispatch::Invalid,
+    }
+}
+
+fn codex_dispatch<I>(args: I) -> CodexDispatch
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    if args.next().as_deref() != Some(OsStr::new("codex")) {
+        return CodexDispatch::NotRequested;
+    }
+
+    let Some(separator) = args.next() else {
+        return CodexDispatch::Invalid("missing `--` before Codex arguments".to_string());
+    };
+    if separator == OsStr::new("--help") || separator == OsStr::new("-h") {
+        if args.next().is_some() {
+            return CodexDispatch::Invalid(
+                "launcher help does not accept additional arguments".to_string(),
+            );
+        }
+        return CodexDispatch::Help;
+    }
+    if separator != OsStr::new("--") {
+        return CodexDispatch::Invalid(format!(
+            "expected `--` before Codex arguments, got `{}`",
+            separator.to_string_lossy()
+        ));
+    }
+
+    CodexDispatch::Launch(args.collect())
+}
+
+fn print_codex_launcher_help() {
+    println!("Compatibility trampoline for retired abtop 0.6 shell integration.");
+    println!();
+    println!("usage: abtop codex -- [LEGACY_FORWARDED_ARGS...]");
+    println!();
+    println!("It directly executes the binary captured by the old shell block.");
+    println!("Use native `codex ...` for normal work and run `abtop --setup-codex`");
+    println!("to remove the retired block and install the isolated hook plugin.");
+}
+
+const CODEX_COVERAGE_NOTICE: &str = "Supported Codex releases cannot attest effective managed/cloud/profile/live hook coverage; installation readiness is diagnostic only.";
+const CODEX_LIVE_STATUS_NOTICE: &str = "Exact supported Codex hook/rollout shapes may report non-actionable heuristic Think, Exec, or Idle; tool and interaction ambiguity remains Unknown. Exactly correlated Herdr terminals may additionally report non-actionable heuristic Wait, Idle, or generic Work when activity cannot be refined. Exact supported process/session Live→Gone transitions report non-actionable heuristic Done for 30 seconds.";
+
+fn print_codex_coverage_notice() {
+    println!("{CODEX_COVERAGE_NOTICE}");
+    println!("{CODEX_LIVE_STATUS_NOTICE}");
+}
+
+fn codex_trust_review_required_notice(hook_count: usize) -> String {
+    format!(
+        "Codex lifecycle monitoring is not ready until all {hook_count} abtop hooks are reviewed and approved and a fresh Codex session is started."
+    )
+}
+
+fn print_codex_setup_report(report: &codex_hooks::plugin::SetupReport) {
+    println!("Codex hook base installation completed.");
+    println!("  Plugin: {}", codex_hooks::plugin::PLUGIN_ID);
+    println!("  Marketplace: {}", report.paths.marketplace_root.display());
+    println!("  Hooks declared: {}", report.hook_count);
+    println!(
+        "  Base config trusted: {}/{}",
+        report.base_config_trusted_hooks, report.hook_count
+    );
+    println!(
+        "  Base config enabled: {}/{}",
+        report.base_config_enabled_hooks, report.hook_count
+    );
+    if !report.legacy_cleanup.changed_files.is_empty() {
+        println!(
+            "  Removed retired shell blocks from {} file(s).",
+            report.legacy_cleanup.changed_files.len()
+        );
+    }
+    if let Some(guidance) = &report.legacy_cleanup.powershell_guidance {
+        println!("  {guidance}");
+    }
+    println!("Native `codex` was not wrapped, aliased, or replaced.");
+    print_codex_coverage_notice();
+    if report.review_required {
+        println!("{}", codex_trust_review_required_notice(report.hook_count));
+        println!(
+            "Restart Codex and review only the {} abtop hooks in its trust prompt.",
+            report.hook_count
+        );
+        println!("Do not approve unrelated hooks from the same prompt.");
+    } else {
+        println!("Restart existing Codex sessions so they load this plugin version.");
+    }
+}
+
+fn print_codex_uninstall_report(report: &codex_hooks::plugin::UninstallReport) {
+    println!("Codex hook integration uninstalled.");
+    println!("  Plugin removed: {}", report.plugin_removed);
+    println!("  Marketplace removed: {}", report.marketplace_removed);
+    if !report.legacy_cleanup.changed_files.is_empty() {
+        println!(
+            "  Removed retired shell blocks from {} file(s).",
+            report.legacy_cleanup.changed_files.len()
+        );
+    }
+    println!(
+        "  Content-free audit data preserved at: {}",
+        report.preserved_data_root.display()
+    );
+    if let Some(guidance) = &report.legacy_cleanup.powershell_guidance {
+        println!("  {guidance}");
+    }
+    println!("Native `codex` was not modified.");
+}
+
+fn print_codex_integration_status(status: &codex_hooks::plugin::IntegrationStatus) {
+    println!(
+        "Codex hook base installation: {}",
+        if status.healthy { "ready" } else { "not ready" }
+    );
+    print_codex_coverage_notice();
+    println!("  CODEX_HOME: {}", status.paths.codex_home.display());
+    println!(
+        "  Codex executable: {}",
+        status
+            .codex_binary
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "—".to_string())
+    );
+    println!("  Hook schema revision: {}", status.hook_schema_revision);
+    println!(
+        "  Helper digest: {}",
+        status.helper_digest.as_deref().unwrap_or("—")
+    );
+    println!(
+        "  Marketplace registered: {}",
+        status.marketplace_registered
+    );
+    println!("  Plugin installed: {}", status.plugin_installed);
+    println!("  Plugin enabled: {}", status.plugin_enabled);
+    println!(
+        "  Installed version: {}",
+        status.installed_version.as_deref().unwrap_or("—")
+    );
+    println!("  Bundle valid: {}", status.bundle_valid);
+    println!("  Attestation valid: {}", status.attestation_valid);
+    println!(
+        "  Base config trusted: {}/{}",
+        status.base_config_trusted_hooks, status.hook_count
+    );
+    println!(
+        "  Base config enabled: {}/{}",
+        status.base_config_enabled_hooks, status.hook_count
+    );
+    println!(
+        "  Legacy profile inspection: {}",
+        if status.legacy_inspection_valid {
+            "valid"
+        } else {
+            "failed"
+        }
+    );
+    println!(
+        "  Retired shell blocks found: {}",
+        status.legacy_marker_files.len()
+    );
+    for detail in &status.details {
+        println!("  Note: {detail}");
+    }
 }
 
 fn should_enable_mouse_capture<I, S>(args: I) -> bool
@@ -232,16 +548,24 @@ fn run_app(
     demo_mode: bool,
     initial_theme: Option<theme::Theme>,
     exit_on_jump: bool,
-    hidden_agents: &[String],
-    panels: config::PanelVisibility,
-    claude_config_dirs: &[std::path::PathBuf],
+    config: &config::AppConfig,
 ) -> io::Result<()> {
-    let mut app = App::new_with_config_and_claude_dirs(
-        initial_theme.unwrap_or_default(),
-        hidden_agents,
-        panels,
-        claude_config_dirs,
-    );
+    let mut app = if demo_mode {
+        App::new_with_config_and_claude_dirs(
+            initial_theme.unwrap_or_default(),
+            &[],
+            config::PanelVisibility::default(),
+            &[],
+        )
+    } else {
+        App::new_with_config_and_claude_dirs_and_codexbar(
+            initial_theme.unwrap_or_default(),
+            &config.hidden_agents,
+            config.panels,
+            &config.claude_config_dirs,
+            config.codexbar_quota_fallback,
+        )
+    };
     if demo_mode {
         demo::populate_demo(&mut app);
     } else {
@@ -330,7 +654,13 @@ fn handle_key_press(
             KeyCode::Backspace => app.filter_pop(),
             KeyCode::Down => app.select_next(),
             KeyCode::Up => app.select_prev(),
-            KeyCode::Char(c) => app.filter_push(c),
+            KeyCode::Char(c)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                app.filter_push(c);
+            }
             _ => {}
         }
     } else {
@@ -452,36 +782,37 @@ fn print_snapshot(app: &App) {
         }
         println!();
     }
+    print_snapshot_quota(app);
     for session in &app.sessions {
-        let status = match &session.status {
-            model::SessionStatus::Thinking => "◉ Think",
-            model::SessionStatus::Executing => "● Exec",
-            model::SessionStatus::Waiting => "◌ Wait",
-            model::SessionStatus::Unknown => "? Unknown",
-            model::SessionStatus::RateLimited => "⏳ Rate",
-            model::SessionStatus::Done => "✓ Done",
-        };
-        let sid_short = if session.session_id.len() >= 7 {
-            &session.session_id[..7]
-        } else {
-            &session.session_id
-        };
+        let status = snapshot_status_label(&session.status);
+        let sid_short: String = session.session_id.chars().take(7).collect();
         let project_label = format!("{}({})", session.project_name, sid_short);
         let summary = sanitize_output(&app.session_summary(session));
         println!(
-            "  {} {:<20} {} {} {:<10} CTX:{:>3.0}% Tok:{} Mem:{}M {}",
-            session.pid,
-            sanitize_output(&project_label),
-            summary,
-            status,
-            session.model.replace("claude-", ""),
-            session.context_percent,
-            fmt_tok(session.total_tokens()),
-            session.mem_mb,
-            session.elapsed_display(),
+            "{}",
+            format_snapshot_session_line(session, &project_label, &summary, status)
         );
-        if let Some(task) = session.current_tasks.last() {
+        if let Some(task) = session.display_task() {
             println!("       └─ {}", sanitize_output(task));
+        }
+        if session.status_evidence.has_sample() {
+            let recent = session.status_evidence.recent(5);
+            let statuses = recent
+                .observations
+                .iter()
+                .map(|sample| snapshot_status_name(&sample.status))
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "       evidence={} reason={} observed_at_ms={} status_since_ms={} generation={} matching={} recent=[{}]",
+                session.status_evidence.authority.as_str(),
+                session.status_evidence.reason.as_str(),
+                session.status_evidence.observed_at_ms,
+                session.status_evidence.status_since_ms,
+                session.status_evidence.connection_generation,
+                session.status_evidence.consecutive_matching,
+                statuses,
+            );
         }
         for child in &session.children {
             let port = child.port.map(|p| format!(":{}", p)).unwrap_or_default();
@@ -501,6 +832,203 @@ fn print_snapshot(app: &App) {
             );
         }
     }
+}
+
+fn print_snapshot_quota(app: &App) {
+    let unavailable_providers = app
+        .codexbar_provider_snapshots()
+        .iter()
+        .filter(|provider| provider.error.is_some())
+        .map(|provider| provider.provider.as_str());
+    let rows = snapshot_quota_rows(&app.rate_limits, unavailable_providers);
+    if rows.is_empty() {
+        return;
+    }
+    println!("quota:");
+    for row in rows {
+        println!("{row}");
+    }
+    println!();
+}
+
+fn snapshot_quota_rows<'a>(
+    rate_limits: &[model::RateLimitInfo],
+    unavailable_providers: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut providers = std::collections::BTreeMap::<String, (Vec<String>, bool)>::new();
+
+    for info in rate_limits {
+        let Some(provider) = collector::codexbar::canonical_provider_id(&info.source) else {
+            continue;
+        };
+        let row = providers.entry(provider).or_default();
+        if info.windows.is_empty() {
+            if let Some(window) = format_snapshot_quota_window(
+                info.five_hour_pct,
+                info.five_hour_resets_at,
+                info.five_hour_window_minutes,
+            ) {
+                row.0.push(window);
+            }
+            if let Some(window) = format_snapshot_quota_window(
+                info.seven_day_pct,
+                info.seven_day_resets_at,
+                info.seven_day_window_minutes,
+            ) {
+                row.0.push(window);
+            }
+        } else {
+            row.0
+                .extend(info.windows.iter().map(format_snapshot_named_quota_window));
+        }
+    }
+
+    for provider in unavailable_providers {
+        let Some(provider) = collector::codexbar::canonical_provider_id(provider) else {
+            continue;
+        };
+        providers.entry(provider).or_default().1 = true;
+    }
+
+    let mut providers = providers.into_iter().collect::<Vec<_>>();
+    providers.sort_by(|(left, _), (right, _)| {
+        snapshot_provider_rank(left)
+            .cmp(&snapshot_provider_rank(right))
+            .then_with(|| left.cmp(right))
+    });
+    providers
+        .into_iter()
+        .filter_map(|(provider, (windows, unavailable))| {
+            if windows.is_empty() {
+                unavailable.then(|| format!("  {provider}: unavailable"))
+            } else {
+                Some(format!("  {provider}: {}", windows.join(" | ")))
+            }
+        })
+        .collect()
+}
+
+fn snapshot_provider_rank(provider: &str) -> u8 {
+    match provider {
+        "claude" => 0,
+        "codex" => 1,
+        "grok" => 2,
+        "kimi" => 3,
+        _ => 4,
+    }
+}
+
+fn format_snapshot_named_quota_window(window: &model::RateLimitWindow) -> String {
+    let label = sanitize_output(&window.label);
+    let label = label.trim();
+    let label = if label.is_empty() { "window" } else { label };
+    format_snapshot_quota_value(label, window.used_pct, window.resets_at)
+}
+
+fn format_snapshot_quota_window(
+    used_pct: Option<f64>,
+    resets_at: Option<u64>,
+    window_minutes: Option<u64>,
+) -> Option<String> {
+    let used_pct = used_pct?;
+    let label = match window_minutes {
+        Some(minutes) if minutes % 1_440 == 0 => format!("{}d", minutes / 1_440),
+        Some(minutes) if minutes % 60 == 0 => format!("{}h", minutes / 60),
+        Some(minutes) => format!("{minutes}m"),
+        None => "window".to_string(),
+    };
+    Some(format_snapshot_quota_value(&label, used_pct, resets_at))
+}
+
+fn format_snapshot_quota_value(label: &str, used_pct: f64, resets_at: Option<u64>) -> String {
+    let usage = if used_pct.is_finite() {
+        format!("{used_pct:.0}% used")
+    } else {
+        "usage unavailable".to_string()
+    };
+    let reset = resets_at.map(format_snapshot_reset).unwrap_or_default();
+    if reset.is_empty() {
+        format!("{label} {usage}")
+    } else {
+        format!("{label} {usage}, {reset}")
+    }
+}
+
+fn format_snapshot_reset(resets_at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let remaining = resets_at.saturating_sub(now);
+    if remaining == 0 {
+        return "reset due".to_string();
+    }
+    if remaining < 3_600 {
+        format!("resets in {}m", remaining.div_ceil(60))
+    } else if remaining < 86_400 {
+        format!("resets in {}h", remaining.div_ceil(3_600))
+    } else {
+        format!("resets in {}d", remaining.div_ceil(86_400))
+    }
+}
+
+fn snapshot_status_name(status: &model::SessionStatus) -> &'static str {
+    match status {
+        model::SessionStatus::Thinking => "Thinking",
+        model::SessionStatus::Executing => "Executing",
+        model::SessionStatus::Working => "Working",
+        model::SessionStatus::Waiting => "Waiting",
+        model::SessionStatus::Idle => "Idle",
+        model::SessionStatus::Unknown => "Unknown",
+        model::SessionStatus::RateLimited => "RateLimited",
+        model::SessionStatus::Error => "Error",
+        model::SessionStatus::Done => "Done",
+    }
+}
+
+fn snapshot_status_label(status: &model::SessionStatus) -> &'static str {
+    match status {
+        model::SessionStatus::Thinking => "◉ Think",
+        model::SessionStatus::Executing => "● Exec",
+        model::SessionStatus::Working => "◐ Work",
+        model::SessionStatus::Waiting => "◌ Wait",
+        model::SessionStatus::Idle => "○ Idle",
+        model::SessionStatus::Unknown => "? Unknown",
+        model::SessionStatus::Error => "✗ Error",
+        model::SessionStatus::RateLimited => "⏳ Rate",
+        model::SessionStatus::Done => "✓ Done",
+    }
+}
+
+fn format_snapshot_session_line(
+    session: &model::AgentSession,
+    project_label: &str,
+    summary: &str,
+    status: &str,
+) -> String {
+    let context = if session.context_window == 0 {
+        "—".to_string()
+    } else {
+        format!("{:.0}%", session.context_percent)
+    };
+
+    let model = session
+        .model
+        .strip_prefix("claude-")
+        .unwrap_or(&session.model);
+    format!(
+        "  {:<8} {} {:<20} {} {} {:<10} CTX:{:>4} Tok:{} Mem:{}M {}",
+        sanitize_output(session.agent_cli),
+        session.pid,
+        sanitize_output(project_label),
+        summary,
+        status,
+        sanitize_output(model),
+        context,
+        fmt_tok(session.total_tokens()),
+        session.mem_mb,
+        session.elapsed_display(),
+    )
 }
 
 fn run_update() -> io::Result<()> {
@@ -577,13 +1105,258 @@ fn fmt_tok(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
+    use crossterm::event::KeyEvent;
     use ratatui::backend::TestBackend;
 
     #[test]
     fn mouse_capture_is_opt_in() {
         assert!(!should_enable_mouse_capture(["abtop"]));
         assert!(should_enable_mouse_capture(["abtop", "--mouse"]));
+    }
+
+    #[test]
+    fn demo_app_ignores_persisted_panel_visibility() {
+        let cfg = config::AppConfig {
+            panels: config::PanelVisibility {
+                context: false,
+                quota: false,
+                tokens: false,
+                projects: false,
+                ports: false,
+                sessions: false,
+                mcp: false,
+            },
+            ..config::AppConfig::default()
+        };
+
+        let app = build_app(theme::Theme::default(), &cfg, true);
+
+        assert!(app.show_context);
+        assert!(app.show_quota);
+        assert!(app.show_tokens);
+        assert!(app.show_projects);
+        assert!(app.show_ports);
+        assert!(app.show_sessions);
+        assert!(app.show_mcp);
+    }
+
+    #[test]
+    fn codex_launcher_requires_explicit_separator() {
+        assert_eq!(
+            codex_dispatch([OsString::from("codex")]),
+            CodexDispatch::Invalid("missing `--` before Codex arguments".to_string())
+        );
+        assert!(matches!(
+            codex_dispatch([OsString::from("codex"), OsString::from("resume")]),
+            CodexDispatch::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn codex_admin_commands_are_exact_singletons() {
+        assert_eq!(
+            codex_admin_dispatch([OsString::from("--setup-codex")]),
+            CodexAdminDispatch::Setup
+        );
+        assert_eq!(
+            codex_admin_dispatch([OsString::from("--uninstall-codex")]),
+            CodexAdminDispatch::Uninstall
+        );
+        assert_eq!(
+            codex_admin_dispatch([OsString::from("--codex-integration-status")]),
+            CodexAdminDispatch::Status
+        );
+        assert_eq!(
+            codex_admin_dispatch([OsString::from("--setup")]),
+            CodexAdminDispatch::NotRequested
+        );
+        assert_eq!(
+            codex_admin_dispatch([OsString::from("--setup-codex"), OsString::from("--json"),]),
+            CodexAdminDispatch::Invalid
+        );
+    }
+
+    #[test]
+    fn codex_launcher_preserves_os_arguments_after_separator() {
+        let prompt = OsString::from("review paths with spaces");
+        assert_eq!(
+            codex_dispatch([
+                OsString::from("codex"),
+                OsString::from("--"),
+                OsString::from("resume"),
+                prompt.clone(),
+            ]),
+            CodexDispatch::Launch(vec![OsString::from("resume"), prompt])
+        );
+    }
+
+    #[test]
+    fn codex_launcher_help_is_unambiguous() {
+        assert_eq!(
+            codex_dispatch([OsString::from("codex"), OsString::from("--help")]),
+            CodexDispatch::Help
+        );
+        assert_eq!(
+            codex_dispatch([
+                OsString::from("codex"),
+                OsString::from("--"),
+                OsString::from("--help"),
+            ]),
+            CodexDispatch::Launch(vec![OsString::from("--help")])
+        );
+    }
+
+    #[test]
+    fn codex_admin_notice_separates_installation_from_live_status_proof() {
+        assert!(CODEX_COVERAGE_NOTICE.contains("cannot attest effective"));
+        assert!(CODEX_COVERAGE_NOTICE.contains("installation readiness is diagnostic only"));
+        assert!(CODEX_LIVE_STATUS_NOTICE.contains("non-actionable heuristic"));
+        assert!(CODEX_LIVE_STATUS_NOTICE.contains("Herdr"));
+        assert!(CODEX_LIVE_STATUS_NOTICE.contains("generic Work"));
+        assert!(CODEX_LIVE_STATUS_NOTICE.contains("Live→Gone"));
+        assert!(CODEX_LIVE_STATUS_NOTICE.contains("Done for 30 seconds"));
+    }
+
+    #[test]
+    fn codex_setup_trust_notice_requires_approval_and_a_fresh_session() {
+        let notice = codex_trust_review_required_notice(11);
+
+        assert!(notice.contains("lifecycle monitoring is not ready"));
+        assert!(notice.contains("all 11 abtop hooks are reviewed and approved"));
+        assert!(notice.contains("a fresh Codex session is started"));
+    }
+
+    #[test]
+    fn once_session_line_includes_provider_and_unavailable_context() {
+        let mut app = App::new_with_config(
+            theme::Theme::default(),
+            &[],
+            config::PanelVisibility::default(),
+        );
+        demo::populate_demo(&mut app);
+        let session = &mut app.sessions[0];
+        session.agent_cli = "grok";
+        session.context_window = 0;
+        session.context_percent = 99.0;
+
+        let line = format_snapshot_session_line(session, "project(session)", "summary", "◌ Wait");
+
+        assert!(line.starts_with("  grok"));
+        assert!(line.contains("CTX:   —"));
+        assert!(!line.contains("99%"));
+    }
+
+    #[test]
+    fn once_status_labels_distinguish_idle_from_actionable_waiting() {
+        assert_eq!(
+            snapshot_status_name(&model::SessionStatus::Working),
+            "Working"
+        );
+        assert_eq!(
+            snapshot_status_label(&model::SessionStatus::Working),
+            "◐ Work"
+        );
+        assert_eq!(snapshot_status_label(&model::SessionStatus::Idle), "○ Idle");
+        assert_eq!(
+            snapshot_status_label(&model::SessionStatus::Waiting),
+            "◌ Wait"
+        );
+    }
+
+    #[test]
+    fn once_quota_formatter_uses_actual_window_lengths() {
+        assert_eq!(
+            format_snapshot_quota_window(Some(25.0), None, Some(300)).as_deref(),
+            Some("5h 25% used")
+        );
+        assert_eq!(
+            format_snapshot_quota_window(Some(40.0), None, Some(10_080)).as_deref(),
+            Some("7d 40% used")
+        );
+        assert_eq!(
+            format_snapshot_quota_window(Some(50.0), None, Some(43_200)).as_deref(),
+            Some("30d 50% used")
+        );
+    }
+
+    #[test]
+    fn once_quota_rows_render_every_window_in_stable_provider_order() {
+        let window = |id: &str, label: &str, used_pct: f64| model::RateLimitWindow {
+            id: id.to_string(),
+            label: label.to_string(),
+            used_pct,
+            resets_at: None,
+            window_minutes: None,
+            provenance: model::RateLimitProvenance::CodexBar,
+        };
+        let limits = vec![
+            model::RateLimitInfo {
+                source: "zeta".to_string(),
+                windows: vec![window("primary", "Primary", 9.0)],
+                ..Default::default()
+            },
+            model::RateLimitInfo {
+                source: "grok".to_string(),
+                windows: vec![window("primary", "Primary", 18.0)],
+                ..Default::default()
+            },
+            model::RateLimitInfo {
+                source: "claude".to_string(),
+                windows: vec![
+                    window("primary", "5h", 28.0),
+                    window("tertiary", "30d", 11.0),
+                    window("fable", "Fable only", 0.0),
+                ],
+                ..Default::default()
+            },
+            model::RateLimitInfo {
+                source: "codex".to_string(),
+                windows: vec![window("spark", "Codex Spark Weekly", 0.0)],
+                ..Default::default()
+            },
+            model::RateLimitInfo {
+                source: "alpha".to_string(),
+                windows: vec![window("primary", "Primary", 3.0)],
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            snapshot_quota_rows(&limits, ["KIMI"]),
+            vec![
+                "  claude: 5h 28% used | 30d 11% used | Fable only 0% used",
+                "  codex: Codex Spark Weekly 0% used",
+                "  grok: Primary 18% used",
+                "  kimi: unavailable",
+                "  alpha: Primary 3% used",
+                "  zeta: Primary 9% used",
+            ]
+        );
+    }
+
+    #[test]
+    fn once_quota_rows_fall_back_to_legacy_windows_without_duplicates() {
+        let limits = vec![model::RateLimitInfo {
+            source: "claude".to_string(),
+            five_hour_pct: Some(25.0),
+            five_hour_window_minutes: Some(300),
+            seven_day_pct: Some(40.0),
+            seven_day_window_minutes: Some(10_080),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            snapshot_quota_rows(&limits, std::iter::empty()),
+            vec!["  claude: 5h 25% used | 7d 40% used"]
+        );
+    }
+
+    #[test]
+    fn once_quota_rows_never_render_provider_error_details() {
+        let rows = snapshot_quota_rows(&[], ["kimi"]);
+
+        assert_eq!(rows, vec!["  kimi: unavailable"]);
+        assert!(!rows.join("\n").contains("provider_error"));
     }
 
     #[test]
@@ -611,5 +1384,36 @@ mod tests {
         assert!(text.contains("cmux: socket broken; restart cmux"));
         assert!(!text.contains("Broken pipe"));
         assert!(!text.contains("select-workspace"));
+    }
+
+    #[test]
+    fn control_modified_character_cannot_corrupt_an_active_filter() {
+        let mut app = App::new_with_config(
+            theme::Theme::default(),
+            &[],
+            config::PanelVisibility::default(),
+        );
+        app.filter_active = true;
+        app.filter_text = "019fc2c5".to_string();
+
+        handle_key_press(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            false,
+            false,
+            |_| JumpOutcome::NoOp,
+        );
+        assert_eq!(app.filter_text, "019fc2c5");
+        assert!(app.filter_active);
+
+        handle_key_press(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            false,
+            false,
+            |_| JumpOutcome::NoOp,
+        );
+        assert_eq!(app.filter_text, "019fc2c5");
+        assert!(!app.filter_active);
     }
 }

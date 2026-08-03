@@ -32,10 +32,92 @@ pub struct FileAccess {
 /// Maximum file access entries kept per session to bound memory.
 pub const MAX_FILE_ACCESSES: usize = 1000;
 
+/// Maximum UTF-8 byte length accepted for a quota window identity.
+pub const MAX_RATE_LIMIT_WINDOW_ID_BYTES: usize = 128;
+
+/// Maximum UTF-8 byte length accepted for a quota window display label.
+pub const MAX_RATE_LIMIT_WINDOW_LABEL_BYTES: usize = 128;
+
+/// Source that supplied one account-level quota window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum RateLimitProvenance {
+    /// Data emitted directly by the provider integration.
+    #[default]
+    Native,
+    /// Data returned by the optional CodexBar integration.
+    CodexBar,
+}
+
+/// One bounded account-level quota window.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitWindow {
+    /// Stable source-owned identity used to merge matching windows.
+    pub id: String,
+    /// Short user-facing window label.
+    pub label: String,
+    /// Used quota percentage (0-100).
+    pub used_pct: f64,
+    /// Reset timestamp in epoch seconds, when reported by the source.
+    pub resets_at: Option<u64>,
+    /// Window duration in minutes, when reported by the source.
+    pub window_minutes: Option<u64>,
+    /// Integration that supplied this window.
+    pub provenance: RateLimitProvenance,
+}
+
+impl RateLimitWindow {
+    /// Build a window only when its owned identity and label are safely bounded.
+    ///
+    /// IDs are rejected rather than truncated because truncation could merge
+    /// distinct source windows under the same identity.
+    pub fn try_new(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        used_pct: f64,
+        resets_at: Option<u64>,
+        window_minutes: Option<u64>,
+        provenance: RateLimitProvenance,
+    ) -> Option<Self> {
+        let id = id.into();
+        let label = label.into();
+        if id.is_empty()
+            || id.len() > MAX_RATE_LIMIT_WINDOW_ID_BYTES
+            || id.chars().any(is_unsafe_quota_text_char)
+            || label.is_empty()
+            || label.len() > MAX_RATE_LIMIT_WINDOW_LABEL_BYTES
+            || label.chars().any(is_unsafe_quota_text_char)
+            || !used_pct.is_finite()
+            || !(0.0..=100.0).contains(&used_pct)
+            || window_minutes == Some(0)
+        {
+            return None;
+        }
+
+        Some(Self {
+            id,
+            label,
+            used_pct,
+            resets_at,
+            window_minutes,
+            provenance,
+        })
+    }
+}
+
+fn is_unsafe_quota_text_char(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+        )
+}
+
 /// Account-level rate limit info (shared across all sessions).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RateLimitInfo {
-    /// "claude" or "codex"
+    /// Canonical provider ID, such as "claude", "codex", or "grok".
     pub source: String,
     /// 5-hour window usage percentage (0-100)
     pub five_hour_pct: Option<f64>,
@@ -54,20 +136,35 @@ pub struct RateLimitInfo {
     pub seven_day_window_minutes: Option<u64>,
     /// When this data was last updated
     pub updated_at: Option<u64>,
+    /// Authoritative ordered quota windows from all available integrations.
+    ///
+    /// The legacy five-hour and seven-day fields remain populated for API
+    /// compatibility, but new consumers should prefer this collection.
+    pub windows: Vec<RateLimitWindow>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum SessionStatus {
-    /// Model is generating a response (last_user_ts_ms > 0)
+    /// Model is generating a response and no tool is currently running
     Thinking,
-    /// Running a tool (descendant CPU active OR current_task non-empty)
+    /// A tool, background terminal, or active child is doing work
     Executing,
-    /// Idle, waiting for user input or permission prompt
+    /// Exact terminal evidence proves activity, but cannot distinguish model
+    /// generation from tool execution
+    Working,
+    /// Exact provider or terminal evidence says the session needs user input
+    /// or approval
     Waiting,
-    /// Session appears recent, but process ownership is not confirmed
+    /// Process is alive, but no model turn, tool, or user interaction is active
+    Idle,
+    /// No sufficiently fresh, complete, and trustworthy lifecycle proof exists
+    #[default]
     Unknown,
     /// Waiting due to rate limit
     RateLimited,
+    /// Provider reported a live session or turn failure
+    Error,
     /// Session finished
     Done,
 }
@@ -75,7 +172,226 @@ pub enum SessionStatus {
 impl SessionStatus {
     /// Returns true for states where the agent is actively doing work.
     pub fn is_active(&self) -> bool {
-        matches!(self, SessionStatus::Thinking | SessionStatus::Executing)
+        matches!(
+            self,
+            SessionStatus::Thinking | SessionStatus::Executing | SessionStatus::Working
+        )
+    }
+}
+
+/// Maximum status samples retained on a live session.
+pub const MAX_STATUS_OBSERVATIONS: usize = 128;
+
+/// Maximum status samples included in a JSON snapshot and rendered in detail.
+pub const MAX_VISIBLE_STATUS_OBSERVATIONS: usize = 5;
+
+/// How directly abtop can substantiate the displayed lifecycle status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum StatusAuthority {
+    /// Exact provider-emitted lifecycle data supplied the status.
+    Provider,
+    /// abtop derived the status from local files or process metadata.
+    Heuristic,
+    /// No sufficiently reliable status source is currently available.
+    #[default]
+    Unavailable,
+}
+
+impl StatusAuthority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Heuristic => "heuristic",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Machine-readable explanation for a status observation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum StatusReason {
+    ProviderIdle,
+    ProviderThinking,
+    ProviderExecuting,
+    ProviderWaitingApproval,
+    ProviderWaitingUserInput,
+    ProviderRateLimit,
+    ProviderError,
+    ProcessExited,
+    ProtocolUnknown,
+    ProtocolMalformed,
+    Disconnected,
+    Stale,
+    Bootstrap,
+    BackgroundProbePending,
+    BackgroundProbeFailed,
+    BackgroundTerminalActive,
+    OwnershipUnconfirmed,
+    CollectorInference,
+    /// The installed Codex hook integration cannot be verified exactly.
+    HookIntegrationUnverified,
+    /// The installed Codex hook declaration/helper identity changed.
+    HookConfigChanged,
+    /// Required Codex hook lifecycle events are missing or out of order.
+    HookEventGap,
+    /// The private Codex hook state failed schema or filesystem validation.
+    HookStateMalformed,
+    /// Codex emitted an interaction request without an exact resolution event.
+    HookInteractionResolutionUnavailable,
+    /// A covered Codex tool call is open in both hook and rollout evidence.
+    HookToolOpen,
+    /// A complete Codex hook subagent set matches active direct-child model work.
+    HookSubagentActive,
+    /// A Codex turn is open in both hook and rollout evidence.
+    HookTurnOpen,
+    /// A Codex stop hook and rollout terminal event agree that the turn ended.
+    HookTurnComplete,
+    /// Herdr's private terminal detector reports a visible Codex blocker.
+    HerdrScreenBlocked,
+    /// Herdr's private terminal detector reports visible Codex activity.
+    HerdrScreenWorking,
+    /// Herdr's private terminal detector reports the live Codex composer idle.
+    HerdrScreenIdle,
+    /// Herdr reports work, but Codex evidence cannot classify that activity.
+    HerdrWorkingUnrefined,
+    #[default]
+    Unavailable,
+}
+
+impl StatusReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderIdle => "provider idle",
+            Self::ProviderThinking => "provider thinking",
+            Self::ProviderExecuting => "provider executing",
+            Self::ProviderWaitingApproval => "waiting for approval",
+            Self::ProviderWaitingUserInput => "waiting for user input",
+            Self::ProviderRateLimit => "provider rate limit",
+            Self::ProviderError => "provider error",
+            Self::ProcessExited => "process exited",
+            Self::ProtocolUnknown => "unknown protocol state",
+            Self::ProtocolMalformed => "malformed protocol state",
+            Self::Disconnected => "disconnected",
+            Self::Stale => "stale observation",
+            Self::Bootstrap => "initializing",
+            Self::BackgroundProbePending => "checking background work",
+            Self::BackgroundProbeFailed => "background check failed",
+            Self::BackgroundTerminalActive => "background terminal active",
+            Self::OwnershipUnconfirmed => "ownership unconfirmed",
+            Self::CollectorInference => "collector inference",
+            Self::HookIntegrationUnverified => "Codex hook integration unverified",
+            Self::HookConfigChanged => "Codex hook configuration changed",
+            Self::HookEventGap => "Codex hook event gap",
+            Self::HookStateMalformed => "malformed Codex hook state",
+            Self::HookInteractionResolutionUnavailable => {
+                "Codex interaction resolution unavailable"
+            }
+            Self::HookToolOpen => "Codex hook tool open",
+            Self::HookSubagentActive => "Codex hook subagent active",
+            Self::HookTurnOpen => "Codex hook turn open",
+            Self::HookTurnComplete => "Codex hook turn complete",
+            Self::HerdrScreenBlocked => "Herdr screen needs attention",
+            Self::HerdrScreenWorking => "Herdr screen working",
+            Self::HerdrScreenIdle => "Herdr screen idle",
+            Self::HerdrWorkingUnrefined => "Herdr work type unavailable",
+            Self::Unavailable => "evidence unavailable",
+        }
+    }
+}
+
+/// One bounded, content-free status sample.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct StatusObservation {
+    pub status: SessionStatus,
+    pub authority: StatusAuthority,
+    pub reason: StatusReason,
+    /// Unix-epoch milliseconds when this state was observed.
+    pub observed_at_ms: u64,
+    /// Provider connection generation, or zero for non-protocol sources.
+    pub connection_generation: u64,
+}
+
+impl StatusObservation {
+    pub fn new(
+        status: SessionStatus,
+        authority: StatusAuthority,
+        reason: StatusReason,
+        observed_at_ms: u64,
+        connection_generation: u64,
+    ) -> Self {
+        Self {
+            status,
+            authority,
+            reason,
+            observed_at_ms,
+            connection_generation,
+        }
+    }
+}
+
+/// Current status provenance plus a bounded observation history.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct StatusEvidence {
+    pub authority: StatusAuthority,
+    pub reason: StatusReason,
+    /// Unix-epoch milliseconds of the newest authoritative/heuristic sample.
+    pub observed_at_ms: u64,
+    /// Unix-epoch milliseconds when the current status first began.
+    pub status_since_ms: u64,
+    /// Provider connection generation, or zero for non-protocol sources.
+    pub connection_generation: u64,
+    /// Consecutive samples matching status, authority, and connection generation.
+    pub consecutive_matching: u32,
+    /// Content-free samples, oldest first.
+    pub observations: Vec<StatusObservation>,
+}
+
+impl StatusEvidence {
+    /// Record one sample and update the current evidence summary.
+    pub fn observe(&mut self, observation: StatusObservation) {
+        let previous = self.observations.last();
+        let same_status = previous.is_some_and(|sample| {
+            sample.status == observation.status
+                && sample.authority == observation.authority
+                && sample.connection_generation == observation.connection_generation
+        });
+
+        if same_status {
+            self.consecutive_matching = self.consecutive_matching.saturating_add(1).max(1);
+        } else {
+            self.status_since_ms = observation.observed_at_ms;
+            self.consecutive_matching = 1;
+        }
+
+        self.authority = observation.authority;
+        self.reason = observation.reason;
+        self.observed_at_ms = observation.observed_at_ms;
+        self.connection_generation = observation.connection_generation;
+        self.observations.push(observation);
+        if self.observations.len() > MAX_STATUS_OBSERVATIONS {
+            let excess = self.observations.len() - MAX_STATUS_OBSERVATIONS;
+            self.observations.drain(..excess);
+        }
+    }
+
+    /// Return a copy whose observation ledger contains only the newest samples.
+    pub fn recent(&self, limit: usize) -> Self {
+        let mut recent = self.clone();
+        if recent.observations.len() > limit {
+            let start = recent.observations.len() - limit;
+            recent.observations = recent.observations.split_off(start);
+        }
+        recent
+    }
+
+    pub fn has_sample(&self) -> bool {
+        self.observed_at_ms > 0 || !self.observations.is_empty()
     }
 }
 
@@ -132,16 +448,28 @@ pub const MAX_CHAT_MESSAGES: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct AgentSession {
-    /// Which CLI tool this session belongs to: "claude", "codex", etc.
+    /// Which CLI tool this session belongs to: "claude", "codex", "opencode",
+    /// "grok", or "kimi".
     /// Also used as the identifier for the `hidden_agents` config key
     /// (case-insensitive match).
     pub agent_cli: &'static str,
     pub pid: u32,
+    /// Internal, exact opaque OS process-incarnation anchor that the collector
+    /// tied to this logical row while validating ownership. Never render or
+    /// serialize this value. PID actions must compare this retained value with
+    /// fresh OS observations; they must never create the expected identity by
+    /// resampling the PID after collection.
+    ///
+    /// `None` means ownership is not strong enough for kill or terminal-jump
+    /// actions, even when lifecycle metadata is otherwise useful for display.
+    pub action_process_incarnation: Option<String>,
     pub session_id: String,
     pub cwd: String,
     pub project_name: String,
     pub started_at: u64,
     pub status: SessionStatus,
+    /// Provenance, freshness, and bounded samples supporting `status`.
+    pub status_evidence: StatusEvidence,
     pub model: String,
     /// Reasoning effort setting (Codex CLI only: "minimal" | "low" | "medium" | "high").
     /// Empty string when unknown or not applicable.
@@ -182,6 +510,10 @@ pub struct AgentSession {
     /// turn has already been closed (no tools currently in flight).
     /// Used to animate the timeline bar for the running tool(s).
     pub pending_since_ms: u64,
+    /// True when exact provider or terminal evidence exposes a pending
+    /// interaction that needs a user response. Codex hook candidates alone
+    /// remain false because their contract cannot prove prompt resolution.
+    pub awaiting_input: bool,
     /// Unix-epoch ms of the most recent `user` line (prompt or tool_result)
     /// that has not yet been followed by an assistant response. Zero when
     /// the last transcript entry was an assistant turn. Used to render a
@@ -191,11 +523,22 @@ pub struct AgentSession {
     pub file_accesses: Vec<FileAccess>,
     /// Config root directory for this session's agent (home-abbreviated, e.g. "~/.claude-work").
     /// For Claude Code: the active .claude* profile folder. For Codex: "~/.codex".
-    /// For OpenCode: the data directory containing opencode.db.
+    /// For OpenCode: the data directory containing opencode.db. For Grok and
+    /// Kimi: the active GROK_HOME or KIMI_CODE_HOME directory.
     pub config_root: String,
 }
 
 impl AgentSession {
+    /// Keep the compatibility flag exactly aligned with the lifecycle enum.
+    /// Waiting is reserved for an exactly observed actionable interaction.
+    pub fn enforce_status_contract(&mut self) {
+        self.awaiting_input = matches!(self.status, SessionStatus::Waiting);
+    }
+
+    pub fn is_awaiting_input(&self) -> bool {
+        matches!(self.status, SessionStatus::Waiting)
+    }
+
     pub fn total_tokens(&self) -> u64 {
         self.total_input_tokens
             + self.total_output_tokens
@@ -207,6 +550,30 @@ impl AgentSession {
     /// Used for rate calculation to avoid inflated numbers from cache_read.
     pub fn active_tokens(&self) -> u64 {
         self.total_input_tokens + self.total_output_tokens + self.total_cache_create
+    }
+
+    /// Task text suitable for user-facing session summaries.
+    ///
+    /// Status-owned labels take precedence over stale provider task text.
+    /// Only Executing may expose a provider tool/task preview: every terminal,
+    /// quiescent, waiting, or uncertain state uses a canonical label so an old
+    /// tool name cannot make an Idle or Unknown row look active.
+    pub fn display_task(&self) -> Option<&str> {
+        match self.status {
+            SessionStatus::Thinking => Some("thinking"),
+            SessionStatus::Executing => self
+                .current_tasks
+                .last()
+                .map(String::as_str)
+                .or(Some("executing")),
+            SessionStatus::Working => Some("working"),
+            SessionStatus::Waiting => Some("waiting for user input"),
+            SessionStatus::Idle => Some("idle"),
+            SessionStatus::RateLimited => Some("rate limited"),
+            SessionStatus::Error => Some("error"),
+            SessionStatus::Unknown => Some("status evidence unavailable"),
+            SessionStatus::Done => Some("finished"),
+        }
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -237,6 +604,11 @@ pub struct SessionFile {
     pub cwd: String,
     #[serde(rename = "startedAt")]
     pub started_at: u64,
+    /// Optional, undocumented per-PID Claude session status. Serde defaults it
+    /// when absent for compatibility; the collector uses an exact decision-tool
+    /// fallback when this signal is not waiting.
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 impl SessionFile {
@@ -263,15 +635,111 @@ fn truncate_string(s: &mut String, max_bytes: usize) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rate_limit_window_provenance_has_stable_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&RateLimitProvenance::Native).unwrap(),
+            r#""native""#
+        );
+        assert_eq!(
+            serde_json::to_string(&RateLimitProvenance::CodexBar).unwrap(),
+            r#""codexbar""#
+        );
+    }
+
+    #[test]
+    fn rate_limit_info_default_preserves_legacy_fields_and_empty_windows() {
+        let value = serde_json::to_value(RateLimitInfo::default()).unwrap();
+        assert_eq!(value["source"], "");
+        assert!(value["five_hour_pct"].is_null());
+        assert!(value["seven_day_pct"].is_null());
+        assert_eq!(value["windows"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn rate_limit_window_serializes_all_public_fields() {
+        let window = RateLimitWindow::try_new(
+            "codex-spark-weekly",
+            "Codex Spark Weekly",
+            12.5,
+            Some(1_800_000_000),
+            Some(10_080),
+            RateLimitProvenance::CodexBar,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(window).unwrap(),
+            serde_json::json!({
+                "id": "codex-spark-weekly",
+                "label": "Codex Spark Weekly",
+                "used_pct": 12.5,
+                "resets_at": 1_800_000_000_u64,
+                "window_minutes": 10_080,
+                "provenance": "codexbar"
+            })
+        );
+    }
+
+    #[test]
+    fn rate_limit_window_rejects_unbounded_or_unsafe_identity_fields() {
+        let make = |id: String, label: String| {
+            RateLimitWindow::try_new(id, label, 1.0, None, None, RateLimitProvenance::Native)
+        };
+
+        assert!(make(String::new(), "Five hours".into()).is_none());
+        assert!(make("primary".into(), String::new()).is_none());
+        assert!(make(
+            "x".repeat(MAX_RATE_LIMIT_WINDOW_ID_BYTES + 1),
+            "Five hours".into()
+        )
+        .is_none());
+        assert!(make(
+            "primary".into(),
+            "x".repeat(MAX_RATE_LIMIT_WINDOW_LABEL_BYTES + 1)
+        )
+        .is_none());
+        assert!(make("primary\nsecondary".into(), "Five hours".into()).is_none());
+        assert!(make("primary".into(), "Five\thours".into()).is_none());
+        assert!(make("primary".into(), "Five \u{202E}hours".into()).is_none());
+
+        let bounded_unicode_label = "ą".repeat(MAX_RATE_LIMIT_WINDOW_LABEL_BYTES / 2);
+        assert!(make("primary".into(), bounded_unicode_label).is_some());
+    }
+
+    #[test]
+    fn rate_limit_window_rejects_invalid_measurements() {
+        let make = |used_pct, window_minutes| {
+            RateLimitWindow::try_new(
+                "primary",
+                "Five hours",
+                used_pct,
+                None,
+                window_minutes,
+                RateLimitProvenance::Native,
+            )
+        };
+
+        assert!(make(f64::NAN, Some(300)).is_none());
+        assert!(make(f64::INFINITY, Some(300)).is_none());
+        assert!(make(-0.1, Some(300)).is_none());
+        assert!(make(100.1, Some(300)).is_none());
+        assert!(make(50.0, Some(0)).is_none());
+        assert!(make(0.0, None).is_some());
+        assert!(make(100.0, Some(300)).is_some());
+    }
+
     fn make_session(input: u64, output: u64, cache_read: u64, cache_create: u64) -> AgentSession {
         AgentSession {
             agent_cli: "claude",
             pid: 0,
+            action_process_incarnation: None,
             session_id: String::new(),
             cwd: String::new(),
             project_name: String::new(),
             started_at: 0,
             status: SessionStatus::Waiting,
+            status_evidence: StatusEvidence::default(),
             model: String::new(),
             effort: String::new(),
             context_percent: 0.0,
@@ -299,6 +767,7 @@ mod tests {
             chat_messages: Vec::new(),
             tool_calls: Vec::new(),
             pending_since_ms: 0,
+            awaiting_input: false,
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: String::new(),
@@ -315,5 +784,187 @@ mod tests {
     fn test_active_tokens() {
         let session = make_session(100, 50, 200, 30);
         assert_eq!(session.active_tokens(), 180); // 100 + 50 + 30, excludes cache_read
+    }
+
+    #[test]
+    fn thinking_executing_and_working_are_active() {
+        for status in [
+            SessionStatus::Thinking,
+            SessionStatus::Executing,
+            SessionStatus::Working,
+        ] {
+            assert!(status.is_active(), "{status:?}");
+        }
+        for status in [
+            SessionStatus::Waiting,
+            SessionStatus::Idle,
+            SessionStatus::Unknown,
+            SessionStatus::RateLimited,
+            SessionStatus::Error,
+            SessionStatus::Done,
+        ] {
+            assert!(!status.is_active(), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn codex_active_subagent_reason_is_stable_and_content_free() {
+        assert_eq!(
+            StatusReason::HookSubagentActive.as_str(),
+            "Codex hook subagent active"
+        );
+        assert_eq!(
+            serde_json::to_string(&StatusReason::HookSubagentActive).unwrap(),
+            r#""HookSubagentActive""#
+        );
+    }
+
+    #[test]
+    fn herdr_status_reasons_are_stable_and_content_free() {
+        let cases = [
+            (StatusReason::HerdrScreenBlocked, "HerdrScreenBlocked"),
+            (StatusReason::HerdrScreenWorking, "HerdrScreenWorking"),
+            (StatusReason::HerdrScreenIdle, "HerdrScreenIdle"),
+            (StatusReason::HerdrWorkingUnrefined, "HerdrWorkingUnrefined"),
+        ];
+        for (reason, wire_name) in cases {
+            assert!(reason.as_str().starts_with("Herdr "));
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{wire_name}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn status_owned_task_labels_override_stale_provider_text() {
+        let mut session = make_session(0, 0, 0, 0);
+        session.current_tasks.push("Edit stale.rs".into());
+
+        session.status = SessionStatus::Waiting;
+        assert_eq!(session.display_task(), Some("waiting for user input"));
+
+        session.status = SessionStatus::Thinking;
+        assert_eq!(session.display_task(), Some("thinking"));
+
+        session.status = SessionStatus::Working;
+        assert_eq!(session.display_task(), Some("working"));
+
+        session.status = SessionStatus::RateLimited;
+        assert_eq!(session.display_task(), Some("rate limited"));
+    }
+
+    #[test]
+    fn status_owned_task_labels_never_leak_stale_work() {
+        let mut session = make_session(0, 0, 0, 0);
+        session.current_tasks.push("Edit stale.rs".into());
+
+        for (status, expected) in [
+            (SessionStatus::Working, "working"),
+            (SessionStatus::Waiting, "waiting for user input"),
+            (SessionStatus::Idle, "idle"),
+            (SessionStatus::Unknown, "status evidence unavailable"),
+            (SessionStatus::RateLimited, "rate limited"),
+            (SessionStatus::Error, "error"),
+            (SessionStatus::Done, "finished"),
+        ] {
+            session.status = status;
+            assert_eq!(session.display_task(), Some(expected), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn missing_status_evidence_fails_closed() {
+        let evidence: StatusEvidence =
+            serde_json::from_str("{}").expect("missing fields use safe defaults");
+        assert_eq!(evidence.authority, StatusAuthority::Unavailable);
+        assert_eq!(evidence.reason, StatusReason::Unavailable);
+        assert_eq!(evidence.observed_at_ms, 0);
+        assert_eq!(evidence.consecutive_matching, 0);
+        assert!(evidence.observations.is_empty());
+        assert_eq!(
+            serde_json::from_str::<SessionStatus>("\"Error\"").unwrap(),
+            SessionStatus::Error
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionStatus::Working).unwrap(),
+            "\"Working\""
+        );
+    }
+
+    #[test]
+    fn status_evidence_tracks_transitions_and_bounds_samples() {
+        let mut evidence = StatusEvidence::default();
+        evidence.observe(StatusObservation::new(
+            SessionStatus::Idle,
+            StatusAuthority::Provider,
+            StatusReason::ProviderIdle,
+            10,
+            1,
+        ));
+        evidence.observe(StatusObservation::new(
+            SessionStatus::Idle,
+            StatusAuthority::Provider,
+            StatusReason::ProviderIdle,
+            20,
+            1,
+        ));
+        assert_eq!(evidence.status_since_ms, 10);
+        assert_eq!(evidence.consecutive_matching, 2);
+
+        evidence.observe(StatusObservation::new(
+            SessionStatus::Thinking,
+            StatusAuthority::Provider,
+            StatusReason::ProviderThinking,
+            30,
+            1,
+        ));
+        assert_eq!(evidence.status_since_ms, 30);
+        assert_eq!(evidence.consecutive_matching, 1);
+
+        for observed_at_ms in 31..=(MAX_STATUS_OBSERVATIONS as u64 + 40) {
+            evidence.observe(StatusObservation::new(
+                SessionStatus::Thinking,
+                StatusAuthority::Provider,
+                StatusReason::ProviderThinking,
+                observed_at_ms,
+                1,
+            ));
+        }
+        assert_eq!(evidence.observations.len(), MAX_STATUS_OBSERVATIONS);
+        assert_eq!(
+            evidence
+                .recent(MAX_VISIBLE_STATUS_OBSERVATIONS)
+                .observations
+                .len(),
+            MAX_VISIBLE_STATUS_OBSERVATIONS
+        );
+    }
+
+    #[test]
+    fn awaiting_input_is_exactly_the_waiting_status() {
+        let mut session = make_session(0, 0, 0, 0);
+        for status in [
+            SessionStatus::Thinking,
+            SessionStatus::Executing,
+            SessionStatus::Working,
+            SessionStatus::Idle,
+            SessionStatus::Unknown,
+            SessionStatus::RateLimited,
+            SessionStatus::Error,
+            SessionStatus::Done,
+        ] {
+            session.status = status;
+            session.awaiting_input = true;
+            session.enforce_status_contract();
+            assert!(!session.awaiting_input, "{status:?}");
+            assert!(!session.is_awaiting_input(), "{status:?}");
+        }
+
+        session.status = SessionStatus::Waiting;
+        session.awaiting_input = false;
+        session.enforce_status_contract();
+        assert!(session.awaiting_input);
+        assert!(session.is_awaiting_input());
     }
 }
