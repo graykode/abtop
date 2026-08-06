@@ -22,6 +22,7 @@ dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
 unicode-width = "0.2"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 proc_pidinfo = "0.1"
