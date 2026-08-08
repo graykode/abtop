@@ -99,6 +99,14 @@ impl SessionTokenUsage {
     }
 }
 
+/// Last call token usage from a session's settings (`lastCallTokenUsage`).
+#[derive(Debug, Default, Clone, Copy)]
+struct LastCallUsage {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+}
+
 /// Deserialized `sessions-index.json`.
 #[derive(Debug, Deserialize)]
 struct IndexRoot {
@@ -172,6 +180,8 @@ pub struct FactoryCollector {
     /// Inclusive token usage for worker sessions as recorded by their parent
     /// (`childInclusiveTokenUsageBySessionId`).
     cached_child_tokens: HashMap<String, SessionTokenUsage>,
+    /// Last call token usage by session id (from `lastCallTokenUsage` in settings).
+    cached_last_call_usage: HashMap<String, LastCallUsage>,
     /// PIDs of detected droid processes on the last tick.
     last_droid_pids: Vec<u32>,
 }
@@ -189,6 +199,7 @@ impl FactoryCollector {
             cached_issues: Vec::new(),
             cached_tokens: HashMap::new(),
             cached_child_tokens: HashMap::new(),
+            cached_last_call_usage: HashMap::new(),
             last_droid_pids: Vec::new(),
         }
     }
@@ -220,9 +231,10 @@ impl FactoryCollector {
             self.cached_models = read_models(&self.root);
             self.cached_missions = read_missions(&self.root);
             self.cached_issues = validate_config(&self.root);
-            let (tokens, child_tokens) = read_session_tokens(&self.root);
+            let (tokens, child_tokens, last_call) = read_session_tokens(&self.root);
             self.cached_tokens = tokens;
             self.cached_child_tokens = child_tokens;
+            self.cached_last_call_usage = last_call;
         }
         self.build_sessions()
     }
@@ -309,6 +321,27 @@ impl FactoryCollector {
                 .map(|m| (*m).to_string())
                 .unwrap_or_else(|| default_model.clone());
 
+            // Find max_context_limit for this model from the catalog.
+            let context_window = self
+                .cached_models
+                .iter()
+                .find(|m| m.id == model || m.model == model)
+                .map(|m| m.max_context_limit)
+                .unwrap_or(0);
+
+            // Current context usage from last call (input + cache_read, like Claude).
+            let last_call = self
+                .cached_last_call_usage
+                .get(&parent.session_id)
+                .copied()
+                .unwrap_or_default();
+            let current_context = last_call.input.saturating_add(last_call.cache_read);
+            let context_percent = if context_window > 0 {
+                (current_context as f64 / context_window as f64 * 100.0).min(100.0)
+            } else {
+                0.0
+            };
+
             let tokens = self
                 .cached_tokens
                 .get(&parent.session_id)
@@ -325,7 +358,7 @@ impl FactoryCollector {
                 status: live_status(age),
                 model,
                 effort: String::new(),
-                context_percent: 0.0,
+                context_percent,
                 total_input_tokens: tokens.input,
                 total_output_tokens: tokens.output,
                 total_cache_read: tokens.cache_read,
@@ -340,7 +373,7 @@ impl FactoryCollector {
                 token_history: Vec::new(),
                 context_history: Vec::new(),
                 compaction_count: 0,
-                context_window: 0,
+                context_window,
                 subagents,
                 mem_file_count: 0,
                 mem_line_count: 0,
@@ -426,12 +459,17 @@ fn read_index(root: &Path) -> Vec<IndexEntry> {
 
 /// Recursively scan `sessions/` for `<sessionId>.settings.json` files and parse
 /// token usage. Returns `(own usage by session id, child inclusive usage by
-/// child session id as recorded by each parent)`.
+/// child session id, last call usage by session id)`.
 fn read_session_tokens(
     root: &Path,
-) -> (HashMap<String, SessionTokenUsage>, HashMap<String, SessionTokenUsage>) {
+) -> (
+    HashMap<String, SessionTokenUsage>,
+    HashMap<String, SessionTokenUsage>,
+    HashMap<String, LastCallUsage>,
+) {
     let mut own = HashMap::new();
     let mut children = HashMap::new();
+    let mut last_call = HashMap::new();
     let mut stack = vec![root.join("sessions")];
     while let Some(dir) = stack.pop() {
         let Ok(read_dir) = fs::read_dir(&dir) else {
@@ -459,6 +497,9 @@ fn read_session_tokens(
             if let Some(usage) = parse_token_usage(v.get("tokenUsage")) {
                 own.insert(session_id.to_string(), usage);
             }
+            if let Some(lc) = parse_last_call_usage(v.get("lastCallTokenUsage")) {
+                last_call.insert(session_id.to_string(), lc);
+            }
             if let Some(child_usage) = v
                 .get("childInclusiveTokenUsageBySessionId")
                 .and_then(serde_json::Value::as_object)
@@ -471,7 +512,18 @@ fn read_session_tokens(
             }
         }
     }
-    (own, children)
+    (own, children, last_call)
+}
+
+/// Parse `lastCallTokenUsage` from a session's settings.
+fn parse_last_call_usage(v: Option<&serde_json::Value>) -> Option<LastCallUsage> {
+    let obj = v?.as_object()?;
+    let get = |key: &str| obj.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    Some(LastCallUsage {
+        input: get("inputTokens"),
+        output: get("outputTokens"),
+        cache_read: get("cacheReadTokens"),
+    })
 }
 
 /// Parse a Factory Droid token usage object, tolerating missing/unknown fields.
@@ -971,6 +1023,7 @@ mod tests {
             cached_issues: Vec::new(),
             cached_tokens: HashMap::new(),
             cached_child_tokens: HashMap::new(),
+            cached_last_call_usage: HashMap::new(),
             last_droid_pids: Vec::new(),
         }
     }
@@ -1063,7 +1116,7 @@ mod tests {
         std::fs::write(sessions.join("notes.txt"), "not json").unwrap();
         std::fs::write(sessions.join("misc.settings.json.bak"), "{").unwrap();
 
-        let (own, children) = read_session_tokens(root);
+        let (own, children, _last_call) = read_session_tokens(root);
         assert_eq!(own.get("parent-1").unwrap().total(), 420);
         assert_eq!(own.get("worker-1").unwrap().total(), 12);
         assert_eq!(children.get("worker-1").unwrap().total(), 42);

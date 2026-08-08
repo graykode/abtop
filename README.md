@@ -118,8 +118,10 @@ abtop is also a library crate, so local tools can reuse its data-collection laye
 
 ```bash
 abtop --json          # one-shot JSON snapshot for scripts
-abtop --status-json   # compact status summary; omits paths, prompts, session ids
+abtop --status-json   # compact status summary; omits local paths, prompts, session ids
 ```
+
+The **JSON snapshot includes** `chat_messages`, `summary`, working directories, tool-call previews, token counts, and a `factory` block — matching the TUI view.
 
 For long-running consumers, build an `App`, refresh with `App::tick_no_summaries()` (never spawns `claude --print`), and call `App::to_snapshot(interval_ms)`:
 
@@ -137,7 +139,7 @@ let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
 
 ## Privacy
 
-abtop reads local files and local process/open-file metadata only. No API keys, no auth. Tool names and file paths are shown, but file contents and prompt text are never displayed. The full `--json` snapshot includes local dashboard data (summaries, chat text, working directories, tool-call previews, token counts) plus a `factory` block — treat it as private and don't expose it without your own access controls. `--status-json` emits only aggregate health/quota fields.
+abtop reads local files and local process/open-file metadata only. No API keys, no auth. Tool names and file paths are shown, but file contents and prompt text are never displayed. The full `--json` snapshot includes local dashboard data (`chat_messages`, `summary`, working directories, tool-call previews, token counts) plus a `factory` block — treat it as private and don't expose it without your own access controls. `--status-json` emits only aggregate health/quota fields and **omits local paths**.
 
 ## License
 
