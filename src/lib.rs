@@ -274,7 +274,7 @@ fn run_app(
                             KeyCode::Char('T') => app.tree_view = !app.tree_view,
                             KeyCode::Char('l') => app.toggle_timeline(),
                             KeyCode::Char('f') => app.toggle_file_audit(),
-                            KeyCode::Char(c @ '1'..='7') => app.toggle_panel(c as u8 - b'0'),
+                            KeyCode::Char(c @ '1'..='9') => app.toggle_panel(c as u8 - b'0'),
                             KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
                             KeyCode::Char('t') => app.cycle_theme(),
                             _ => {}
@@ -319,7 +319,7 @@ fn run_app(
                             KeyCode::Char('t') => app.cycle_theme(),
                             KeyCode::Char('T') => app.tree_view = !app.tree_view,
                             KeyCode::Char('l') | KeyCode::Char('L') => app.toggle_timeline(),
-                            KeyCode::Char(c @ '1'..='7') => app.toggle_panel(c as u8 - b'0'),
+                            KeyCode::Char(c @ '1'..='9') => app.toggle_panel(c as u8 - b'0'),
                             KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
                             KeyCode::Char('c') => app.toggle_config(),
                             KeyCode::Char('v') => app.toggle_view_menu(),

@@ -9,6 +9,8 @@ pub struct PanelVisibility {
     pub ports: bool,
     pub sessions: bool,
     pub mcp: bool,
+    pub models: bool,
+    pub missions: bool,
 }
 
 impl Default for PanelVisibility {
@@ -21,6 +23,8 @@ impl Default for PanelVisibility {
             ports: true,
             sessions: true,
             mcp: true,
+            models: false,
+            missions: false,
         }
     }
 }
@@ -104,6 +108,8 @@ fn parse_config_body(content: &str) -> AppConfig {
                 "show_ports" => config.panels.ports = parse_bool(val).unwrap_or(true),
                 "show_sessions" => config.panels.sessions = parse_bool(val).unwrap_or(true),
                 "show_mcp" => config.panels.mcp = parse_bool(val).unwrap_or(true),
+                "show_models" => config.panels.models = parse_bool(val).unwrap_or(true),
+                "show_missions" => config.panels.missions = parse_bool(val).unwrap_or(true),
                 _ => {}
             }
         }
@@ -167,6 +173,8 @@ pub fn save_panel_visibility(panels: &PanelVisibility) -> Result<(), String> {
         ("show_ports", panels.ports.to_string()),
         ("show_sessions", panels.sessions.to_string()),
         ("show_mcp", panels.mcp.to_string()),
+        ("show_models", panels.models.to_string()),
+        ("show_missions", panels.missions.to_string()),
     ])
 }
 
@@ -260,6 +268,17 @@ mod tests {
         let cfg = parse_config_body(r#"claude_config_dirs = ["~/.claude-personal"]"#);
 
         assert_eq!(cfg.claude_config_dirs, vec![home.join(".claude-personal")]);
+    }
+
+    #[test]
+    fn parse_config_body_loads_factory_panel_keys() {
+        let cfg = parse_config_body("show_models = false\nshow_missions = true\n");
+        assert!(!cfg.panels.models);
+        assert!(cfg.panels.missions);
+        // Unset keys keep their defaults.
+        let cfg = parse_config_body("");
+        assert!(!cfg.panels.models);
+        assert!(!cfg.panels.missions);
     }
 
     fn theme_update(name: &str) -> Vec<(&'static str, String)> {

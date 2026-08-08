@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::collector::factory::{FactoryConfigIssue, FactoryMission, FactoryModel};
 use crate::model::{
     AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, OrphanPort,
     RateLimitInfo, SessionStatus, SubAgent, ToolCall,
@@ -509,6 +510,68 @@ pub fn populate_demo(app: &mut App) {
             config_root: "~/.local/share/opencode".into(),
             file_accesses: vec![],
         },
+        AgentSession {
+            agent_cli: "factory",
+            pid: 9800,
+            session_id: "ses_f6a7b8c9-def0-1234-5678-666666666666".into(),
+            cwd: "/Users/demo/factory-droid".into(),
+            project_name: "factory-droid".into(),
+            started_at: now - 3 * 60 * 1000, // 3m ago
+            status: SessionStatus::Executing,
+            model: "custom:claude-opus-5-0".into(),
+            effort: String::new(),
+            context_percent: 61.0,
+            total_input_tokens: 18_400,
+            total_output_tokens: 6_200,
+            total_cache_read: 240_000,
+            total_cache_create: 31_000,
+            turn_count: 17,
+            current_tasks: vec!["Mission: draft migration plan".into()],
+            mem_mb: 210,
+            version: "1.2.3".into(),
+            git_branch: "".into(),
+            git_added: 0,
+            git_modified: 0,
+            token_history: vec![
+                4000, 7000, 11000, 9000, 13000, 10000, 15000, 12000, 17000, 14000, 19000, 16000,
+            ],
+            context_history: vec![],
+            compaction_count: 0,
+            context_window: 200_000,
+            subagents: vec![
+                SubAgent {
+                    name: "draft migration plan".into(),
+                    status: "done".into(),
+                    tokens: 4_100,
+                },
+                SubAgent {
+                    name: "verify breaking changes".into(),
+                    status: "working".into(),
+                    tokens: 2_300,
+                },
+            ],
+            mem_file_count: 1,
+            mem_line_count: 4,
+            children: vec![],
+
+            first_assistant_text: String::new(),
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Plan the migration to the new storage backend".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "Scoped the migration; worker is verifying breaking changes now.".into(),
+                },
+            ],
+            initial_prompt: "Plan the migration to the new storage backend".into(),
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            config_root: "~/.factory".into(),
+            file_accesses: vec![],
+        },
     ];
 
     // --- Summaries (pre-populated, no LLM calls) ---
@@ -531,6 +594,10 @@ pub fn populate_demo(app: &mut App) {
     app.summaries.insert(
         "ses_e5f6a7b8-9abc-def0-1234-555555555555".into(),
         "Terraform multi-region refactor".into(),
+    );
+    app.summaries.insert(
+        "ses_f6a7b8c9-def0-1234-5678-666666666666".into(),
+        "Storage migration plan".into(),
     );
 
     // --- Rate limits ---
@@ -582,4 +649,69 @@ pub fn populate_demo(app: &mut App) {
         load1: 1.8,
     });
     app.agent_aggregate = crate::host_info::AgentAggregate::from_sessions(&app.sessions);
+
+    // --- Factory Droid catalog, missions, and config validation ---
+    app.factory_app_running = true;
+    app.factory_models = vec![
+        FactoryModel {
+            id: "custom:claude-opus-5-0".into(),
+            model: "claude-opus-5".into(),
+            display_name: "Claude Opus 5".into(),
+            provider: "anthropic".into(),
+            base_url: "https://api.anthropic.com".into(),
+            max_context_limit: 200_000,
+            max_output_tokens: 32_000,
+            no_image_support: false,
+            index: 0,
+            source: "droid",
+            is_default: true,
+        },
+        FactoryModel {
+            id: "custom:qwen3-coder".into(),
+            model: "qwen3-coder:14b".into(),
+            display_name: "Qwen3 Coder".into(),
+            provider: "ollama".into(),
+            base_url: "http://localhost:11434".into(),
+            max_context_limit: 32_000,
+            max_output_tokens: 8_192,
+            no_image_support: true,
+            index: 1,
+            source: "vibemode",
+            is_default: false,
+        },
+    ];
+    app.factory_missions = vec![
+        FactoryMission {
+            mission_id: "mis_57ffdada".into(),
+            dir: "mis_57ffdada".into(),
+            state: "running".into(),
+            title: "Storage migration plan".into(),
+            cwd: "/Users/demo/factory-droid".into(),
+            created_at_ms: now - 3 * 60 * 1000,
+            updated_at_ms: now - 15_000,
+            worker_model: "custom:claude-opus-5-0".into(),
+        },
+        FactoryMission {
+            mission_id: "mis_77aa0001".into(),
+            dir: "mis_77aa0001".into(),
+            state: "paused".into(),
+            title: "UI polish pass".into(),
+            cwd: "/Users/demo/factory-droid".into(),
+            created_at_ms: now - 26 * 60 * 1000,
+            updated_at_ms: now - 18 * 60 * 1000,
+            worker_model: "custom:qwen3-coder".into(),
+        },
+    ];
+    app.factory_issues = vec![
+        FactoryConfigIssue {
+            severity: "medium",
+            file: "settings.json".into(),
+            message: "model default points to unknown id".into(),
+        },
+        FactoryConfigIssue {
+            severity: "low",
+            file: "missions/mis_77aa0001/state.json".into(),
+            message: "stale heartbeat".into(),
+        },
+    ];
 }

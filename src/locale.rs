@@ -47,6 +47,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     // Agent labels
     m.insert("agent.claude", "*CC");
     m.insert("agent.codex", ">CD");
+    m.insert("agent.factory", "@FC");
 
     // Tool labels
     m.insert("tool.bash", "Bash");
@@ -127,7 +128,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("help.toggle_file_audit", "toggle file audit");
     m.insert(
         "help.toggle_panels",
-        "toggle panels (context/quota/tokens/projects/ports/sessions/mcp)",
+        "toggle panels (context/quota/tokens/projects/ports/sessions/mcp/models/missions)",
     );
     m.insert(
         "help.mcp_suppress",
@@ -166,6 +167,8 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("view.sessions_panel", "sessions panel");
     m.insert("view.mcp_servers_panel", "mcp servers panel");
     m.insert("view.mcp_session_hide", "mcp session hide");
+    m.insert("view.models_panel", "models panel");
+    m.insert("view.missions_panel", "missions panel");
     m.insert("view.cycle_theme", "cycle theme");
     m.insert("view.key_toggle", "key = toggle  ·  Esc = close ");
 
@@ -230,6 +233,20 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("mcp.default", "default");
     m.insert("mcp.suppress_off", "suppress: off (M)");
 
+    // Models panel
+    m.insert("models.no_models", "no custom models");
+    m.insert("models.running", "running");
+    m.insert("models.stopped", "stopped");
+    m.insert("models.default", "default");
+    m.insert("models.provider", "provider");
+    m.insert("models.context", "ctx");
+    m.insert("models.source", "src");
+    m.insert("models.output", "out");
+
+    // Missions panel
+    m.insert("missions.no_missions", "no missions");
+    m.insert("missions.model", "model");
+
     // Config panel
     m.insert("config.title", " Config ");
     m.insert("config.theme", "Theme");
@@ -244,6 +261,8 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("config.ports_panel", "Ports panel (5)");
     m.insert("config.sessions_panel", "Sessions panel (6)");
     m.insert("config.mcp_panel", "MCP servers (7)");
+    m.insert("config.models_panel", "Models panel (8)");
+    m.insert("config.missions_panel", "Missions panel (9)");
 
     // Terminal size too small
     m.insert("term.too_small", "Terminal size too small:");
@@ -299,6 +318,7 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     // Agent labels
     m.insert("agent.claude", "*CC");
     m.insert("agent.codex", ">CD");
+    m.insert("agent.factory", "@FC");
 
     // Tool labels
     m.insert("tool.bash", "终端");
@@ -379,7 +399,7 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("help.toggle_file_audit", "切换文件审计");
     m.insert(
         "help.toggle_panels",
-        "切换面板 (上下文/配额/词元/项目/端口/会话/MCP)",
+        "切换面板 (上下文/配额/词元/项目/端口/会话/MCP/模型/任务)",
     );
     m.insert("help.mcp_suppress", "切换会话面板中的 MCP 服务器隐藏");
     m.insert("help.this_help", "显示帮助");
@@ -415,6 +435,8 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("view.sessions_panel", "会话面板");
     m.insert("view.mcp_servers_panel", "MCP 服务器面板");
     m.insert("view.mcp_session_hide", "隐藏 MCP 会话");
+    m.insert("view.models_panel", "模型面板");
+    m.insert("view.missions_panel", "任务面板");
     m.insert("view.cycle_theme", "切换主题");
     m.insert("view.key_toggle", "按键切换  ·  Esc 关闭 ");
 
@@ -479,6 +501,20 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("mcp.default", "默认");
     m.insert("mcp.suppress_off", "隐藏: 关闭 (M)");
 
+    // Models panel
+    m.insert("models.no_models", "无自定义模型");
+    m.insert("models.running", "运行中");
+    m.insert("models.stopped", "已停止");
+    m.insert("models.default", "默认");
+    m.insert("models.provider", "提供方");
+    m.insert("models.context", "上下文");
+    m.insert("models.source", "来源");
+    m.insert("models.output", "输出");
+
+    // Missions panel
+    m.insert("missions.no_missions", "无任务");
+    m.insert("missions.model", "模型");
+
     // Config panel
     m.insert("config.title", " 配置 ");
     m.insert("config.theme", "主题");
@@ -493,6 +529,8 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("config.ports_panel", "端口面板 (5)");
     m.insert("config.sessions_panel", "会话面板 (6)");
     m.insert("config.mcp_panel", "MCP 服务器 (7)");
+    m.insert("config.models_panel", "模型面板 (8)");
+    m.insert("config.missions_panel", "任务面板 (9)");
 
     // Terminal size too small
     m.insert("term.too_small", "终端尺寸过小:");

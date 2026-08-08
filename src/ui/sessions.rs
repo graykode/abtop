@@ -134,9 +134,10 @@ pub(crate) fn draw_sessions_panel_active(
         let marker = if selected { "►" } else { " " };
 
         let (agent_label, agent_color) = match session.agent_cli {
-            "claude"   => ("*CC", Color::Rgb(217, 119, 87)),  // #D97757 terracotta
-            "codex"    => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
-            "opencode" => ("#OC", Color::Rgb(74, 222, 128)),  // #4ADE80 emerald
+            "claude" => ("*CC", Color::Rgb(217, 119, 87)), // #D97757 terracotta
+            "codex" => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
+            "opencode" => ("#OC", Color::Rgb(74, 222, 128)), // #4ADE80 emerald
+            "factory" => ("@FC", Color::Rgb(129, 140, 248)), // #818CF8 indigo
             other => {
                 let fallback: String = other.chars().take(3).collect::<String>().to_uppercase();
                 (
@@ -255,8 +256,7 @@ pub(crate) fn draw_sessions_panel_active(
         rows.push(Row::new(cells).style(row_style).height(1));
 
         // 2nd line: task text in Summary column
-        let summary_idx =
-            3 + show_pid as usize + show_session_id as usize + show_config as usize;
+        let summary_idx = 3 + show_pid as usize + show_session_id as usize + show_config as usize;
         let total_cols = 6
             + show_pid as usize
             + show_session_id as usize

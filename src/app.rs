@@ -1,3 +1,4 @@
+use crate::collector::factory::{FactoryConfigIssue, FactoryMission, FactoryModel};
 use crate::collector::{read_rate_limits, McpServer, MultiCollector};
 use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
@@ -80,9 +81,11 @@ impl NarrowTab {
 pub enum NarrowSection {
     Sessions,
     Projects,
+    Missions,
     Context,
     Quota,
     Tokens,
+    Models,
     Ports,
     Mcp,
 }
@@ -90,8 +93,8 @@ pub enum NarrowSection {
 impl NarrowSection {
     pub fn tab(self) -> NarrowTab {
         match self {
-            Self::Sessions | Self::Projects => NarrowTab::Work,
-            Self::Context | Self::Quota | Self::Tokens => NarrowTab::Usage,
+            Self::Sessions | Self::Projects | Self::Missions => NarrowTab::Work,
+            Self::Context | Self::Quota | Self::Tokens | Self::Models => NarrowTab::Usage,
             Self::Ports | Self::Mcp => NarrowTab::System,
         }
     }
@@ -136,6 +139,17 @@ pub struct App {
     pub show_ports: bool,
     pub show_sessions: bool,
     pub show_mcp: bool,
+    pub show_models: bool,
+    pub show_missions: bool,
+    /// Factory Droid custom-model catalog (populated on slow ticks when the
+    /// droid workspace is present).
+    pub factory_models: Vec<FactoryModel>,
+    /// Factory Droid mission list (populated on slow ticks).
+    pub factory_missions: Vec<FactoryMission>,
+    /// Factory Droid config validation findings.
+    pub factory_issues: Vec<FactoryConfigIssue>,
+    /// True when a Factory Droid app process was detected on the last tick.
+    pub factory_app_running: bool,
     pub narrow_tab: NarrowTab,
     pub active_narrow_section: Option<NarrowSection>,
     pub maximized_narrow_section: Option<NarrowSection>,
@@ -213,6 +227,12 @@ impl App {
             show_ports: panels.ports,
             show_sessions: panels.sessions,
             show_mcp: panels.mcp,
+            show_models: panels.models,
+            show_missions: panels.missions,
+            factory_models: Vec::new(),
+            factory_missions: Vec::new(),
+            factory_issues: Vec::new(),
+            factory_app_running: false,
             narrow_tab: NarrowTab::Work,
             active_narrow_section: Some(NarrowSection::Sessions),
             maximized_narrow_section: None,
@@ -257,6 +277,8 @@ impl App {
             5 => self.show_ports = !self.show_ports,
             6 => self.show_sessions = !self.show_sessions,
             7 => self.show_mcp = !self.show_mcp,
+            8 => self.show_models = !self.show_models,
+            9 => self.show_missions = !self.show_missions,
             _ => return,
         }
         self.persist_panel_visibility();
@@ -286,6 +308,8 @@ impl App {
             ports: self.show_ports,
             sessions: self.show_sessions,
             mcp: self.show_mcp,
+            models: self.show_models,
+            missions: self.show_missions,
         };
         if let Err(e) = crate::config::save_panel_visibility(&panels) {
             self.set_status(format!("panels save failed: {}", e));
@@ -304,7 +328,7 @@ impl App {
     }
 
     pub fn config_item_count(&self) -> usize {
-        8 // theme + 7 panel toggles
+        10 // theme + 9 panel toggles
     }
 
     pub fn config_select_next(&mut self) {
@@ -330,6 +354,8 @@ impl App {
             5 => self.show_ports = !self.show_ports,
             6 => self.show_sessions = !self.show_sessions,
             7 => self.show_mcp = !self.show_mcp,
+            8 => self.show_models = !self.show_models,
+            9 => self.show_missions = !self.show_missions,
             _ => return,
         }
         self.persist_panel_visibility();
@@ -338,8 +364,10 @@ impl App {
 
     pub fn narrow_tab_visible(&self, tab: NarrowTab) -> bool {
         match tab {
-            NarrowTab::Work => self.show_sessions || self.show_projects,
-            NarrowTab::Usage => self.show_context || self.show_quota || self.show_tokens,
+            NarrowTab::Work => self.show_sessions || self.show_projects || self.show_missions,
+            NarrowTab::Usage => {
+                self.show_context || self.show_quota || self.show_tokens || self.show_models
+            }
             NarrowTab::System => self.show_ports || self.show_mcp,
         }
     }
@@ -401,9 +429,11 @@ impl App {
         match section {
             NarrowSection::Sessions => self.show_sessions,
             NarrowSection::Projects => self.show_projects,
+            NarrowSection::Missions => self.show_missions,
             NarrowSection::Context => self.show_context,
             NarrowSection::Quota => self.show_quota,
             NarrowSection::Tokens => self.show_tokens,
+            NarrowSection::Models => self.show_models,
             NarrowSection::Ports => self.show_ports,
             NarrowSection::Mcp => self.show_mcp,
         }
@@ -411,11 +441,16 @@ impl App {
 
     pub fn visible_narrow_sections(&self, tab: NarrowTab) -> Vec<NarrowSection> {
         let sections: &[NarrowSection] = match tab {
-            NarrowTab::Work => &[NarrowSection::Sessions, NarrowSection::Projects],
+            NarrowTab::Work => &[
+                NarrowSection::Sessions,
+                NarrowSection::Projects,
+                NarrowSection::Missions,
+            ],
             NarrowTab::Usage => &[
                 NarrowSection::Context,
                 NarrowSection::Quota,
                 NarrowSection::Tokens,
+                NarrowSection::Models,
             ],
             NarrowTab::System => &[NarrowSection::Ports, NarrowSection::Mcp],
         };
@@ -526,6 +561,10 @@ impl App {
         self.sessions = self.collector.collect();
         self.orphan_ports = self.collector.orphan_ports.clone();
         self.mcp_servers = self.collector.mcp_servers.clone();
+        self.factory_models = self.collector.factory_models().to_vec();
+        self.factory_missions = self.collector.factory_missions().to_vec();
+        self.factory_issues = self.collector.factory_issues().to_vec();
+        self.factory_app_running = self.collector.factory_app_running();
         self.host_metrics = self.host_sampler.sample();
         self.agent_aggregate = AgentAggregate::from_sessions(&self.sessions);
         if self.selected >= self.sessions.len() && !self.sessions.is_empty() {

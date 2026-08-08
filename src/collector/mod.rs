@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod codex;
+pub mod factory;
 pub mod mcp;
 pub mod opencode;
 pub mod process;
@@ -7,6 +8,7 @@ pub mod rate_limit;
 
 pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
+pub use factory::FactoryCollector;
 pub use mcp::McpServer;
 pub use opencode::OpenCodeCollector;
 pub use rate_limit::read_rate_limits;
@@ -270,6 +272,8 @@ impl Drop for DesktopRolloutScanner {
 pub struct MultiCollector {
     collectors: Vec<Box<dyn AgentCollector>>,
     codex_enabled: bool,
+    factory_enabled: bool,
+    factory: factory::FactoryCollector,
     tick_count: u32,
     cached_ports: HashMap<u32, Vec<u16>>,
     /// PID set snapshot from last port scan — invalidate cache when PIDs change.
@@ -320,9 +324,12 @@ impl MultiCollector {
             collectors.push(Box::new(OpenCodeCollector::new()));
         }
         let codex_enabled = !is_hidden("codex");
+        let factory_enabled = !is_hidden("factory");
         Self {
             collectors,
             codex_enabled,
+            factory_enabled,
+            factory: factory::FactoryCollector::new(),
             tick_count: SLOW_POLL_INTERVAL, // trigger on first tick
             cached_ports: HashMap::new(),
             cached_port_pids: Vec::new(),
@@ -345,6 +352,26 @@ impl MultiCollector {
             .iter()
             .filter_map(|c| c.live_rate_limit())
             .collect()
+    }
+
+    /// Factory Droid model catalog from the last slow tick.
+    pub fn factory_models(&self) -> &[factory::FactoryModel] {
+        self.factory.models()
+    }
+
+    /// Factory Droid missions from the last slow tick.
+    pub fn factory_missions(&self) -> &[factory::FactoryMission] {
+        self.factory.missions()
+    }
+
+    /// Factory Droid config validation findings from the last slow tick.
+    pub fn factory_issues(&self) -> &[factory::FactoryConfigIssue] {
+        self.factory.issues()
+    }
+
+    /// True when a Factory Droid app process was detected on the last tick.
+    pub fn factory_app_running(&self) -> bool {
+        self.factory.app_running()
     }
 
     /// Return all config directories discovered across all collectors.
@@ -396,6 +423,9 @@ impl MultiCollector {
         }
 
         let mut all = Vec::new();
+        if self.factory_enabled {
+            all.extend(self.factory.collect(&shared));
+        }
         for collector in &mut self.collectors {
             all.extend(collector.collect(&shared));
         }
@@ -515,13 +545,25 @@ mod tests {
     }
 
     #[test]
+    fn with_hidden_factory_disables_factory_collector() {
+        let mc = MultiCollector::with_hidden(&["factory".to_string()]);
+        assert!(!mc.factory_enabled);
+        let mc = MultiCollector::with_hidden(&["FACTORY".to_string()]);
+        assert!(!mc.factory_enabled);
+        let mc = MultiCollector::with_hidden(&[]);
+        assert!(mc.factory_enabled);
+    }
+
+    #[test]
     fn with_hidden_all_agents_yields_empty() {
         let mc = MultiCollector::with_hidden(&[
             "claude".to_string(),
             "codex".to_string(),
             "opencode".to_string(),
+            "factory".to_string(),
         ]);
         assert!(mc.collectors.is_empty());
+        assert!(!mc.factory_enabled);
     }
 
     #[test]

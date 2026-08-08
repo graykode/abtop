@@ -71,20 +71,22 @@ tmux new -s work
 
 ## Supported Agents
 
-| Feature           | Claude Code | Codex CLI | OpenCode |
-| ----------------- | :---------: | :-------: | :------: |
-| Session Discovery |     ✅      |    ✅     |    ✅    |
-| Token Tracking    |     ✅      |    ✅     |    ✅    |
-| Context Window %  |     ✅      |    ✅     |    ❌    |
-| Status Detection  |     ✅      |    ✅     |    ✅    |
-| Current Task      |     ✅      |    ✅     |    ❌    |
-| Rate Limit        |     ✅      |    ✅     |    ❌    |
-| Git Status        |     ✅      |    ✅     |    ✅    |
-| Children / Ports  |     ✅      |    ✅     |    ✅    |
-| Subagents         |     ✅      |    ❌     |    ❌    |
-| Memory Status     |     ✅      |    ❌     |    ❌    |
+| Feature           | Claude Code | Codex CLI | OpenCode | Factory Droid |
+| ----------------- | :---------: | :-------: | :------: | :-----------: |
+| Session Discovery |     ✅      |    ✅     |    ✅    |      ✅       |
+| Token Tracking    |     ✅      |    ✅     |    ✅    |      ✅       |
+| Context Window %  |     ✅      |    ✅     |    ❌    |      ❌       |
+| Status Detection  |     ✅      |    ✅     |    ✅    |      ✅       |
+| Current Task      |     ✅      |    ✅     |    ❌    |      ✅       |
+| Rate Limit        |     ✅      |    ✅     |    ❌    |      ❌       |
+| Git Status        |     ✅      |    ✅     |    ✅    |      ❌       |
+| Children / Ports  |     ✅      |    ✅     |    ✅    |      ❌       |
+| Subagents         |     ✅      |    ❌     |    ❌    |      ✅       |
+| Memory Status     |     ✅      |    ❌     |    ❌    |      ❌       |
 
 OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` and requires `sqlite3` in `PATH`.
+
+Factory Droid support reads the `~/.factory` workspace: live sessions from `sessions-index.json` (orchestrator sessions plus worker subagents), the custom-model catalog from `settings.json` / `factory-settings.json`, missions from `missions/<id>/`, and a config validator that flags duplicate ids, dangling default model references, and stale state files. API keys are never read. The models and missions panels are opt-in (`8` / `9`); `hidden_agents = ["factory"]` disables the collector entirely.
 
 ## Themes
 
@@ -123,6 +125,9 @@ theme = "btop"
 # Hide specific agent CLIs from the TUI (case-insensitive).
 # Useful if you only use one agent and want a cleaner view.
 hidden_agents = ["codex"]
+# Factory Droid models / missions panels (default: off, toggle with 8 / 9).
+show_models = true
+show_missions = true
 # Additional Claude Code profile roots to scan.
 # abtop also auto-discovers ~/.claude and ~/.claude-* roots that contain
 # both sessions/ and projects/.
@@ -149,7 +154,7 @@ When `language` is unset, abtop auto-detects from `LANG` — any value starting 
 | `x`                | Kill selected session                |
 | `X`                | Kill all orphan ports                |
 | `t`                | Cycle theme                          |
-| `1`–`5`            | Toggle panel visibility              |
+| `1`–`9`            | Toggle panel visibility           |
 | `Esc`              | Open/close config page               |
 | `q`                | Quit                                 |
 | `r`                | Force refresh                        |
@@ -193,7 +198,7 @@ is a reference consumer: a local-first web dashboard built on exactly this API.
 
 abtop reads local files and local process/open-file metadata only. No API keys, no auth. In the TUI and `--once` output, tool names and file paths are shown, but file contents and prompt text are never displayed. Session summaries are generated via `claude --print`, which makes its own API call — this is the only indirect network usage.
 
-The full JSON snapshot includes richer local dashboard data, including `summary`, `chat_messages`, working directories, config roots, tool-call previews, child process commands, token counts, and port metadata. Chat text is bounded and redacted by the collectors, but it is still derived from local transcripts and may contain sensitive project context. Treat full JSON snapshots as local/private data and avoid writing them to shared logs or exposing them on a network without your own access controls.
+The full JSON snapshot includes richer local dashboard data, including `summary`, `chat_messages`, working directories, config roots, tool-call previews, child process commands, token counts, and port metadata, plus a `factory` block (model catalog, missions, config issues). Chat text is bounded and redacted by the collectors, but it is still derived from local transcripts and may contain sensitive project context. Treat full JSON snapshots as local/private data and avoid writing them to shared logs or exposing them on a network without your own access controls.
 
 For lower-risk integrations, `--status-json` emits only aggregate health/quota fields and intentionally omits local paths, prompts, chat text, session identifiers, tool arguments, child commands, and project names.
 

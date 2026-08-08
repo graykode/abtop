@@ -48,6 +48,58 @@ pub struct Snapshot {
     pub orphan_ports: Vec<OrphanPort>,
     /// Detected MCP servers (currently `codex mcp-server`).
     pub mcp_servers: Vec<McpServerView>,
+    /// Factory Droid state: custom-model catalog, missions, config validation.
+    pub factory: FactorySnapshot,
+}
+
+/// Factory Droid state surfaced to JSON consumers. `apiKey` is intentionally
+/// never present; the catalog keeps only the provider `base_url`.
+#[derive(Debug, Clone, Serialize)]
+pub struct FactorySnapshot {
+    /// True when a running Factory Droid desktop app was detected.
+    pub app_running: bool,
+    /// Custom-model catalog (merged from settings + factory-settings).
+    pub models: Vec<FactoryModelView>,
+    /// Missions with lifecycle state and worker model.
+    pub missions: Vec<FactoryMissionView>,
+    /// Config validation findings, sorted by severity.
+    pub issues: Vec<FactoryConfigIssueView>,
+}
+
+/// A single catalog model, without secrets.
+#[derive(Debug, Clone, Serialize)]
+pub struct FactoryModelView {
+    pub id: String,
+    pub model: String,
+    pub display_name: String,
+    pub provider: String,
+    pub base_url: String,
+    pub max_context_limit: u64,
+    pub max_output_tokens: u64,
+    pub no_image_support: bool,
+    pub source: &'static str,
+    pub is_default: bool,
+}
+
+/// A single mission.
+#[derive(Debug, Clone, Serialize)]
+pub struct FactoryMissionView {
+    pub mission_id: String,
+    pub dir: String,
+    pub state: String,
+    pub title: String,
+    pub cwd: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub worker_model: String,
+}
+
+/// A config validation finding.
+#[derive(Debug, Clone, Serialize)]
+pub struct FactoryConfigIssueView {
+    pub severity: &'static str,
+    pub file: String,
+    pub message: String,
 }
 
 /// Compact status payload for widgets, notifications, and mobile clients.
@@ -340,6 +392,48 @@ impl App {
             rate_limits: self.rate_limits.clone(),
             orphan_ports: self.orphan_ports.clone(),
             mcp_servers,
+            factory: FactorySnapshot {
+                app_running: self.factory_app_running,
+                models: self
+                    .factory_models
+                    .iter()
+                    .map(|m| FactoryModelView {
+                        id: m.id.clone(),
+                        model: m.model.clone(),
+                        display_name: m.display_name.clone(),
+                        provider: m.provider.clone(),
+                        base_url: m.base_url.clone(),
+                        max_context_limit: m.max_context_limit,
+                        max_output_tokens: m.max_output_tokens,
+                        no_image_support: m.no_image_support,
+                        source: m.source,
+                        is_default: m.is_default,
+                    })
+                    .collect(),
+                missions: self
+                    .factory_missions
+                    .iter()
+                    .map(|m| FactoryMissionView {
+                        mission_id: m.mission_id.clone(),
+                        dir: m.dir.clone(),
+                        state: m.state.clone(),
+                        title: m.title.clone(),
+                        cwd: m.cwd.clone(),
+                        created_at_ms: m.created_at_ms,
+                        updated_at_ms: m.updated_at_ms,
+                        worker_model: m.worker_model.clone(),
+                    })
+                    .collect(),
+                issues: self
+                    .factory_issues
+                    .iter()
+                    .map(|i| FactoryConfigIssueView {
+                        severity: i.severity,
+                        file: i.file.clone(),
+                        message: i.message.clone(),
+                    })
+                    .collect(),
+            },
         }
     }
 
@@ -353,7 +447,7 @@ impl App {
         let now_secs = generated_at_ms / 1000;
 
         let mut agents = Vec::new();
-        for agent_cli in ["claude", "codex", "opencode"] {
+        for agent_cli in ["claude", "codex", "opencode", "factory"] {
             let matching: Vec<_> = self
                 .sessions
                 .iter()
@@ -563,6 +657,20 @@ mod tests {
         // Re-parse as generic JSON to confirm it is well-formed.
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert!(parsed["sessions"].is_array());
+    }
+
+    #[test]
+    fn snapshot_includes_factory_catalog_without_secrets() {
+        let snap = demo_app().to_snapshot(2_000);
+        assert!(snap.factory.app_running);
+        assert!(!snap.factory.models.is_empty());
+        assert!(!snap.factory.missions.is_empty());
+        // The demo seeds a config issue; payload never carries apiKey fields.
+        let json = serde_json::to_string(&snap).expect("snapshot serializes");
+        assert!(json.contains("\"factory\""));
+        assert!(json.contains("\"app_running\""));
+        assert!(!json.contains("apiKey"));
+        assert!(!json.contains("api_key"));
     }
 
     #[test]

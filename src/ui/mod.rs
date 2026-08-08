@@ -4,6 +4,8 @@ mod footer;
 mod header;
 mod help;
 mod mcp;
+mod missions;
+mod models;
 mod ports;
 mod projects;
 mod quota;
@@ -397,6 +399,8 @@ pub fn draw(f: &mut Frame, app: &App) {
             NarrowSection::Projects => projects::draw_projects_panel(f, app, area, theme),
             NarrowSection::Ports => ports::draw_ports_panel(f, app, area, theme),
             NarrowSection::Mcp => mcp::draw_mcp_panel(f, app, area, theme),
+            NarrowSection::Models => models::draw_models_panel(f, app, area, theme),
+            NarrowSection::Missions => missions::draw_missions_panel(f, app, area, theme),
             NarrowSection::Sessions | NarrowSection::Context => {}
         }
     }
@@ -429,6 +433,12 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     }
     if app.show_mcp {
         mid_sections.push(NarrowSection::Mcp);
+    }
+    if app.show_models {
+        mid_sections.push(NarrowSection::Models);
+    }
+    if app.show_missions {
+        mid_sections.push(NarrowSection::Missions);
     }
 
     let any_mid = !mid_sections.is_empty();
@@ -669,6 +679,10 @@ fn draw_narrow_section(
         NarrowSection::Tokens => tokens::draw_tokens_panel_active(f, app, area, theme, active),
         NarrowSection::Ports => ports::draw_ports_panel_active(f, app, area, theme, active),
         NarrowSection::Mcp => mcp::draw_mcp_panel_active(f, app, area, theme, active),
+        NarrowSection::Models => models::draw_models_panel_active(f, app, area, theme, active),
+        NarrowSection::Missions => {
+            missions::draw_missions_panel_active(f, app, area, theme, active)
+        }
     }
 }
 
@@ -1340,6 +1354,44 @@ mod tests {
                 "desktop should render {label}\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn factory_panels_render_when_enabled() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.show_models = true;
+        app.show_missions = true;
+
+        // Compact mode: models land in Usage, missions in Work.
+        let backend = TestBackend::new(69, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        app.set_narrow_tab(NarrowTab::Usage);
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("models"), "models panel title\n{text}");
+        assert!(
+            text.contains("Qwen3 Coder"),
+            "custom model display name\n{text}"
+        );
+        assert!(text.contains("running"), "droid app running status\n{text}");
+
+        app.set_narrow_tab(NarrowTab::Work);
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("missions"), "missions panel title\n{text}");
+        assert!(
+            text.contains("Storage migration plan"),
+            "mission title\n{text}"
+        );
+
+        // Desktop mode: both panels render as mid panels.
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("models"), "desktop models panel\n{text}");
+        assert!(text.contains("missions"), "desktop missions panel\n{text}");
     }
 
     fn render_demo(width: u16, height: u16) -> String {

@@ -77,6 +77,16 @@ pub(crate) fn items(app: &App) -> Vec<ViewItem> {
             state: bool_state(app.show_mcp),
         },
         ViewItem {
+            key: '8',
+            label: t("view.models_panel").leak(),
+            state: bool_state(app.show_models),
+        },
+        ViewItem {
+            key: '9',
+            label: t("view.missions_panel").leak(),
+            state: bool_state(app.show_missions),
+        },
+        ViewItem {
             key: 'M',
             label: t("view.mcp_session_hide").leak(),
             state: bool_state(app.mcp_suppress_sessions),
