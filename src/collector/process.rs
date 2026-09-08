@@ -432,6 +432,17 @@ fn unix_token_has_binary(tok: &str, name: &str) -> bool {
     matches!((iter.next(), iter.next()), (Some("versions"), Some(parent)) if parent == name)
 }
 
+/// True when `cmd` is a non-interactive Claude Code session driven over the
+/// Agent SDK's bidirectional stream-json protocol (`--input-format stream-json`).
+/// A human `claude --print "q"` never feeds an input *stream*, so this matches
+/// only programmatic/background sessions (the Agent SDK, claude-mem's observer),
+/// never interactive use nor a one-shot `--print`. Callers skip these for the
+/// same reason abtop already skips its own `--print` summary children: they are
+/// infrastructure, not interactive agent sessions the user is running.
+pub fn is_sdk_stream_session(cmd: &str) -> bool {
+    cmd.contains("--input-format stream-json") || cmd.contains("--input-format=stream-json")
+}
+
 /// Windows variant: checks executable-position tokens, splits on `\`, strips a
 /// trailing `.exe` and common script extensions (`.js`, `.sh`, `.py`), and
 /// matches case-insensitively.
@@ -575,6 +586,21 @@ mod tests {
         ));
         // A `versions/` dir not under `<name>/` shouldn't match either.
         assert!(!cmd_has_binary("/some/versions/2.1.121", "claude"));
+    }
+
+    #[test]
+    fn is_sdk_stream_session_matches_stream_json_input() {
+        // Observed claude-mem observer invocation (space form).
+        assert!(is_sdk_stream_session(
+            "claude --output-format stream-json --verbose --input-format stream-json --model sonnet"
+        ));
+        // `=` form.
+        assert!(is_sdk_stream_session("claude --input-format=stream-json"));
+        // Interactive and one-shot `--print` sessions must NOT match.
+        assert!(!is_sdk_stream_session("claude"));
+        assert!(!is_sdk_stream_session("claude --print user-script"));
+        // `--output-format stream-json` alone (scripted one-shot read) must not match.
+        assert!(!is_sdk_stream_session("claude --output-format stream-json"));
     }
 
     #[cfg(windows)]
