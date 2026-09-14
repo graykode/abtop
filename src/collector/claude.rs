@@ -104,6 +104,11 @@ impl ClaudeCollector {
             if !process::cmd_has_binary(&info.command, "claude") {
                 continue;
             }
+            // Don't let a background SDK session (e.g. claude-mem's observer)
+            // register its CLAUDE_CONFIG_DIR as a scanned root.
+            if process::is_sdk_stream_session(&info.command) {
+                continue;
+            }
             if let Some(dir) = read_env_var_from_proc(*pid, "CLAUDE_CONFIG_DIR") {
                 let p = PathBuf::from(dir);
                 if p.is_dir() {
@@ -257,6 +262,11 @@ impl ClaudeCollector {
                 continue;
             }
             if process::is_descendant_of(*pid, self_pid, process_info) {
+                continue;
+            }
+            // SDK stream-json sessions (Agent SDK, background observers like
+            // claude-mem) are infrastructure, not interactive agent sessions.
+            if process::is_sdk_stream_session(&info.command) {
                 continue;
             }
             pids.push(*pid);
@@ -2763,6 +2773,62 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
         let mut got = ClaudeCollector::find_claude_pids(&process_info, abtop_pid);
         got.sort_unstable();
         assert_eq!(got, vec![10, 13]);
+    }
+
+    #[test]
+    fn test_find_claude_pids_excludes_sdk_stream_sessions() {
+        // A background SDK session driven over the stream-json protocol
+        // (`--input-format stream-json`, e.g. claude-mem's observer) is
+        // infrastructure and must be filtered, while an interactive session
+        // (PID 10) and a human `claude --print` one-shot (PID 11) are still
+        // surfaced.
+        let abtop_pid = 99u32;
+        let mut process_info = HashMap::new();
+        process_info.insert(
+            abtop_pid,
+            ProcInfo {
+                pid: abtop_pid,
+                ppid: 1,
+                rss_kb: 1,
+                cpu_pct: 0.0,
+                command: "abtop".to_string(),
+            },
+        );
+        process_info.insert(
+            10,
+            ProcInfo {
+                pid: 10,
+                ppid: 1,
+                rss_kb: 1,
+                cpu_pct: 0.0,
+                command: "claude".to_string(),
+            },
+        );
+        process_info.insert(
+            11,
+            ProcInfo {
+                pid: 11,
+                ppid: 1,
+                rss_kb: 1,
+                cpu_pct: 0.0,
+                command: "claude --print user-script".to_string(),
+            },
+        );
+        process_info.insert(
+            12,
+            ProcInfo {
+                pid: 12,
+                ppid: 1,
+                rss_kb: 1,
+                cpu_pct: 0.0,
+                command: "claude --output-format stream-json --verbose --input-format stream-json"
+                    .to_string(),
+            },
+        );
+
+        let mut got = ClaudeCollector::find_claude_pids(&process_info, abtop_pid);
+        got.sort_unstable();
+        assert_eq!(got, vec![10, 11]);
     }
 
     #[test]
