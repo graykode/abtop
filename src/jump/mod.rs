@@ -66,12 +66,20 @@ pub fn jumpers() -> Vec<Box<dyn TerminalJumper>> {
     ]
 }
 
-/// The registry: the single ordered source of truth for supported terminals.
-/// Non-macOS builds exclude the iTerm2 adapter so standalone Linux/Windows
-/// sessions no-op cleanly instead of trying macOS-only `osascript`.
-#[cfg(not(target_os = "macos"))]
+/// Linux registry: cmux + tmux (both work on Linux). iTerm2 is macOS-only.
+#[cfg(target_os = "linux")]
 pub fn jumpers() -> Vec<Box<dyn TerminalJumper>> {
     vec![Box::new(cmux::CmuxJumper), Box::new(tmux::TmuxJumper)]
+}
+
+/// Windows registry: empty. All current jumpers (cmux/tmux/iTerm2) rely on
+/// Unix-only `ps`/`osascript`, so on Windows `resolve` returns `NoOp` up
+/// front rather than shelling out to commands that don't exist. The jump
+/// key should be presented but greyed out / no-op until a Windows adapter
+/// exists (review point 2 stopgap).
+#[cfg(target_os = "windows")]
+pub fn jumpers() -> Vec<Box<dyn TerminalJumper>> {
+    vec![]
 }
 
 /// Entry point used by the app: run the selected PID through the registry.
@@ -327,8 +335,12 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(jumpers().len(), 3);
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         assert_eq!(jumpers().len(), 2);
+
+        // Windows has no Unix-multiplexer jumpers; resolve returns NoOp.
+        #[cfg(target_os = "windows")]
+        assert_eq!(jumpers().len(), 0);
     }
 
     // ---- find_pane_target (tmux) ----
