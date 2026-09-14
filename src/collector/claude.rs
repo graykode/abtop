@@ -1,7 +1,7 @@
 use super::process::{self, ProcInfo};
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, SessionFile,
-    SessionStatus, SubAgent, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
+    SessionFile, SessionStatus, SubAgent, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -264,6 +264,36 @@ impl ClaudeCollector {
         pids
     }
 
+    /// Classify which surface launched a `claude` process, from the resolved
+    /// executable path in its full command line (as reported by `ps`/
+    /// `/proc/{pid}/cmdline`/sysinfo — see `process::ProcInfo::command`).
+    ///
+    /// - The Claude desktop app bundles its own Claude Code binary under a
+    ///   per-user `Claude/claude-code/<version>/` directory (Electron's
+    ///   userData layout: `~/Library/Application Support/Claude/...` on
+    ///   macOS, `%APPDATA%\Claude\...` on Windows, `~/.config/Claude/...`
+    ///   on Linux) — distinct from a plain PATH install.
+    /// - Editor extensions (VS Code, Cursor, Windsurf, ...) vendor the
+    ///   binary under `<editor-extensions-dir>/anthropic.claude-code-<ver>/`.
+    /// - Anything else (homebrew/npm/native install, the auto-updater's
+    ///   `claude/versions/<ver>` layout) is a plain CLI invocation.
+    fn detect_launch_surface(cmd: &str) -> LaunchSurface {
+        // Match against the whole command string rather than the first
+        // whitespace-split token: unlike `cmd_has_binary`'s binary-name
+        // check, these are fixed path fragments with no ambiguity, and the
+        // desktop app's own path already contains an unquoted space
+        // ("Application Support") on macOS that a naive first-token split
+        // would cut through.
+        let normalized = cmd.replace('\\', "/");
+        if normalized.contains("/Claude/claude-code/") {
+            LaunchSurface::App
+        } else if normalized.contains("/extensions/anthropic.claude-code") {
+            LaunchSurface::Ide
+        } else {
+            LaunchSurface::Cli
+        }
+    }
+
     fn map_pid_to_open_paths(pids: &[u32]) -> HashMap<u32, ProcessOpenPaths> {
         if pids.is_empty() {
             return HashMap::new();
@@ -343,6 +373,9 @@ impl ClaudeCollector {
         let pid_alive = proc_cmd
             .map(|c| process::cmd_has_binary(c, "claude"))
             .unwrap_or(false);
+        let launch_surface = proc_cmd
+            .map(Self::detect_launch_surface)
+            .unwrap_or(LaunchSurface::Cli);
 
         // Skip sessions whose PID is a descendant of abtop itself —
         // those are the `claude --print` summary children spawned by
@@ -536,13 +569,28 @@ impl ClaudeCollector {
             return None;
         }
 
+        // Derive the project directory from the transcript path (handles worktree sessions),
+        // falling back to the encoded cwd.
+        let project_dir = transcript_path
+            .as_ref()
+            .and_then(|tp| tp.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| config.projects_dir.join(encode_cwd_path(&sf.cwd)));
+
+        // Collect subagents before deriving the parent status so asynchronous
+        // Agent work keeps the parent active after its tool_result has returned.
+        let subagents_dir = project_dir.join(&sf.session_id).join("subagents");
+        let subagents = Self::collect_subagents(&subagents_dir);
+        let has_working_subagent = subagents.iter().any(|agent| agent.status == "working");
+
         // Status is best-effort. Signals we trust:
         //   1. Active descendant CPU → tool is running.
         //   2. current_task non-empty → latest assistant turn left a
         //      tool_use unanswered. Catches I/O-bound tools (Read, Edit)
         //      whose descendants stay under 5% CPU, so the CPU heuristic
         //      alone would flicker to Waiting while the tool runs.
-        //   3. last_user_ts_ms > 0 → trailing transcript line is a real
+        //   3. A working subagent → an async Agent call is still running even
+        //      though its tool_result has already returned to the parent.
+        //   4. last_user_ts_ms > 0 → trailing transcript line is a real
         //      user prompt with no assistant reply yet, so the model is
         //      generating. tool_result wrappers are skipped at the
         //      parser level so this only fires for actual prompts.
@@ -562,7 +610,7 @@ impl ClaudeCollector {
             // between CPU samples, so has_active_descendant alone misses them.
             let pending_tool = !cached.current_task.is_empty();
             let model_generating = cached.last_user_ts_ms > 0;
-            if has_active_descendant || pending_tool {
+            if has_active_descendant || pending_tool || has_working_subagent {
                 SessionStatus::Executing
             } else if model_generating {
                 SessionStatus::Thinking
@@ -616,17 +664,6 @@ impl ClaudeCollector {
         // Git stats: populated by MultiCollector on slow ticks
         let (git_added, git_modified) = (0, 0);
 
-        // Derive the project directory from the transcript path (handles worktree sessions),
-        // falling back to the encoded cwd.
-        let project_dir = transcript_path
-            .as_ref()
-            .and_then(|tp| tp.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| config.projects_dir.join(encode_cwd_path(&sf.cwd)));
-
-        // Subagent discovery
-        let subagents_dir = project_dir.join(&sf.session_id).join("subagents");
-        let subagents = Self::collect_subagents(&subagents_dir);
-
         // Memory status
         let memory_dir = project_dir.join("memory");
         let (mem_file_count, mem_line_count) = Self::collect_memory_status(&memory_dir);
@@ -638,6 +675,7 @@ impl ClaudeCollector {
 
         Some(AgentSession {
             agent_cli: "claude",
+            launch_surface,
             pid: sf.pid,
             session_id: sf.session_id,
             cwd: sf.cwd,
@@ -2021,6 +2059,60 @@ fn read_env_var_from_proc(_pid: u32, _var_name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    // ---- detect_launch_surface ----
+
+    #[test]
+    fn detect_launch_surface_desktop_app_macos() {
+        let cmd = "/Users/a/Library/Application Support/Claude/claude-code/2.1.266/claude.app/Contents/MacOS/claude";
+        assert_eq!(
+            ClaudeCollector::detect_launch_surface(cmd),
+            LaunchSurface::App
+        );
+    }
+
+    #[test]
+    fn detect_launch_surface_desktop_app_windows_backslashes() {
+        let cmd = r#"C:\Users\a\AppData\Roaming\Claude\claude-code\2.1.266\claude.exe"#;
+        assert_eq!(
+            ClaudeCollector::detect_launch_surface(cmd),
+            LaunchSurface::App
+        );
+    }
+
+    #[test]
+    fn detect_launch_surface_vscode_extension() {
+        let cmd = "/Users/a/.vscode/extensions/anthropic.claude-code-2.1.269-darwin-arm64/resources/native-binary/claude";
+        assert_eq!(
+            ClaudeCollector::detect_launch_surface(cmd),
+            LaunchSurface::Ide
+        );
+    }
+
+    #[test]
+    fn detect_launch_surface_plain_cli_install() {
+        assert_eq!(
+            ClaudeCollector::detect_launch_surface("/usr/local/bin/claude"),
+            LaunchSurface::Cli
+        );
+        assert_eq!(
+            ClaudeCollector::detect_launch_surface("claude --session-id abc"),
+            LaunchSurface::Cli
+        );
+    }
+
+    #[test]
+    fn detect_launch_surface_autoupdater_versions_layout_is_cli() {
+        // The auto-updater's `<name>/versions/<ver>` layout (see
+        // `cmd_has_binary_autoupdater_layout` in process.rs) is a plain CLI
+        // install, not the desktop app — it must not match on "claude" alone.
+        assert_eq!(
+            ClaudeCollector::detect_launch_surface(
+                "/Users/a/.local/share/claude/versions/2.1.121 --allow-dangerously-skip-permissions",
+            ),
+            LaunchSurface::Cli
+        );
+    }
 
     fn write_lines(file: &mut tempfile::NamedTempFile, lines: &[&str]) {
         for line in lines {
@@ -3566,6 +3658,79 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             sessions[0].status,
             SessionStatus::Executing,
             "pending tool_use must read as Executing even with idle descendants",
+        );
+    }
+
+    #[test]
+    fn test_load_session_working_async_subagent_is_executing() {
+        // Regression for #156: an async Agent tool returns immediately, so the
+        // parent has no pending tool while its subagent keeps working. The
+        // working subagent must keep the parent Executing instead of Waiting.
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 9104;
+        let sid = "async-subagent";
+        let session_path = sessions_dir.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, sid, &cwd);
+
+        let project_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let transcript = project_dir.join(format!("{}.jsonl", sid));
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"research this"}}
+{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","name":"Agent","id":"agent-tool-1","input":{"prompt":"research"}}]}}
+{"type":"user","timestamp":"2026-03-28T15:00:06Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-tool-1","content":"Async agent launched successfully.\nagentId: child-1\nrunning in background"}]}}
+{"type":"assistant","timestamp":"2026-03-28T15:00:07Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"Waiting for the research result."}]}}
+"#,
+        )
+        .unwrap();
+
+        let subagents_dir = project_dir.join(sid).join("subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+        std::fs::write(
+            subagents_dir.join("agent-child-1.meta.json"),
+            r#"{"agentType":"general-purpose","description":"research"}"#,
+        )
+        .unwrap();
+        let subagent_transcript = subagents_dir.join("agent-child-1.jsonl");
+        std::fs::write(
+            &subagent_transcript,
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:06Z","message":{"role":"user","content":"research"}}
+"#,
+        )
+        .unwrap();
+        set_mtime(&subagent_transcript, 0);
+
+        let config = ConfigDir::new(profile.clone());
+        let process_info = make_proc_info(pid, "claude");
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config.clone()];
+
+        let session_paths = vec![(session_path, config)];
+        let ctx = build_discovery_context(&session_paths, &process_info, 0);
+        let sessions = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].subagents.len(), 1);
+        assert_eq!(sessions[0].subagents[0].status, "working");
+        assert_eq!(
+            sessions[0].status,
+            SessionStatus::Executing,
+            "a working async subagent must keep its parent Executing",
         );
     }
 

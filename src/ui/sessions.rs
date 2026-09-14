@@ -133,7 +133,7 @@ pub(crate) fn draw_sessions_panel_active(
         let selected = i == app.selected;
         let marker = if selected { "►" } else { " " };
 
-        let (agent_label, agent_color) = match session.agent_cli {
+        let (agent_base, agent_color) = match session.agent_cli {
             "claude" => ("*CC", Color::Rgb(217, 119, 87)), // #D97757 terracotta
             "codex" => (">CD", Color::Rgb(122, 157, 255)), // #7A9DFF periwinkle
             "opencode" => ("#OC", Color::Rgb(74, 222, 128)), // #4ADE80 emerald
@@ -145,6 +145,9 @@ pub(crate) fn draw_sessions_panel_active(
                 )
             }
         };
+        // App/IDE-launched sessions get a trailing suffix letter ("a"/"i");
+        // plain CLI sessions (the common case) keep the label unchanged.
+        let agent_label = format!("{agent_base}{}", session.launch_surface.label_suffix());
 
         let (status_icon_str, status_color) = match &session.status {
             crate::model::SessionStatus::Thinking => (t("sess.think"), theme.proc_misc),
@@ -287,7 +290,7 @@ pub(crate) fn draw_sessions_panel_active(
         if app.tree_view && !session.subagents.is_empty() {
             for (sa_idx, sa) in session.subagents.iter().enumerate() {
                 let is_last = sa_idx == session.subagents.len() - 1;
-                // Tree connector fits the 3-wide agent column (was truncated before).
+                // Tree connector fits the agent column (was truncated before).
                 let prefix = if is_last { "└─" } else { "├─" };
                 let is_working = sa.status.eq_ignore_ascii_case("working")
                     || sa.status.eq_ignore_ascii_case("in_progress");
@@ -378,7 +381,7 @@ pub(crate) fn draw_sessions_panel_active(
 
     let mut widths_vec: Vec<Constraint> = vec![
         Constraint::Length(1), // marker
-        Constraint::Length(3), // agent label
+        Constraint::Length(4), // agent label (+1 for the App/IDE suffix letter)
     ];
     if show_pid {
         widths_vec.push(Constraint::Length(6)); // pid
@@ -1251,7 +1254,7 @@ fn draw_timeline(
 mod tests {
     use super::*;
     use crate::config::PanelVisibility;
-    use crate::model::SessionStatus;
+    use crate::model::{LaunchSurface, SessionStatus};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -1276,6 +1279,7 @@ mod tests {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         app.sessions.push(AgentSession {
             agent_cli: "codex",
+            launch_surface: LaunchSurface::Cli,
             pid: 42,
             session_id: "codex-session".into(),
             cwd: "/tmp/project".into(),
@@ -1340,6 +1344,54 @@ mod tests {
         assert!(
             !text.contains("[1m]"),
             "non-1M Codex context windows must not be labeled as 1M\n{text}"
+        );
+    }
+
+    #[test]
+    fn agent_label_flags_app_and_ide_launch_surfaces() {
+        let render = |surface: LaunchSurface| {
+            let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+            let mut session = test_session("sid", "proj");
+            session.launch_surface = surface;
+            app.sessions.push(session);
+
+            let backend = TestBackend::new(120, 20);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    draw_sessions_panel(
+                        f,
+                        &app,
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            width: 120,
+                            height: 20,
+                        },
+                        &app.theme,
+                    )
+                })
+                .unwrap();
+            format!("{}", terminal.backend())
+        };
+
+        let cli_text = render(LaunchSurface::Cli);
+        assert!(
+            cli_text.contains("*CC "),
+            "plain CLI session should render the unsuffixed label\n{cli_text}"
+        );
+        assert!(!cli_text.contains("*CCa") && !cli_text.contains("*CCi"));
+
+        let app_text = render(LaunchSurface::App);
+        assert!(
+            app_text.contains("*CCa"),
+            "Claude desktop app session should get the 'a' suffix\n{app_text}"
+        );
+
+        let ide_text = render(LaunchSurface::Ide);
+        assert!(
+            ide_text.contains("*CCi"),
+            "IDE-extension session should get the 'i' suffix\n{ide_text}"
         );
     }
 
@@ -1428,6 +1480,7 @@ mod tests {
     fn test_session(session_id: &str, project_name: &str) -> AgentSession {
         AgentSession {
             agent_cli: "claude",
+            launch_surface: LaunchSurface::Cli,
             pid: 42,
             session_id: session_id.into(),
             cwd: format!("/tmp/{project_name}"),

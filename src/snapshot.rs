@@ -14,7 +14,8 @@ use crate::app::App;
 use crate::collector::mcp::ACTIVE_MTIME_SECS;
 use crate::host_info::{AgentAggregate, HostMetrics};
 use crate::model::{
-    ChatRole, ChildProcess, OrphanPort, RateLimitInfo, SessionStatus, MAX_CHAT_MESSAGES,
+    ChatRole, ChildProcess, LaunchSurface, OrphanPort, RateLimitInfo, SessionStatus,
+    MAX_CHAT_MESSAGES,
 };
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -86,6 +87,9 @@ pub struct SubAgentView {
 pub struct SessionView {
     /// Owning CLI: "claude", "codex", "opencode".
     pub agent_cli: &'static str,
+    /// Which surface launched this session (CLI / Claude desktop app / IDE
+    /// extension); always `Cli` for Codex and OpenCode.
+    pub launch_surface: LaunchSurface,
     /// OS process id of the agent CLI for this session.
     pub pid: u32,
     /// Agent-assigned session identifier (stable for the life of the session).
@@ -202,6 +206,7 @@ impl App {
             .iter()
             .map(|s| SessionView {
                 agent_cli: s.agent_cli,
+                launch_surface: s.launch_surface,
                 pid: s.pid,
                 session_id: s.session_id.clone(),
                 project_name: s.project_name.clone(),

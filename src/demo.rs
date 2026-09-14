@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, OrphanPort,
-    RateLimitInfo, SessionStatus, SubAgent, ToolCall,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
+    OrphanPort, RateLimitInfo, SessionStatus, SubAgent, ToolCall,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,6 +23,7 @@ pub fn populate_demo(app: &mut App) {
     app.sessions = vec![
         AgentSession {
             agent_cli: "claude",
+            launch_surface: LaunchSurface::Cli,
             pid: 7336,
             session_id: "a1b2c3d4-5678-9abc-def0-111111111111".into(),
             cwd: "/Users/demo/webshop".into(),
@@ -254,6 +255,7 @@ pub fn populate_demo(app: &mut App) {
         },
         AgentSession {
             agent_cli: "claude",
+            launch_surface: LaunchSurface::App,
             pid: 8840,
             session_id: "b2c3d4e5-6789-abcd-ef01-222222222222".into(),
             cwd: "/Users/demo/ml-pipeline".into(),
@@ -311,6 +313,7 @@ pub fn populate_demo(app: &mut App) {
         },
         AgentSession {
             agent_cli: "claude",
+            launch_surface: LaunchSurface::Ide,
             pid: 9102,
             session_id: "c3d4e5f6-789a-bcde-f012-333333333333".into(),
             cwd: "/Users/demo/api-server".into(),
@@ -415,6 +418,7 @@ pub fn populate_demo(app: &mut App) {
         },
         AgentSession {
             agent_cli: "codex",
+            launch_surface: LaunchSurface::Cli,
             pid: 8901,
             session_id: "d4e5f6a7-89ab-cdef-0123-444444444444".into(),
             cwd: "/Users/demo/data-viz".into(),
@@ -469,6 +473,7 @@ pub fn populate_demo(app: &mut App) {
         },
         AgentSession {
             agent_cli: "opencode",
+            launch_surface: LaunchSurface::Cli,
             pid: 9500,
             session_id: "ses_e5f6a7b8-9abc-def0-1234-555555555555".into(),
             cwd: "/Users/demo/infra".into(),

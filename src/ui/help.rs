@@ -29,6 +29,8 @@ fn get_entries() -> Vec<(String, String)> {
         ("  M".to_string(), t("help.mcp_suppress")),
         (t("help.help"), String::new()),
         ("  ?".to_string(), t("help.this_help")),
+        (t("help.legend"), String::new()),
+        ("  a / i".to_string(), t("help.launch_surface_suffix")),
     ]
 }
 

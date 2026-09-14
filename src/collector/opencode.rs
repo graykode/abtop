@@ -1,5 +1,5 @@
 use super::{process, context_window_for_model};
-use crate::model::{AgentSession, ChildProcess, SessionStatus};
+use crate::model::{AgentSession, ChildProcess, LaunchSurface, SessionStatus};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -195,6 +195,7 @@ impl OpenCodeCollector {
 
             sessions.push(AgentSession {
                 agent_cli: "opencode",
+                launch_surface: LaunchSurface::Cli,
                 pid: matched_pid,
                 session_id: ds.id.clone(),
                 cwd: ds.directory.clone(),

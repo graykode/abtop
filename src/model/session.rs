@@ -130,12 +130,42 @@ pub struct ChatMessage {
 /// Maximum chat messages kept per session to bound memory and UI noise.
 pub const MAX_CHAT_MESSAGES: usize = 12;
 
+/// Which surface launched this session's process, detected from the resolved
+/// executable path in its command line. Always `Cli` for Codex and OpenCode
+/// sessions — no desktop-app or editor-extension equivalent is known for
+/// those tools yet.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum LaunchSurface {
+    /// Plain CLI invocation: a terminal shell running an npm/homebrew/native
+    /// install (or the auto-updater's `versions/<ver>` layout).
+    Cli,
+    /// The Claude desktop app's bundled `claude-code` binary.
+    App,
+    /// An editor extension (VS Code, Cursor, Windsurf, ...).
+    Ide,
+}
+
+impl LaunchSurface {
+    /// Single-char suffix appended to the agent-label column in the sessions
+    /// table. Empty for the default `Cli` case so existing rows/tests are
+    /// unaffected; `a`/`i` flag the less common surfaces.
+    pub fn label_suffix(&self) -> &'static str {
+        match self {
+            LaunchSurface::Cli => "",
+            LaunchSurface::App => "a",
+            LaunchSurface::Ide => "i",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentSession {
     /// Which CLI tool this session belongs to: "claude", "codex", etc.
     /// Also used as the identifier for the `hidden_agents` config key
     /// (case-insensitive match).
     pub agent_cli: &'static str,
+    /// Which surface launched this session's process (CLI / desktop app / IDE extension).
+    pub launch_surface: LaunchSurface,
     pub pid: u32,
     pub session_id: String,
     pub cwd: String,
@@ -266,6 +296,7 @@ mod tests {
     fn make_session(input: u64, output: u64, cache_read: u64, cache_create: u64) -> AgentSession {
         AgentSession {
             agent_cli: "claude",
+            launch_surface: LaunchSurface::Cli,
             pid: 0,
             session_id: String::new(),
             cwd: String::new(),

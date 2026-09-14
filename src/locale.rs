@@ -134,6 +134,11 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
         "toggle mcp-server suppression in sessions panel",
     );
     m.insert("help.this_help", "this help");
+    m.insert("help.legend", "Legend");
+    m.insert(
+        "help.launch_surface_suffix",
+        "Claude: a = Desktop App, i = IDE extension (blank = CLI)",
+    );
 
     // Footer
     m.insert("footer.select", "select");
@@ -145,8 +150,6 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("footer.quit", "quit");
     m.insert("footer.sessions", "sessions");
     m.insert("footer.auto", "auto");
-    m.insert("footer.peak_hours", "Claude Peak Hours");
-    m.insert("footer.resets_in", "resets in");
     m.insert("footer.esc_clear", "Esc clear, Enter keep");
     m.insert("footer.jump", "jump");
 
@@ -379,6 +382,11 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     );
     m.insert("help.mcp_suppress", "切换会话面板中的 MCP 服务器隐藏");
     m.insert("help.this_help", "显示帮助");
+    m.insert("help.legend", "图例");
+    m.insert(
+        "help.launch_surface_suffix",
+        "Claude: a = 桌面应用, i = IDE 扩展（无后缀 = 命令行）",
+    );
 
     // Footer
     m.insert("footer.select", "选择");
@@ -390,8 +398,6 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("footer.quit", "退出");
     m.insert("footer.sessions", "会话");
     m.insert("footer.auto", "自动");
-    m.insert("footer.peak_hours", "Claude 高峰时段");
-    m.insert("footer.resets_in", "重置于");
     m.insert("footer.esc_clear", "Esc 清除，Enter 保留");
     m.insert("footer.jump", "跳转");
 

@@ -1,7 +1,6 @@
 use crate::app::App;
 use crate::locale::t;
 use crate::theme::Theme;
-use chrono::Timelike;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -131,28 +130,6 @@ pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
                 Style::default().fg(theme.inactive_fg),
             ));
         }
-    }
-
-    // Peak hours warning: US business hours = PT 5am–11am = UTC 12:00–18:00
-    let peak_info = {
-        let now = chrono::Utc::now();
-        let hour = now.hour();
-        if (12..18).contains(&hour) {
-            let mins_left = (18 - hour) * 60 - now.minute();
-            let h = mins_left / 60;
-            let m = mins_left % 60;
-            let peak_label = t("footer.peak_hours");
-            let resets_in = t("footer.resets_in");
-            Some(format!("⚡{} ({} {}h{:02}m)", peak_label, resets_in, h, m))
-        } else {
-            None
-        }
-    };
-    if let Some(ref peak) = peak_info.filter(|_| !compact) {
-        spans.push(Span::styled(
-            format!(" {peak} "),
-            Style::default().fg(theme.warning_fg),
-        ));
     }
 
     let visible_count = app.visible_indices().len();
