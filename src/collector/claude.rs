@@ -46,6 +46,14 @@ struct ProcessOpenPaths {
     paths: Vec<PathBuf>,
 }
 
+#[derive(Default)]
+struct SubagentUsage {
+    offset: u64,
+    file_identity: (u64, u64),
+    /// Input, output, cache read, and cache write tokens, in that order.
+    totals: [u64; 4],
+}
+
 pub struct ClaudeCollector {
     /// All known config directories to scan for sessions.
     config_dirs: Vec<ConfigDir>,
@@ -54,6 +62,9 @@ pub struct ClaudeCollector {
     /// Cached transcript parse results keyed by session_id.
     /// On each tick, only new bytes since `new_offset` are parsed.
     transcript_cache: HashMap<String, TranscriptResult>,
+    /// Per-session subagent usage, keyed by subagents directory then transcript path.
+    /// Keep only counters and offsets, not each workflow agent's full transcript state.
+    subagent_cache: HashMap<PathBuf, HashMap<PathBuf, SubagentUsage>>,
 }
 
 impl ClaudeCollector {
@@ -67,6 +78,7 @@ impl ClaudeCollector {
             config_dirs: Vec::new(),
             configured_config_dirs,
             transcript_cache: HashMap::new(),
+            subagent_cache: HashMap::new(),
         }
     }
 
@@ -177,6 +189,12 @@ impl ClaudeCollector {
             sessions.iter().map(|s| s.session_id.as_str()).collect();
         self.transcript_cache
             .retain(|sid, _| active_ids.contains(sid.as_str()));
+        self.subagent_cache.retain(|dir, _| {
+            dir.parent()
+                .and_then(Path::file_name)
+                .and_then(|sid| sid.to_str())
+                .is_some_and(|sid| active_ids.contains(sid))
+        });
     }
 
     fn load_session_paths(
@@ -579,7 +597,13 @@ impl ClaudeCollector {
         // Collect subagents before deriving the parent status so asynchronous
         // Agent work keeps the parent active after its tool_result has returned.
         let subagents_dir = project_dir.join(&sf.session_id).join("subagents");
-        let subagents = Self::collect_subagents(&subagents_dir);
+        let (subagents, subagent_totals) = Self::collect_subagents(
+            &subagents_dir,
+            self.subagent_cache
+                .entry(subagents_dir.clone())
+                .or_default(),
+        );
+        let [sub_input, sub_output, sub_cache_read, sub_cache_write] = subagent_totals;
         let has_working_subagent = subagents.iter().any(|agent| agent.status == "working");
 
         // Status is best-effort. Signals we trust:
@@ -685,10 +709,10 @@ impl ClaudeCollector {
             model,
             effort,
             context_percent,
-            total_input_tokens: total_input,
-            total_output_tokens: total_output,
-            total_cache_read,
-            total_cache_create,
+            total_input_tokens: total_input + sub_input,
+            total_output_tokens: total_output + sub_output,
+            total_cache_read: total_cache_read + sub_cache_read,
+            total_cache_create: total_cache_create + sub_cache_write,
             turn_count,
             current_tasks,
             mem_mb,
@@ -715,95 +739,106 @@ impl ClaudeCollector {
         })
     }
 
-    fn collect_subagents(subagents_dir: &Path) -> Vec<SubAgent> {
+    fn collect_subagents(
+        subagents_dir: &Path,
+        cache: &mut HashMap<PathBuf, SubagentUsage>,
+    ) -> (Vec<SubAgent>, [u64; 4]) {
         let mut subagents = Vec::new();
-
-        let entries = match fs::read_dir(subagents_dir) {
-            Ok(e) => e,
-            Err(_) => return subagents,
-        };
-
-        // Collect meta files and their corresponding jsonl files
-        let mut meta_files: Vec<PathBuf> = Vec::new();
-        for entry in entries.flatten() {
-            if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
+        let mut directories = vec![subagents_dir.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            // Workflows write under subagents/workflows/<workflow-id>/. Do not
+            // follow directory links out of this session or into a cycle.
+            if is_symlink(&directory) {
                 continue;
             }
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".meta.json") {
-                    meta_files.push(path);
+            let Ok(entries) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                if file_type.is_dir() {
+                    directories.push(path);
+                    continue;
                 }
-            }
-        }
-
-        for meta_path in meta_files {
-            let meta_name = match meta_path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-
-            // Parse meta JSON
-            let meta_content = match fs::read_to_string(&meta_path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let meta_val: Value = match serde_json::from_str(&meta_content) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let description = meta_val
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("agent")
-                .to_string();
-
-            // Derive jsonl path: agent-{hash}.meta.json -> agent-{hash}.jsonl
-            let jsonl_name = meta_name.replace(".meta.json", ".jsonl");
-            let jsonl_path = meta_path.with_file_name(&jsonl_name);
-
-            let mut tokens = 0u64;
-            let mut last_activity = std::time::UNIX_EPOCH;
-
-            if jsonl_path.exists() {
-                // Get file mtime for status
-                if let Ok(metadata) = fs::metadata(&jsonl_path) {
-                    if let Ok(mtime) = metadata.modified() {
-                        last_activity = mtime;
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                // Skip workflow journals and other JSONL files that are not
+                // agent transcripts. Metadata can arrive after the transcript.
+                if !file_type.is_file() || !name.starts_with("agent-") || !name.ends_with(".jsonl")
+                {
+                    continue;
+                }
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                let usage = cache.entry(path.clone()).or_default();
+                let identity = file_identity(&path);
+                if identity != usage.file_identity || metadata.len() < usage.offset {
+                    *usage = SubagentUsage::default();
+                }
+                if metadata.len() > usage.offset {
+                    let delta = parse_transcript(&path, usage.offset);
+                    let totals = [
+                        delta.total_input,
+                        delta.total_output,
+                        delta.total_cache_read,
+                        delta.total_cache_create,
+                    ];
+                    for (total, increment) in usage.totals.iter_mut().zip(totals) {
+                        *total += increment;
                     }
+                    usage.offset = delta.new_offset;
+                    usage.file_identity = delta.file_identity;
                 }
 
-                // Parse jsonl for token totals
-                let transcript = parse_transcript(&jsonl_path, 0);
-                tokens = transcript.total_input
-                    + transcript.total_output
-                    + transcript.total_cache_read
-                    + transcript.total_cache_create;
-            }
-
-            let status = {
-                let since = std::time::SystemTime::now()
-                    .duration_since(last_activity)
-                    .unwrap_or_default();
-                if since.as_secs() < 30 {
-                    "working".to_string()
+                let meta_path = path.with_extension("meta.json");
+                let meta: Option<Value> = if is_symlink(&meta_path) {
+                    None
                 } else {
-                    "done".to_string()
-                }
-            };
-
-            // Use description as name, shorten if needed
-            let name = truncate(&description, 30);
-
-            subagents.push(SubAgent {
-                name,
-                status,
-                tokens,
-            });
+                    fs::read_to_string(&meta_path)
+                        .ok()
+                        .and_then(|text| serde_json::from_str(&text).ok())
+                };
+                let description = meta
+                    .as_ref()
+                    .and_then(|value| value.get("description"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| name.trim_end_matches(".jsonl"));
+                let age = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|mtime| mtime.elapsed().ok());
+                let subagent = SubAgent {
+                    name: truncate(description, 30),
+                    status: if age.is_some_and(|age| age.as_secs() < 30) {
+                        "working".to_string()
+                    } else {
+                        "done".to_string()
+                    },
+                    tokens: usage.totals.iter().sum(),
+                };
+                subagents.push((path, subagent));
+            }
         }
 
-        subagents
+        // Directory iteration order is unspecified. Use transcript paths so
+        // rows stay ordered even when metadata arrives or descriptions change.
+        subagents.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let subagents = subagents.into_iter().map(|(_, agent)| agent).collect();
+
+        // Preserve lifetime counts if a completed agent's file is removed.
+        // The whole cache is evicted when the owning session leaves discovery.
+        let mut totals = [0; 4];
+        for usage in cache.values() {
+            for (total, count) in totals.iter_mut().zip(usage.totals) {
+                *total += count;
+            }
+        }
+        (subagents, totals)
     }
 
     fn collect_memory_status(memory_dir: &Path) -> (u32, u32) {
@@ -2167,6 +2202,333 @@ mod tests {
             },
         );
         process_info
+    }
+
+    fn append_usage(path: &Path, totals: [u64; 4]) {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "usage": {
+                        "input_tokens": totals[0],
+                        "output_tokens": totals[1],
+                        "cache_read_input_tokens": totals[2],
+                        "cache_creation_input_tokens": totals[3]
+                    }
+                }
+            })
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn workflow_usage_updates_parent_totals_without_parent_activity() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = ConfigDir::new(temp.path().join("profile"));
+        fs::create_dir_all(&config.sessions_dir).unwrap();
+        let cwd = temp.path().join("repo");
+        let sid = "workflow-session";
+        let pid = 4242;
+        let session_path = config.sessions_dir.join("4242.json");
+        write_session_file(&session_path, pid, sid, &cwd);
+        let parent = write_transcript(&config.projects_dir, &cwd, sid, "Run the workflow");
+        let root = parent.with_extension("").join("subagents");
+        let workflow = root.join("workflows/wf-example");
+        fs::create_dir_all(&workflow).unwrap();
+        append_usage(&root.join("agent-direct.jsonl"), [1, 2, 3, 4]);
+        let nested = workflow.join("agent-nested.jsonl");
+        append_usage(&nested, [10, 20, 30, 40]);
+        // A journal is not an agent transcript, even if it contains usage.
+        append_usage(&workflow.join("journal.jsonl"), [1_000; 4]);
+
+        let process_info = make_proc_info(pid, "claude");
+        let paths = vec![(session_path, config)];
+        let ctx = build_discovery_context(&paths, &process_info, 0);
+        let mut collector = ClaudeCollector::new();
+        let mut collect = || {
+            collector.load_session_paths(
+                &paths,
+                &process_info,
+                &HashMap::new(),
+                &HashMap::new(),
+                &ctx,
+            )
+        };
+        let sessions = collect();
+        let session = &sessions[0];
+        assert_eq!(session.total_input_tokens, 23);
+        assert_eq!(session.total_output_tokens, 28);
+        assert_eq!(session.total_cache_read, 36);
+        assert_eq!(session.total_cache_create, 44);
+        assert_eq!(session.subagents.len(), 2);
+        assert_eq!(session.status, SessionStatus::Executing);
+        let context = session.context_percent;
+        let turns = session.turn_count;
+        append_usage(&nested, [5, 6, 7, 8]);
+        let sessions = collect();
+        let session = &sessions[0];
+        assert_eq!(session.context_percent, context);
+        assert_eq!(session.turn_count, turns);
+        assert_eq!(session.total_input_tokens, 28);
+        assert_eq!(session.total_output_tokens, 34);
+        assert_eq!(session.total_cache_read, 43);
+        assert_eq!(session.total_cache_create, 52);
+        // Unchanged files must not add their lifetime usage again.
+        let sessions = collect();
+        assert_eq!(sessions[0].total_input_tokens, 28);
+        assert_eq!(sessions[0].total_output_tokens, 34);
+        assert_eq!(sessions[0].total_cache_read, 43);
+        assert_eq!(sessions[0].total_cache_create, 52);
+        collector.evict_stale_cache(&[]);
+        assert!(collector.subagent_cache.is_empty());
+    }
+
+    #[test]
+    fn subagent_usage_handles_partial_lines_rotation_and_removed_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agent-one.jsonl");
+        let mut cache = HashMap::new();
+        append_usage(&path, [10, 20, 30, 40]);
+        let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+        assert_eq!(totals, [10, 20, 30, 40]);
+        let offset = cache[&path].offset;
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{{\"type\":\"assistant\",\"message\":").unwrap();
+        let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+        assert_eq!(totals, [10, 20, 30, 40]);
+        assert_eq!(cache[&path].offset, offset);
+        writeln!(file, "{{\"usage\":{{\"input_tokens\":7}}}}}}").unwrap();
+        let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+        assert_eq!(totals, [17, 20, 30, 40]);
+        drop(file);
+
+        fs::write(&path, "").unwrap();
+        append_usage(&path, [1, 2, 3, 4]);
+        let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+        assert_eq!(totals, [1, 2, 3, 4]);
+        fs::remove_file(&path).unwrap();
+        let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+        assert!(agents.is_empty());
+        assert_eq!(totals, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn subagent_usage_resets_after_transcript_replacement() {
+        for replacement_totals in [[11, 22, 33, 44], [100, 200, 300, 400]] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("agent-one.jsonl");
+            let mut cache = HashMap::new();
+            append_usage(&path, [10, 20, 30, 40]);
+            // Also distinguish the replacement with Windows' mtime-based identity.
+            set_mtime(&path, -60);
+            let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+            assert_eq!(totals, [10, 20, 30, 40]);
+            let old_identity = cache[&path].file_identity;
+            let old_len = fs::metadata(&path).unwrap().len();
+
+            // Create a separate file before replacing the original so Unix
+            // must allocate a different inode. Neither case can rely on shrinkage.
+            let replacement = temp.path().join("replacement.jsonl");
+            append_usage(&replacement, replacement_totals);
+            let new_len = fs::metadata(&replacement).unwrap().len();
+            if replacement_totals[0] == 11 {
+                assert_eq!(new_len, old_len);
+            } else {
+                assert!(new_len > old_len);
+            }
+            fs::rename(&replacement, &path).unwrap();
+            assert_ne!(file_identity(&path), old_identity);
+
+            let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+            assert_eq!(totals, replacement_totals);
+            assert_eq!(agents.len(), 1);
+            assert_eq!(agents[0].tokens, replacement_totals.iter().sum::<u64>());
+            assert_eq!(cache[&path].offset, new_len);
+            let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+            assert_eq!(totals, replacement_totals);
+        }
+    }
+
+    #[test]
+    fn subagent_metadata_can_arrive_after_transcript_without_recounting_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agent-one.jsonl");
+        let mut cache = HashMap::new();
+        append_usage(&path, [1, 2, 3, 4]);
+        let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "agent-one");
+        assert_eq!(totals, [1, 2, 3, 4]);
+        let offset = cache[&path].offset;
+
+        fs::write(
+            path.with_extension("meta.json"),
+            r#"{"description":"Research the parser"}"#,
+        )
+        .unwrap();
+        let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "Research the parser");
+        assert_eq!(agents[0].tokens, 10);
+        assert_eq!(totals, [1, 2, 3, 4]);
+        assert_eq!(cache[&path].offset, offset);
+    }
+
+    #[test]
+    fn subagents_keep_path_order_across_discovery_and_metadata_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = HashMap::new();
+        // Duplicate basenames in different workflows must use the full path.
+        let paths = [
+            ("workflows/z/agent-same.jsonl", [3; 4]),
+            ("workflows/a/agent-same.jsonl", [2; 4]),
+            ("agent-root.jsonl", [1; 4]),
+        ];
+        for (relative, usage) in paths {
+            let path = temp.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            append_usage(&path, usage);
+        }
+        let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+        assert_eq!(totals, [6; 4]);
+        assert_eq!(
+            agents.iter().map(|agent| agent.tokens).collect::<Vec<_>>(),
+            vec![4, 8, 12],
+        );
+
+        // Descriptions sort in the opposite order to workflow paths.
+        fs::write(
+            temp.path().join("workflows/a/agent-same.meta.json"),
+            r#"{"description":"Zulu"}"#,
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("workflows/z/agent-same.meta.json"),
+            r#"{"description":"Alpha"}"#,
+        )
+        .unwrap();
+        append_usage(&temp.path().join("agent-earlier.jsonl"), [4; 4]);
+        for _ in 0..2 {
+            let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+            assert_eq!(totals, [10; 4]);
+            assert_eq!(
+                agents
+                    .iter()
+                    .map(|agent| (agent.name.as_str(), agent.tokens))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("agent-earlier", 16),
+                    ("agent-root", 4),
+                    ("Zulu", 8),
+                    ("Alpha", 12),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_cache_evicts_departed_session_and_preserves_active_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = ConfigDir::new(temp.path().join("profile"));
+        fs::create_dir_all(&config.sessions_dir).unwrap();
+        let mut paths = Vec::new();
+        let mut subagent_dirs = Vec::new();
+        let mut process_info = HashMap::new();
+        for (pid, sid, usage) in [
+            (4242, "session-one", [1, 2, 3, 4]),
+            (4343, "session-two", [10, 20, 30, 40]),
+        ] {
+            let cwd = temp.path().join(sid);
+            let session_path = config.sessions_dir.join(format!("{pid}.json"));
+            write_session_file(&session_path, pid, sid, &cwd);
+            let parent = write_transcript(&config.projects_dir, &cwd, sid, "Run the workflow");
+            let root = parent.with_extension("").join("subagents");
+            fs::create_dir_all(&root).unwrap();
+            append_usage(&root.join("agent-one.jsonl"), usage);
+            paths.push((session_path, config.clone()));
+            subagent_dirs.push(root);
+            process_info.extend(make_proc_info(pid, "claude"));
+        }
+        let mut collector = ClaudeCollector::new();
+        let ctx = build_discovery_context(&paths, &process_info, 0);
+        let sessions = collector.load_session_paths(
+            &paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+        assert_eq!(sessions.len(), 2);
+        collector.evict_stale_cache(&sessions);
+        assert_eq!(collector.subagent_cache.len(), 2);
+
+        fs::remove_file(&paths[0].0).unwrap();
+        process_info.remove(&4242);
+        // The active session must retain completed usage even when the
+        // transcript has disappeared and can no longer be reconstructed.
+        fs::remove_file(subagent_dirs[1].join("agent-one.jsonl")).unwrap();
+        let ctx = build_discovery_context(&paths, &process_info, 0);
+        for _ in 0..2 {
+            let sessions = collector.load_session_paths(
+                &paths,
+                &process_info,
+                &HashMap::new(),
+                &HashMap::new(),
+                &ctx,
+            );
+            assert_eq!(sessions.len(), 1);
+            let session = &sessions[0];
+            assert_eq!(session.session_id, "session-two");
+            assert!(session.subagents.is_empty());
+            assert_eq!(session.total_input_tokens, 22);
+            assert_eq!(session.total_output_tokens, 26);
+            assert_eq!(session.total_cache_read, 33);
+            assert_eq!(session.total_cache_create, 40);
+            collector.evict_stale_cache(&sessions);
+            assert_eq!(collector.subagent_cache.len(), 1);
+            assert!(!collector.subagent_cache.contains_key(&subagent_dirs[0]));
+            assert!(collector.subagent_cache.contains_key(&subagent_dirs[1]));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subagent_discovery_skips_symlinked_directories_transcripts_and_metadata() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("subagents");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        append_usage(&outside.join("agent-external.jsonl"), [100; 4]);
+        fs::write(
+            outside.join("meta.json"),
+            r#"{"description":"external metadata"}"#,
+        )
+        .unwrap();
+        symlink(&outside, root.join("linked-directory")).unwrap();
+        symlink(
+            outside.join("agent-external.jsonl"),
+            root.join("agent-link.jsonl"),
+        )
+        .unwrap();
+        append_usage(&root.join("agent-local.jsonl"), [1; 4]);
+        symlink(
+            outside.join("meta.json"),
+            root.join("agent-local.meta.json"),
+        )
+        .unwrap();
+        let (agents, totals) = ClaudeCollector::collect_subagents(&root, &mut HashMap::new());
+        assert_eq!(totals, [1; 4]);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "agent-local");
     }
 
     #[test]
