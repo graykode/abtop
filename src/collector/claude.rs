@@ -812,7 +812,7 @@ impl ClaudeCollector {
                     .modified()
                     .ok()
                     .and_then(|mtime| mtime.elapsed().ok());
-                subagents.push(SubAgent {
+                let subagent = SubAgent {
                     name: truncate(description, 30),
                     status: if age.is_some_and(|age| age.as_secs() < 30) {
                         "working".to_string()
@@ -820,9 +820,15 @@ impl ClaudeCollector {
                         "done".to_string()
                     },
                     tokens: usage.totals.iter().sum(),
-                });
+                };
+                subagents.push((path, subagent));
             }
         }
+
+        // Directory iteration order is unspecified. Use transcript paths so
+        // rows stay ordered even when metadata arrives or descriptions change.
+        subagents.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let subagents = subagents.into_iter().map(|(_, agent)| agent).collect();
 
         // Preserve lifetime counts if a completed agent's file is removed.
         // The whole cache is evicted when the owning session leaves discovery.
@@ -2311,6 +2317,185 @@ mod tests {
         let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
         assert!(agents.is_empty());
         assert_eq!(totals, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn subagent_usage_resets_after_transcript_replacement() {
+        for replacement_totals in [[11, 22, 33, 44], [100, 200, 300, 400]] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("agent-one.jsonl");
+            let mut cache = HashMap::new();
+            append_usage(&path, [10, 20, 30, 40]);
+            // Also distinguish the replacement with Windows' mtime-based identity.
+            set_mtime(&path, -60);
+            let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+            assert_eq!(totals, [10, 20, 30, 40]);
+            let old_identity = cache[&path].file_identity;
+            let old_len = fs::metadata(&path).unwrap().len();
+
+            // Create a separate file before replacing the original so Unix
+            // must allocate a different inode. Neither case can rely on shrinkage.
+            let replacement = temp.path().join("replacement.jsonl");
+            append_usage(&replacement, replacement_totals);
+            let new_len = fs::metadata(&replacement).unwrap().len();
+            if replacement_totals[0] == 11 {
+                assert_eq!(new_len, old_len);
+            } else {
+                assert!(new_len > old_len);
+            }
+            fs::rename(&replacement, &path).unwrap();
+            assert_ne!(file_identity(&path), old_identity);
+
+            let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+            assert_eq!(totals, replacement_totals);
+            assert_eq!(agents.len(), 1);
+            assert_eq!(agents[0].tokens, replacement_totals.iter().sum::<u64>());
+            assert_eq!(cache[&path].offset, new_len);
+            let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+            assert_eq!(totals, replacement_totals);
+        }
+    }
+
+    #[test]
+    fn subagent_metadata_can_arrive_after_transcript_without_recounting_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agent-one.jsonl");
+        let mut cache = HashMap::new();
+        append_usage(&path, [1, 2, 3, 4]);
+        let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "agent-one");
+        assert_eq!(totals, [1, 2, 3, 4]);
+        let offset = cache[&path].offset;
+
+        fs::write(
+            path.with_extension("meta.json"),
+            r#"{"description":"Research the parser"}"#,
+        )
+        .unwrap();
+        let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "Research the parser");
+        assert_eq!(agents[0].tokens, 10);
+        assert_eq!(totals, [1, 2, 3, 4]);
+        assert_eq!(cache[&path].offset, offset);
+    }
+
+    #[test]
+    fn subagents_keep_path_order_across_discovery_and_metadata_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = HashMap::new();
+        // Duplicate basenames in different workflows must use the full path.
+        let paths = [
+            ("workflows/z/agent-same.jsonl", [3; 4]),
+            ("workflows/a/agent-same.jsonl", [2; 4]),
+            ("agent-root.jsonl", [1; 4]),
+        ];
+        for (relative, usage) in paths {
+            let path = temp.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            append_usage(&path, usage);
+        }
+        let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+        assert_eq!(totals, [6; 4]);
+        assert_eq!(
+            agents.iter().map(|agent| agent.tokens).collect::<Vec<_>>(),
+            vec![4, 8, 12],
+        );
+
+        // Descriptions sort in the opposite order to workflow paths.
+        fs::write(
+            temp.path().join("workflows/a/agent-same.meta.json"),
+            r#"{"description":"Zulu"}"#,
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("workflows/z/agent-same.meta.json"),
+            r#"{"description":"Alpha"}"#,
+        )
+        .unwrap();
+        append_usage(&temp.path().join("agent-earlier.jsonl"), [4; 4]);
+        for _ in 0..2 {
+            let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
+            assert_eq!(totals, [10; 4]);
+            assert_eq!(
+                agents
+                    .iter()
+                    .map(|agent| (agent.name.as_str(), agent.tokens))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("agent-earlier", 16),
+                    ("agent-root", 4),
+                    ("Zulu", 8),
+                    ("Alpha", 12),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_cache_evicts_departed_session_and_preserves_active_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = ConfigDir::new(temp.path().join("profile"));
+        fs::create_dir_all(&config.sessions_dir).unwrap();
+        let mut paths = Vec::new();
+        let mut subagent_dirs = Vec::new();
+        let mut process_info = HashMap::new();
+        for (pid, sid, usage) in [
+            (4242, "session-one", [1, 2, 3, 4]),
+            (4343, "session-two", [10, 20, 30, 40]),
+        ] {
+            let cwd = temp.path().join(sid);
+            let session_path = config.sessions_dir.join(format!("{pid}.json"));
+            write_session_file(&session_path, pid, sid, &cwd);
+            let parent = write_transcript(&config.projects_dir, &cwd, sid, "Run the workflow");
+            let root = parent.with_extension("").join("subagents");
+            fs::create_dir_all(&root).unwrap();
+            append_usage(&root.join("agent-one.jsonl"), usage);
+            paths.push((session_path, config.clone()));
+            subagent_dirs.push(root);
+            process_info.extend(make_proc_info(pid, "claude"));
+        }
+        let mut collector = ClaudeCollector::new();
+        let ctx = build_discovery_context(&paths, &process_info, 0);
+        let sessions = collector.load_session_paths(
+            &paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+        assert_eq!(sessions.len(), 2);
+        collector.evict_stale_cache(&sessions);
+        assert_eq!(collector.subagent_cache.len(), 2);
+
+        fs::remove_file(&paths[0].0).unwrap();
+        process_info.remove(&4242);
+        // The active session must retain completed usage even when the
+        // transcript has disappeared and can no longer be reconstructed.
+        fs::remove_file(subagent_dirs[1].join("agent-one.jsonl")).unwrap();
+        let ctx = build_discovery_context(&paths, &process_info, 0);
+        for _ in 0..2 {
+            let sessions = collector.load_session_paths(
+                &paths,
+                &process_info,
+                &HashMap::new(),
+                &HashMap::new(),
+                &ctx,
+            );
+            assert_eq!(sessions.len(), 1);
+            let session = &sessions[0];
+            assert_eq!(session.session_id, "session-two");
+            assert!(session.subagents.is_empty());
+            assert_eq!(session.total_input_tokens, 22);
+            assert_eq!(session.total_output_tokens, 26);
+            assert_eq!(session.total_cache_read, 33);
+            assert_eq!(session.total_cache_create, 40);
+            collector.evict_stale_cache(&sessions);
+            assert_eq!(collector.subagent_cache.len(), 1);
+            assert!(!collector.subagent_cache.contains_key(&subagent_dirs[0]));
+            assert!(collector.subagent_cache.contains_key(&subagent_dirs[1]));
+        }
     }
 
     #[cfg(unix)]
