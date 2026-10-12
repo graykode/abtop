@@ -75,20 +75,22 @@ tmux new -s work
 
 ## Supported Agents
 
-| Feature           | Claude Code | Codex CLI | OpenCode |
-| ----------------- | :---------: | :-------: | :------: |
-| Session Discovery |     ✅      |    ✅     |    ✅    |
-| Token Tracking    |     ✅      |    ✅     |    ✅    |
-| Context Window %  |     ✅      |    ✅     |    ❌    |
-| Status Detection  |     ✅      |    ✅     |    ✅    |
-| Current Task      |     ✅      |    ✅     |    ❌    |
-| Rate Limit        |     ✅      |    ✅     |    ❌    |
-| Git Status        |     ✅      |    ✅     |    ✅    |
-| Children / Ports  |     ✅      |    ✅     |    ✅    |
-| Subagents         |     ✅      |    ❌     |    ❌    |
-| Memory Status     |     ✅      |    ❌     |    ❌    |
+| Feature           | Claude Code | Codex CLI | OpenCode | Hermes Agent |
+| ----------------- | :---------: | :-------: | :------: | :----------: |
+| Session Discovery |     ✅      |    ✅     |    ✅    |      ✅      |
+| Token Tracking    |     ✅      |    ✅     |    ✅    |      ✅      |
+| Context Window %  |     ✅      |    ✅     |    ❌    |      ✅      |
+| Status Detection  |     ✅      |    ✅     |    ✅    |      ✅      |
+| Current Task      |     ✅      |    ✅     |    ❌    |      ✅      |
+| Rate Limit        |     ✅      |    ✅     |    ❌    |      ❌      |
+| Git Status        |     ✅      |    ✅     |    ✅    |      ✅      |
+| Children / Ports  |     ✅      |    ✅     |    ✅    |      ✅      |
+| Subagents         |     ✅      |    ❌     |    ❌    |      ❌      |
+| Memory Status     |     ✅      |    ❌     |    ❌    |      ❌      |
 
 OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
+
+Hermes Agent sessions are discovered from the `tui_gateway.slash_worker` processes Hermes spawns per active session, with metadata read read-only from `~/.hermes/state.db` (or `HERMES_HOME/state.db`) via bundled SQLite — no `sqlite3` CLI or Python required on any platform.
 
 ## Themes
 
