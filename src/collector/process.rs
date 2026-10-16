@@ -416,6 +416,22 @@ pub fn cmd_first_token_has_binary(cmd: &str, name: &str) -> bool {
         .is_some_and(|tok| unix_token_has_binary(tok, name))
 }
 
+/// True when the process itself is a grep (`grep`, `pgrep`, `egrep`, ...),
+/// e.g. a `ps aux | grep codex` that `cmd_has_binary` would match on its
+/// second token. Only the executable counts: an agent whose arguments
+/// mention grep (prompts, `-c` instructions) is not a grep.
+pub fn cmd_is_grep(cmd: &str) -> bool {
+    #[cfg(windows)]
+    let first = windows_command_tokens(cmd).into_iter().next();
+    #[cfg(not(windows))]
+    let first = cmd.split_whitespace().next().map(str::to_owned);
+    first.is_some_and(|tok| {
+        tok.rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|base| base.contains("grep"))
+    })
+}
+
 #[cfg(not(windows))]
 fn unix_token_has_binary(tok: &str, name: &str) -> bool {
     let mut iter = tok.rsplit('/');
@@ -575,6 +591,17 @@ mod tests {
         ));
         // A `versions/` dir not under `<name>/` shouldn't match either.
         assert!(!cmd_has_binary("/some/versions/2.1.121", "claude"));
+    }
+
+    #[test]
+    fn cmd_is_grep_checks_only_the_executable() {
+        assert!(cmd_is_grep("grep codex"));
+        assert!(cmd_is_grep("/usr/bin/pgrep -f codex mcp-server"));
+        assert!(!cmd_is_grep(
+            "codex -c instructions=use-grep-first mcp-server"
+        ));
+        assert!(!cmd_is_grep("opencode run 'grep the logs'"));
+        assert!(!cmd_is_grep(""));
     }
 
     #[cfg(windows)]

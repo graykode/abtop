@@ -553,12 +553,18 @@ impl CodexCollector {
         // so task_complete alone does NOT mean the session is finished when PID is alive.
         // However, for exec (one-shot) sessions, task_complete means truly done.
         let pid_alive = proc.is_some();
+        // The rollout's originator names the client ("codex_exec" vs
+        // "codex-tui"); argv is only a guess for rollouts without one.
+        let is_exec = match result.originator.as_str() {
+            "" => process_ctx.is_exec,
+            originator => originator == "codex_exec",
+        };
         // Mirrors Claude: trust the trailing-event-is-user signal alone.
         // Codex tool outputs flow through response_item, not user_message,
         // so model_generating only flips on real prompts.
         let status = if process_ctx.unknown_process_owner {
             SessionStatus::Unknown
-        } else if !pid_alive || (process_ctx.is_exec && result.task_complete) {
+        } else if !pid_alive || (is_exec && result.task_complete) {
             SessionStatus::Done
         } else {
             let has_active_child = process_ctx.owns_process_tree
@@ -692,9 +698,12 @@ impl CodexCollector {
                 continue;
             }
             let cmd = &info.command;
-            let is_exec = cmd.contains(" exec");
+            // Whole tokens only: `-c` values and prompts can contain " exec"
+            // or "executable", and an interactive TUI marked as exec is hidden
+            // as Done after its first turn.
+            let is_exec = cmd.split_whitespace().skip(1).any(|tok| tok == "exec");
             let is_codex = process::cmd_has_binary(cmd, "codex");
-            if is_codex && !cmd.contains(" app-server") && !cmd.contains("grep") {
+            if is_codex && !cmd.contains(" app-server") && !process::cmd_is_grep(cmd) {
                 pids.push((*pid, is_exec));
             }
         }
@@ -734,7 +743,7 @@ impl CodexCollector {
             let cmd = &info.command;
             if process::cmd_has_binary(cmd, "codex")
                 && cmd.contains(" app-server")
-                && !cmd.contains("grep")
+                && !process::cmd_is_grep(cmd)
             {
                 pids.push(*pid);
             }
@@ -1769,6 +1778,31 @@ mod tests {
     }
 
     #[test]
+    fn find_codex_pids_ignores_grep_and_exec_inside_args() {
+        let mut process_info = HashMap::new();
+        // ps joins argv with spaces, so a long `-c` value reads as words.
+        process_info.insert(
+            10,
+            proc_info(
+                10,
+                1,
+                "codex -c developer_instructions=Use grep first, then run executables --resume abc",
+            ),
+        );
+        process_info.insert(20, proc_info(20, 1, "grep codex"));
+        process_info.insert(30, proc_info(30, 1, "/usr/bin/pgrep codex"));
+        process_info.insert(
+            40,
+            proc_info(40, 1, "codex --profile ci exec fix the build"),
+        );
+
+        let mut pids = CodexCollector::find_codex_pids_from_shared(&process_info, &HashSet::new());
+        pids.sort_unstable();
+
+        assert_eq!(pids, vec![(10, false), (40, true)]);
+    }
+
+    #[test]
     fn find_codex_desktop_pids_detects_app_servers() {
         let mut process_info = HashMap::new();
         process_info.insert(
@@ -2618,6 +2652,44 @@ mod tests {
 
         assert_eq!(session.status, SessionStatus::Done);
         assert_eq!(session.current_tasks, vec!["finished".to_string()]);
+    }
+
+    #[test]
+    fn test_codex_tui_originator_overrides_exec_guess_from_argv() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"session_meta","timestamp":"2026-03-28T15:00:00Z","payload":{"id":"sess-123","cwd":"/home/user/project","originator":"codex-tui","cli_version":"0.163.0","timestamp":"2026-03-28T15:00:00Z"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:01:00Z","payload":{"type":"task_started"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-03-28T15:02:01Z","payload":{"type":"task_complete"}}"#,
+            ],
+        );
+
+        let collector = CodexCollector::new();
+        let mut process_info = HashMap::new();
+        process_info.insert(
+            42,
+            proc_info(42, 1, "codex -c developer_instructions=never exec blindly"),
+        );
+        let process_ctx = CodexProcessContext {
+            pid: Some(42),
+            is_exec: true,
+            owns_process_tree: true,
+            unknown_process_owner: false,
+        };
+
+        let (session, _) = collector
+            .load_session_with_rate_limit(
+                process_ctx,
+                file.path(),
+                &process_info,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
+
+        assert_eq!(session.status, SessionStatus::Waiting);
     }
 
     #[test]

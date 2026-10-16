@@ -245,7 +245,8 @@ impl OpenCodeCollector {
         process_info
             .iter()
             .filter(|(_, info)| {
-                process::cmd_has_binary(&info.command, "opencode") && !info.command.contains("grep")
+                process::cmd_has_binary(&info.command, "opencode")
+                    && !process::cmd_is_grep(&info.command)
             })
             .map(|(pid, _)| *pid)
             .collect()

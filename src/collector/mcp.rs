@@ -153,7 +153,7 @@ pub fn detect(process_info: &HashMap<u32, ProcInfo>) -> McpDetection {
 fn is_codex_mcp_server(cmd: &str) -> bool {
     process::cmd_has_binary(cmd, "codex")
         && cmd.contains("mcp-server")
-        && !cmd.contains("grep")
+        && !process::cmd_is_grep(cmd)
         && !cmd.contains("app-server")
 }
 
