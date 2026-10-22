@@ -188,6 +188,9 @@ let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
 `App` is not `Send` (it owns the collectors), so keep it on one thread and pass
 the serialized JSON elsewhere. [abtop-web-ui](https://github.com/XKHoshizora/abtop-web-ui)
 is a reference consumer: a local-first web dashboard built on exactly this API.
+[ccx](https://github.com/aaronwong1999/ccx) reads `rate_limits` from
+`abtop --json` to warn when Claude's or Codex's 5-hour window passes 90%, and
+moves the task to the other one with its full context in one click.
 
 ## Privacy
 
