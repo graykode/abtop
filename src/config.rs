@@ -52,7 +52,22 @@ impl Default for AppConfig {
 }
 
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("abtop").join("config.toml"))
+    resolve_config_path(std::env::var_os("XDG_CONFIG_HOME"), dirs::config_dir())
+}
+
+/// Resolve the config file path. A non-empty `XDG_CONFIG_HOME` wins on every
+/// platform; otherwise fall back to the platform config dir (`dirs::config_dir()`,
+/// e.g. `~/Library/Application Support` on macOS). Pure so it can be unit-tested
+/// on any OS. Used by both `load_config` and `save_theme`.
+fn resolve_config_path(
+    xdg_config_home: Option<std::ffi::OsString>,
+    fallback: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let base = xdg_config_home
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or(fallback)?;
+    Some(base.join("abtop").join("config.toml"))
 }
 
 pub fn load_config() -> AppConfig {
@@ -218,6 +233,34 @@ fn rewrite_kv_lines(content: &str, updates: &[(&str, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn config_path_prefers_xdg_config_home() {
+        let got = resolve_config_path(
+            Some(OsString::from("/tmp/xdg")),
+            Some(PathBuf::from("/fallback")),
+        );
+        assert_eq!(got, Some(PathBuf::from("/tmp/xdg/abtop/config.toml")));
+    }
+
+    #[test]
+    fn config_path_ignores_empty_xdg_config_home() {
+        let got = resolve_config_path(Some(OsString::new()), Some(PathBuf::from("/fallback")));
+        assert_eq!(got, Some(PathBuf::from("/fallback/abtop/config.toml")));
+    }
+
+    #[test]
+    fn config_path_falls_back_when_xdg_unset() {
+        let got = resolve_config_path(None, Some(PathBuf::from("/fallback")));
+        assert_eq!(got, Some(PathBuf::from("/fallback/abtop/config.toml")));
+    }
+
+    #[test]
+    fn config_path_none_without_any_base() {
+        assert_eq!(resolve_config_path(None, None), None);
+        assert_eq!(resolve_config_path(Some(OsString::new()), None), None);
+    }
 
     #[test]
     fn parse_string_array_basic() {

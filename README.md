@@ -120,7 +120,12 @@ Light themes (`light` — Solarized cream, `white` — GitHub-style pure white) 
 
 ## Configuration
 
-`~/.config/abtop/config.toml` supports:
+abtop reads and saves `abtop/config.toml` under the first of:
+
+1. `$XDG_CONFIG_HOME`, if set and non-empty (on every platform, including macOS)
+2. the platform config directory: `~/.config` on Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows
+
+The file supports:
 
 ```toml
 theme = "btop"
