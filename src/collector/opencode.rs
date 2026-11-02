@@ -318,66 +318,38 @@ impl OpenCodeCollector {
     }
 
     fn query_sessions(&self) -> Option<Vec<DbSession>> {
+        // OpenCode v2 schema: sessions live in `session_v2` with token totals
+        // on the row; `model` is a JSON blob like {"id","providerID","variant"}.
+        // Most rows are subagent children (parent_id set) — only parent sessions
+        // map to user-launched processes, so filter them out like the v1 view.
         let session_sql = format!(
             r#"
 SELECT
   s.id, s.title, s.directory, s.version, s.time_created, s.time_updated,
   COALESCE(p.name, '') as project_name,
-  COUNT(m.id) as turn_count,
-  COALESCE(SUM(json_extract(m.data, '$.tokens.input')), 0) as total_input,
-  COALESCE(SUM(json_extract(m.data, '$.tokens.output')), 0) as total_output,
-  COALESCE(SUM(json_extract(m.data, '$.tokens.cache.read')), 0) as total_cache_read,
-  COALESCE(SUM(json_extract(m.data, '$.tokens.cache.write')), 0) as total_cache_write
-FROM session s
+  (SELECT COUNT(*) FROM session_message m
+    WHERE m.session_id = s.id AND m.type = 'assistant') as turn_count,
+  s.tokens_input as total_input,
+  s.tokens_output as total_output,
+  s.tokens_cache_read as total_cache_read,
+  s.tokens_cache_write as total_cache_write,
+  COALESCE(json_extract(s.model, '$.id'), '') as model,
+  COALESCE(json_extract(s.model, '$.providerID'), '') as provider
+FROM session_v2 s
 LEFT JOIN project p ON s.project_id = p.id
-LEFT JOIN message m ON m.session_id = s.id
-  AND json_extract(m.data, '$.role') = 'assistant'
-GROUP BY s.id
+WHERE s.parent_id IS NULL
 ORDER BY s.time_updated DESC
 LIMIT {};"#,
             MAX_SESSIONS
         );
 
-        let model_sql = format!(
-            r#"
-SELECT
-  s.id,
-  COALESCE((SELECT json_extract(m2.data, '$.modelID')
-    FROM message m2 WHERE m2.session_id = s.id
-    AND json_extract(m2.data, '$.role') = 'assistant'
-    ORDER BY m2.time_created DESC LIMIT 1), '') as model,
-  COALESCE((SELECT json_extract(m2.data, '$.providerID')
-    FROM message m2 WHERE m2.session_id = s.id
-    AND json_extract(m2.data, '$.role') = 'assistant'
-    ORDER BY m2.time_created DESC LIMIT 1), '') as provider
-FROM session s
-ORDER BY s.time_updated DESC
-LIMIT {};"#,
-            MAX_SESSIONS
-        );
-
-        // Two separate invocations to avoid fragile concatenated JSON parsing
         let rows = self.run_query(&session_sql)?;
-        let model_rows = self.run_query(&model_sql).unwrap_or_default();
-
-        // Build model lookup by session id
-        let mut model_map: HashMap<String, (String, String)> = HashMap::new();
-        for mr in &model_rows {
-            if let Some(id) = mr["id"].as_str() {
-                model_map.insert(
-                    id.to_string(),
-                    (
-                        sanitize_db_field(mr["model"].as_str().unwrap_or(""), 256),
-                        sanitize_db_field(mr["provider"].as_str().unwrap_or(""), 256),
-                    ),
-                );
-            }
-        }
 
         let mut sessions = Vec::new();
         for row in rows {
             let id = row["id"].as_str().unwrap_or("").to_string();
-            let (model, provider) = model_map.remove(&id).unwrap_or_default();
+            let model = sanitize_db_field(row["model"].as_str().unwrap_or(""), 256);
+            let provider = sanitize_db_field(row["provider"].as_str().unwrap_or(""), 256);
 
             // Sanitize DB-sourced strings before they reach the TUI/JSON snapshot.
             let title = sanitize_db_title(row["title"].as_str().unwrap_or(""));
