@@ -911,7 +911,12 @@ struct CodexJSONLResult {
 
 impl CodexJSONLResult {
     fn is_codex_desktop(&self) -> bool {
-        self.originator == "Codex Desktop"
+        // Hosts that run sessions through `codex app-server`. Newer Codex
+        // versions stopped using the "Codex Desktop" label.
+        matches!(
+            self.originator.as_str(),
+            "Codex Desktop" | "codex_work_desktop" | "codex_vscode"
+        )
     }
 }
 
@@ -1817,6 +1822,40 @@ mod tests {
             cli.path(),
             super::super::mcp::ACTIVE_MTIME_SECS
         ));
+    }
+
+    #[test]
+    fn desktop_rollout_filter_accepts_newer_app_server_originators() {
+        for originator in ["codex_work_desktop", "codex_vscode"] {
+            let meta = DESKTOP_SESSION_META.replace("Codex Desktop", originator);
+            let mut rollout = tempfile::NamedTempFile::new().unwrap();
+            write_lines(&mut rollout, &[&meta]);
+
+            assert!(
+                CodexCollector::is_active_desktop_rollout(
+                    rollout.path(),
+                    super::super::mcp::ACTIVE_MTIME_SECS
+                ),
+                "originator {originator} should count as a desktop rollout"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_rollout_filter_rejects_cli_originators() {
+        for originator in ["codex_cli_rs", "codex-tui", "codex_exec"] {
+            let meta = DESKTOP_SESSION_META.replace("Codex Desktop", originator);
+            let mut rollout = tempfile::NamedTempFile::new().unwrap();
+            write_lines(&mut rollout, &[&meta]);
+
+            assert!(
+                !CodexCollector::is_active_desktop_rollout(
+                    rollout.path(),
+                    super::super::mcp::ACTIVE_MTIME_SECS
+                ),
+                "originator {originator} should not count as a desktop rollout"
+            );
+        }
     }
 
     #[test]
