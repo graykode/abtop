@@ -144,8 +144,41 @@ pub(crate) fn context_window_for_model(
     configured_model: &str,
     max_context_tokens: u64,
 ) -> u64 {
+    context_window_with_1m_models(
+        transcript_model,
+        configured_model,
+        max_context_tokens,
+        configured_1m_models(),
+    )
+}
+
+/// `context_1m_models` from config.toml, for models that are 1M by default and
+/// so never show a `[1m]` suffix. Empty in tests.
+fn configured_1m_models() -> &'static [String] {
+    #[cfg(test)]
+    {
+        &[]
+    }
+    #[cfg(not(test))]
+    {
+        static MODELS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        MODELS.get_or_init(|| crate::config::load_config().context_1m_models)
+    }
+}
+
+fn context_window_with_1m_models(
+    transcript_model: &str,
+    configured_model: &str,
+    max_context_tokens: u64,
+    one_m_models: &[String],
+) -> u64 {
+    let model_lower = transcript_model.to_ascii_lowercase();
+    let listed_1m = one_m_models
+        .iter()
+        .any(|prefix| model_lower.starts_with(&prefix.to_ascii_lowercase()));
     if transcript_model.contains("[1m]")
         || configured_model.contains("[1m]")
+        || listed_1m
         || max_context_tokens > 200_000
     {
         1_000_000
@@ -564,5 +597,41 @@ mod tests {
         scanner.in_flight_pids = Some(vec![42]);
 
         assert!(!scanner.should_start(&[42]));
+    }
+}
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::context_window_with_1m_models;
+
+    #[test]
+    fn listed_prefix_selects_1m_window() {
+        let models = vec!["claude-fable-5".to_string()];
+        assert_eq!(
+            context_window_with_1m_models("claude-fable-5-1", "fable", 50_000, &models),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn prefix_match_is_case_insensitive() {
+        let models = vec!["Claude-Fable-5".to_string()];
+        assert_eq!(
+            context_window_with_1m_models("claude-fable-5-2", "", 0, &models),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn unlisted_model_keeps_200k_default() {
+        let models = vec!["claude-fable-5".to_string()];
+        assert_eq!(
+            context_window_with_1m_models("claude-opus-4-6", "", 50_000, &models),
+            200_000
+        );
+        assert_eq!(
+            context_window_with_1m_models("claude-fable-5-1", "", 50_000, &[]),
+            200_000
+        );
     }
 }
