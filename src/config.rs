@@ -33,6 +33,8 @@ pub struct AppConfig {
     /// Additional Claude config directories to scan for sessions.
     /// Useful for multi-profile setups that use separate CLAUDE_CONFIG_DIR roots.
     pub claude_config_dirs: Vec<PathBuf>,
+    /// Model-name prefixes that get a 1M context window, e.g. ["claude-fable-5"].
+    pub context_1m_models: Vec<String>,
     pub panels: PanelVisibility,
     /// UI language override. Empty string means auto-detect from `LANG`.
     /// Recognized values: "en", "zh" (anything starting with "zh" maps to Simplified Chinese).
@@ -45,6 +47,7 @@ impl Default for AppConfig {
             theme: "btop".to_string(),
             hidden_agents: Vec::new(),
             claude_config_dirs: Vec::new(),
+            context_1m_models: Vec::new(),
             panels: PanelVisibility::default(),
             language: String::new(),
         }
@@ -91,6 +94,10 @@ fn parse_config_body(content: &str) -> AppConfig {
             }
             if key == "claude_config_dirs" {
                 config.claude_config_dirs = parse_path_array(val);
+                continue;
+            }
+            if key == "context_1m_models" {
+                config.context_1m_models = parse_string_array(val);
                 continue;
             }
             let val = val.trim_matches('"').trim_matches('\'');
@@ -260,6 +267,17 @@ mod tests {
         let cfg = parse_config_body(r#"claude_config_dirs = ["~/.claude-personal"]"#);
 
         assert_eq!(cfg.claude_config_dirs, vec![home.join(".claude-personal")]);
+    }
+
+    #[test]
+    fn parse_config_body_loads_context_1m_models() {
+        let cfg =
+            parse_config_body(r#"context_1m_models = ["claude-fable-5", "claude-opus-5"]"#);
+
+        assert_eq!(
+            cfg.context_1m_models,
+            vec!["claude-fable-5", "claude-opus-5"]
+        );
     }
 
     fn theme_update(name: &str) -> Vec<(&'static str, String)> {

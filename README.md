@@ -131,6 +131,8 @@ hidden_agents = ["codex"]
 # abtop also auto-discovers ~/.claude and ~/.claude-* roots that contain
 # both sessions/ and projects/.
 claude_config_dirs = ["~/.claude-personal", "~/.claude-work-team"]
+# Models with a 1M context window by default (matched by prefix).
+context_1m_models = ["claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-5"]
 # UI language. Omit or leave empty to auto-detect from LANG.
 language = "zh"
 ```
