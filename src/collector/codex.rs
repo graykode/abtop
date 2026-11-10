@@ -353,7 +353,7 @@ impl CodexCollector {
         }
     }
 
-    fn is_active_desktop_rollout(path: &Path, active_mtime_secs: u64) -> bool {
+    fn is_recently_modified(path: &Path, active_mtime_secs: u64) -> bool {
         let Ok(meta) = fs::metadata(path) else {
             return false;
         };
@@ -363,11 +363,22 @@ impl CodexCollector {
         let age = std::time::SystemTime::now()
             .duration_since(modified)
             .unwrap_or_default();
-        if age.as_secs() >= active_mtime_secs {
-            return false;
-        }
+        age.as_secs() < active_mtime_secs
+    }
 
-        parse_codex_jsonl(path).is_some_and(|result| result.is_codex_desktop())
+    /// Filesystem-scan filter. Without a PID to attribute the file to, only
+    /// rollouts that Codex Desktop wrote are trusted to be live.
+    fn is_active_desktop_rollout(path: &Path, active_mtime_secs: u64) -> bool {
+        Self::is_recently_modified(path, active_mtime_secs)
+            && parse_codex_jsonl(path).is_some_and(|result| result.is_codex_desktop())
+    }
+
+    /// fd-scan filter. A recent rollout held open by an `app-server` process
+    /// is live whatever its originator: third-party hosts (e.g. "T3 Code")
+    /// and the managed daemon behind the TUI ("codex-tui") also run through
+    /// `codex app-server`.
+    fn is_active_app_server_rollout(path: &Path, active_mtime_secs: u64) -> bool {
+        Self::is_recently_modified(path, active_mtime_secs) && parse_codex_jsonl(path).is_some()
     }
 
     fn active_desktop_rollouts(
@@ -380,11 +391,17 @@ impl CodexCollector {
             .into_iter()
             .flat_map(|(pid, paths)| paths.into_iter().map(move |path| (pid, path)))
             .collect();
-        candidates.sort_by_key(|(_, path)| {
-            std::cmp::Reverse(
-                fs::metadata(path)
-                    .and_then(|meta| meta.modified())
-                    .unwrap_or(std::time::UNIX_EPOCH),
+        // Several app-server hosts can hold the same rollout open (Codex
+        // Desktop keeps other hosts' threads open). Sort by PID as a tiebreak
+        // so the same PID claims a shared file on every tick.
+        candidates.sort_by_key(|(pid, path)| {
+            (
+                std::cmp::Reverse(
+                    fs::metadata(path)
+                        .and_then(|meta| meta.modified())
+                        .unwrap_or(std::time::UNIX_EPOCH),
+                ),
+                *pid,
             )
         });
 
@@ -395,7 +412,7 @@ impl CodexCollector {
                 !seen_jsonl.contains(path)
                     && !mcp_owned_rollouts.contains(path)
                     && emitted.insert(path.clone())
-                    && Self::is_active_desktop_rollout(path, active_mtime_secs)
+                    && Self::is_active_app_server_rollout(path, active_mtime_secs)
             })
             .collect()
     }
@@ -911,7 +928,12 @@ struct CodexJSONLResult {
 
 impl CodexJSONLResult {
     fn is_codex_desktop(&self) -> bool {
-        self.originator == "Codex Desktop"
+        // Hosts that run sessions through `codex app-server`. Newer Codex
+        // versions stopped using the "Codex Desktop" label.
+        matches!(
+            self.originator.as_str(),
+            "Codex Desktop" | "codex_work_desktop" | "codex_vscode"
+        )
     }
 }
 
@@ -1820,7 +1842,41 @@ mod tests {
     }
 
     #[test]
-    fn active_desktop_rollouts_filters_stale_seen_and_cli_files() {
+    fn desktop_rollout_filter_accepts_newer_app_server_originators() {
+        for originator in ["codex_work_desktop", "codex_vscode"] {
+            let meta = DESKTOP_SESSION_META.replace("Codex Desktop", originator);
+            let mut rollout = tempfile::NamedTempFile::new().unwrap();
+            write_lines(&mut rollout, &[&meta]);
+
+            assert!(
+                CodexCollector::is_active_desktop_rollout(
+                    rollout.path(),
+                    super::super::mcp::ACTIVE_MTIME_SECS
+                ),
+                "originator {originator} should count as a desktop rollout"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_rollout_filter_rejects_cli_originators() {
+        for originator in ["codex_cli_rs", "codex-tui", "codex_exec"] {
+            let meta = DESKTOP_SESSION_META.replace("Codex Desktop", originator);
+            let mut rollout = tempfile::NamedTempFile::new().unwrap();
+            write_lines(&mut rollout, &[&meta]);
+
+            assert!(
+                !CodexCollector::is_active_desktop_rollout(
+                    rollout.path(),
+                    super::super::mcp::ACTIVE_MTIME_SECS
+                ),
+                "originator {originator} should not count as a desktop rollout"
+            );
+        }
+    }
+
+    #[test]
+    fn active_desktop_rollouts_filters_stale_and_seen_files() {
         let temp = tempfile::tempdir().unwrap();
         let active = temp.path().join("rollout-active.jsonl");
         let stale = temp.path().join("rollout-stale.jsonl");
@@ -1831,11 +1887,18 @@ mod tests {
         write_jsonl(&cli, &[SESSION_META]);
         write_jsonl(&seen, &[DESKTOP_SESSION_META]);
         set_modified(&stale, SystemTime::now() - Duration::from_secs(31 * 60));
+        set_modified(&cli, SystemTime::now() - Duration::from_secs(60));
 
         let mut pid_to_rollouts = HashMap::new();
         pid_to_rollouts.insert(
             99,
-            vec![active.clone(), stale, cli, seen.clone(), active.clone()],
+            vec![
+                active.clone(),
+                stale,
+                cli.clone(),
+                seen.clone(),
+                active.clone(),
+            ],
         );
         let seen_jsonl = HashSet::from([seen]);
 
@@ -1846,7 +1909,82 @@ mod tests {
             super::super::mcp::ACTIVE_MTIME_SECS,
         );
 
-        assert_eq!(rollouts, vec![(99, active)]);
+        // A file held open by an app-server counts even without a Desktop
+        // originator; only staleness and prior claims filter it out.
+        assert_eq!(rollouts, vec![(99, active), (99, cli)]);
+    }
+
+    #[test]
+    fn active_desktop_rollouts_accept_non_desktop_app_server_originators() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut held = Vec::new();
+        for (i, originator) in ["T3 Code", "codex-tui", "codex_vscode"].iter().enumerate() {
+            let path = temp.path().join(format!("rollout-{i}.jsonl"));
+            write_jsonl(
+                &path,
+                &[&DESKTOP_SESSION_META.replace("Codex Desktop", originator)],
+            );
+            set_modified(
+                &path,
+                SystemTime::now() - Duration::from_secs(60 * (i as u64 + 1)),
+            );
+            held.push(path);
+        }
+
+        let mut pid_to_rollouts = HashMap::new();
+        pid_to_rollouts.insert(7, held.clone());
+
+        let rollouts = CodexCollector::active_desktop_rollouts(
+            pid_to_rollouts,
+            &HashSet::new(),
+            &HashSet::new(),
+            super::super::mcp::ACTIVE_MTIME_SECS,
+        );
+
+        let expected: Vec<(u32, PathBuf)> = held.into_iter().map(|p| (7, p)).collect();
+        assert_eq!(rollouts, expected);
+    }
+
+    #[test]
+    fn active_desktop_rollouts_emit_shared_file_once_with_stable_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("rollout-shared.jsonl");
+        write_jsonl(
+            &shared,
+            &[&DESKTOP_SESSION_META.replace("Codex Desktop", "T3 Code")],
+        );
+
+        let mut pid_to_rollouts = HashMap::new();
+        pid_to_rollouts.insert(300, vec![shared.clone()]);
+        pid_to_rollouts.insert(200, vec![shared.clone()]);
+
+        let rollouts = CodexCollector::active_desktop_rollouts(
+            pid_to_rollouts,
+            &HashSet::new(),
+            &HashSet::new(),
+            super::super::mcp::ACTIVE_MTIME_SECS,
+        );
+
+        assert_eq!(rollouts, vec![(200, shared)]);
+    }
+
+    #[test]
+    fn filesystem_scan_still_requires_desktop_originator() {
+        let temp = tempfile::tempdir().unwrap();
+        let t3 = temp.path().join("rollout-t3.jsonl");
+        write_jsonl(
+            &t3,
+            &[&DESKTOP_SESSION_META.replace("Codex Desktop", "T3 Code")],
+        );
+
+        assert!(!CodexCollector::is_active_desktop_rollout(
+            &t3,
+            super::super::mcp::ACTIVE_MTIME_SECS
+        ));
+        assert!(CodexCollector::is_active_app_server_rollout(
+            &t3,
+            super::super::mcp::ACTIVE_MTIME_SECS
+        ));
     }
 
     #[test]
