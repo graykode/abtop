@@ -48,11 +48,19 @@ pub(crate) fn draw_quota_panel_active(
     // Split into side-by-side columns: one per known source (CLAUDE | CODEX).
     // Columns are always rendered so the panel layout stays stable even when a
     // source has no data yet.
-    let num_sources = SOURCES.len() as u16;
+    let mut sources: Vec<&str> = SOURCES
+        .iter()
+        .copied()
+        .filter(|s| !app.hidden_agents.iter().any(|h| h.eq_ignore_ascii_case(s)))
+        .collect();
+    if sources.is_empty() {
+        sources = SOURCES.to_vec();
+    }
+    let num_sources = sources.len() as u16;
     let col_w = inner.width / num_sources;
     let content_h = inner.height.saturating_sub(1); // reserve last row for totals
 
-    for (i, source) in SOURCES.iter().enumerate() {
+    for (i, source) in sources.iter().enumerate() {
         let col_x = inner.x + (i as u16) * col_w;
         let this_w = if i as u16 == num_sources - 1 {
             inner.width - (i as u16) * col_w

@@ -114,6 +114,8 @@ pub struct App {
     /// Kill confirmation: (selected_index, timestamp). Expires after 2s.
     kill_confirm: Option<(usize, Instant)>,
     pub theme: Theme,
+    /// Agent CLIs hidden by config; their quota columns are hidden too.
+    pub hidden_agents: Vec<String>,
     pub show_context: bool,
     pub show_quota: bool,
     pub show_tokens: bool,
@@ -190,6 +192,7 @@ impl App {
             status_msg: None,
             kill_confirm: None,
             theme,
+            hidden_agents: hidden_agents.to_vec(),
             show_context: panels.context,
             show_quota: panels.quota,
             show_tokens: panels.tokens,

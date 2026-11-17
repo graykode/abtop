@@ -91,6 +91,10 @@ pub(crate) fn draw_sessions_panel_active(
     let show_tokens = w >= 86;
     let show_memory = w >= 110;
     let show_turn = w >= 110;
+    // The AI column only tells sessions apart when more than one agent, or an App/IDE session, runs.
+    let show_agent = app.sessions.iter().any(|s| {
+        s.agent_cli != app.sessions[0].agent_cli || !s.launch_surface.label_suffix().is_empty()
+    });
 
     let project_w: u16 = if w >= 120 {
         14
@@ -255,11 +259,19 @@ pub(crate) fn draw_sessions_panel_active(
             )));
         }
 
+        if !show_agent {
+            cells.remove(1);
+        }
         rows.push(Row::new(cells).style(row_style).height(1));
 
         // 2nd line: task text in Summary column
-        let summary_idx = 3 + show_pid as usize + show_session_id as usize + show_config as usize;
-        let total_cols = 6
+        let summary_idx = 2
+            + show_agent as usize
+            + show_pid as usize
+            + show_session_id as usize
+            + show_config as usize;
+        let total_cols = 5
+            + show_agent as usize
             + show_pid as usize
             + show_session_id as usize
             + show_config as usize
@@ -308,8 +320,16 @@ pub(crate) fn draw_sessions_panel_active(
                 if show_pid {
                     sa_cells.push(Cell::from(""));
                 }
+                if !show_agent {
+                    sa_cells.remove(1);
+                }
+                let sa_name = if show_agent {
+                    sa.name.clone()
+                } else {
+                    format!("{prefix}{}", sa.name)
+                };
                 sa_cells.push(Cell::from(Span::styled(
-                    truncate_str(&sa.name, project_w as usize),
+                    truncate_str(&sa_name, project_w as usize),
                     Style::default().fg(theme.graph_text),
                 )));
                 if show_session_id {
@@ -377,6 +397,9 @@ pub(crate) fn draw_sessions_panel_active(
     if show_turn {
         header_cells.push(Cell::from(Span::styled(t("col.turn"), header_style)));
     }
+    if !show_agent {
+        header_cells.remove(1);
+    }
     let header = Row::new(header_cells).height(1);
 
     let mut widths_vec: Vec<Constraint> = vec![
@@ -407,6 +430,9 @@ pub(crate) fn draw_sessions_panel_active(
     }
     if show_turn {
         widths_vec.push(Constraint::Length(4)); // turn
+    }
+    if !show_agent {
+        widths_vec.remove(1);
     }
 
     // Scroll: rows vary per session in tree view; use the built row list as the source of truth.
@@ -1377,10 +1403,9 @@ mod tests {
 
         let cli_text = render(LaunchSurface::Cli);
         assert!(
-            cli_text.contains("*CC "),
-            "plain CLI session should render the unsuffixed label\n{cli_text}"
+            !cli_text.contains("*CC") && !cli_text.contains(" AI "),
+            "sessions from one agent CLI should hide the AI column\n{cli_text}"
         );
-        assert!(!cli_text.contains("*CCa") && !cli_text.contains("*CCi"));
 
         let app_text = render(LaunchSurface::App);
         assert!(
@@ -1392,6 +1417,35 @@ mod tests {
         assert!(
             ide_text.contains("*CCi"),
             "IDE-extension session should get the 'i' suffix\n{ide_text}"
+        );
+    }
+
+    #[test]
+    fn agent_column_shows_only_for_mixed_agent_clis() {
+        let render = |agents: &[&'static str]| {
+            let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+            for (i, agent) in agents.iter().enumerate() {
+                let mut session = test_session(&format!("sid{i}"), "proj");
+                session.agent_cli = agent;
+                app.sessions.push(session);
+            }
+            let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+            terminal
+                .draw(|f| draw_sessions_panel(f, &app, Rect::new(0, 0, 120, 20), &app.theme))
+                .unwrap();
+            format!("{}", terminal.backend())
+        };
+
+        let codex_only = render(&["codex", "codex"]);
+        assert!(
+            !codex_only.contains(">CD"),
+            "codex-only sessions should hide the AI column\n{codex_only}"
+        );
+
+        let mixed = render(&["claude", "codex"]);
+        assert!(
+            mixed.contains("*CC") && mixed.contains(">CD"),
+            "mixed agent CLIs should show the AI column\n{mixed}"
         );
     }
 
