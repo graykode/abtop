@@ -91,11 +91,10 @@ pub(crate) fn draw_sessions_panel_active(
     let show_tokens = w >= 86;
     let show_memory = w >= 110;
     let show_turn = w >= 110;
-    // The AI column only tells sessions apart when more than plain Claude CLI runs.
-    let show_agent = app
-        .sessions
-        .iter()
-        .any(|s| s.agent_cli != "claude" || !s.launch_surface.label_suffix().is_empty());
+    // The AI column only tells sessions apart when more than one agent, or an App/IDE session, runs.
+    let show_agent = app.sessions.iter().any(|s| {
+        s.agent_cli != app.sessions[0].agent_cli || !s.launch_surface.label_suffix().is_empty()
+    });
 
     let project_w: u16 = if w >= 120 {
         14
@@ -1405,7 +1404,7 @@ mod tests {
         let cli_text = render(LaunchSurface::Cli);
         assert!(
             !cli_text.contains("*CC") && !cli_text.contains(" AI "),
-            "only plain Claude CLI sessions should hide the AI column\n{cli_text}"
+            "sessions from one agent CLI should hide the AI column\n{cli_text}"
         );
 
         let app_text = render(LaunchSurface::App);
@@ -1418,6 +1417,35 @@ mod tests {
         assert!(
             ide_text.contains("*CCi"),
             "IDE-extension session should get the 'i' suffix\n{ide_text}"
+        );
+    }
+
+    #[test]
+    fn agent_column_shows_only_for_mixed_agent_clis() {
+        let render = |agents: &[&'static str]| {
+            let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+            for (i, agent) in agents.iter().enumerate() {
+                let mut session = test_session(&format!("sid{i}"), "proj");
+                session.agent_cli = agent;
+                app.sessions.push(session);
+            }
+            let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+            terminal
+                .draw(|f| draw_sessions_panel(f, &app, Rect::new(0, 0, 120, 20), &app.theme))
+                .unwrap();
+            format!("{}", terminal.backend())
+        };
+
+        let codex_only = render(&["codex", "codex"]);
+        assert!(
+            !codex_only.contains(">CD"),
+            "codex-only sessions should hide the AI column\n{codex_only}"
+        );
+
+        let mixed = render(&["claude", "codex"]);
+        assert!(
+            mixed.contains("*CC") && mixed.contains(">CD"),
+            "mixed agent CLIs should show the AI column\n{mixed}"
         );
     }
 
