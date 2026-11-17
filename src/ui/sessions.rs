@@ -91,6 +91,11 @@ pub(crate) fn draw_sessions_panel_active(
     let show_tokens = w >= 86;
     let show_memory = w >= 110;
     let show_turn = w >= 110;
+    // The AI column only tells sessions apart when more than plain Claude CLI runs.
+    let show_agent = app
+        .sessions
+        .iter()
+        .any(|s| s.agent_cli != "claude" || !s.launch_surface.label_suffix().is_empty());
 
     let project_w: u16 = if w >= 120 {
         14
@@ -255,11 +260,19 @@ pub(crate) fn draw_sessions_panel_active(
             )));
         }
 
+        if !show_agent {
+            cells.remove(1);
+        }
         rows.push(Row::new(cells).style(row_style).height(1));
 
         // 2nd line: task text in Summary column
-        let summary_idx = 3 + show_pid as usize + show_session_id as usize + show_config as usize;
-        let total_cols = 6
+        let summary_idx = 2
+            + show_agent as usize
+            + show_pid as usize
+            + show_session_id as usize
+            + show_config as usize;
+        let total_cols = 5
+            + show_agent as usize
             + show_pid as usize
             + show_session_id as usize
             + show_config as usize
@@ -308,8 +321,16 @@ pub(crate) fn draw_sessions_panel_active(
                 if show_pid {
                     sa_cells.push(Cell::from(""));
                 }
+                if !show_agent {
+                    sa_cells.remove(1);
+                }
+                let sa_name = if show_agent {
+                    sa.name.clone()
+                } else {
+                    format!("{prefix}{}", sa.name)
+                };
                 sa_cells.push(Cell::from(Span::styled(
-                    truncate_str(&sa.name, project_w as usize),
+                    truncate_str(&sa_name, project_w as usize),
                     Style::default().fg(theme.graph_text),
                 )));
                 if show_session_id {
@@ -377,6 +398,9 @@ pub(crate) fn draw_sessions_panel_active(
     if show_turn {
         header_cells.push(Cell::from(Span::styled(t("col.turn"), header_style)));
     }
+    if !show_agent {
+        header_cells.remove(1);
+    }
     let header = Row::new(header_cells).height(1);
 
     let mut widths_vec: Vec<Constraint> = vec![
@@ -407,6 +431,9 @@ pub(crate) fn draw_sessions_panel_active(
     }
     if show_turn {
         widths_vec.push(Constraint::Length(4)); // turn
+    }
+    if !show_agent {
+        widths_vec.remove(1);
     }
 
     // Scroll: rows vary per session in tree view; use the built row list as the source of truth.
@@ -1377,10 +1404,9 @@ mod tests {
 
         let cli_text = render(LaunchSurface::Cli);
         assert!(
-            cli_text.contains("*CC "),
-            "plain CLI session should render the unsuffixed label\n{cli_text}"
+            !cli_text.contains("*CC") && !cli_text.contains(" AI "),
+            "only plain Claude CLI sessions should hide the AI column\n{cli_text}"
         );
-        assert!(!cli_text.contains("*CCa") && !cli_text.contains("*CCi"));
 
         let app_text = render(LaunchSurface::App);
         assert!(
