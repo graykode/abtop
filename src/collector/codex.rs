@@ -672,6 +672,8 @@ impl CodexCollector {
                         .parent()
                         .unwrap_or(std::path::Path::new(".")),
                 ),
+                // Populated by MultiCollector
+                tmux: None,
             },
             rate_limit,
         ))

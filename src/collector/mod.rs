@@ -4,6 +4,7 @@ pub mod mcp;
 pub mod opencode;
 pub mod process;
 pub mod rate_limit;
+pub mod tmux;
 
 pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
@@ -308,6 +309,8 @@ pub struct MultiCollector {
     /// when unreadable. Each value expires once per slow period (see
     /// `expire_pss`), so it is re-read every `SLOW_POLL_INTERVAL` ticks.
     pss_cache: HashMap<u32, Option<u64>>,
+    /// tmux panes keyed by pane process pid, listed again on slow ticks.
+    tmux_panes: HashMap<u32, crate::model::TmuxLocation>,
 }
 
 /// Drop the cached PSS values due on this tick. Each pid falls due once every
@@ -379,6 +382,7 @@ impl MultiCollector {
             mcp_suppress: true,
             desktop_rollout_scanner: DesktopRolloutScanner::new(),
             pss_cache: HashMap::new(),
+            tmux_panes: HashMap::new(),
         }
     }
 
@@ -487,6 +491,18 @@ impl MultiCollector {
             &mut self.pss_cache,
             process::read_pss_and_swap_kb,
         );
+
+        // tmux location: list the panes on slow ticks, but map pids every
+        // tick so a session started in a known pane is placed at once. When
+        // tmux does not answer in time, the panes listed before are kept.
+        if slow_tick {
+            if let Some(panes) = tmux::list_panes() {
+                self.tmux_panes = panes;
+            }
+        }
+        for s in &mut all {
+            s.tmux = tmux::pane_of(s.pid, &self.tmux_panes, &shared.process_info);
+        }
 
         // --- Orphan port detection ---
         // 1. Update tracked port children from live sessions

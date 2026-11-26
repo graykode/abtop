@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::model::{
     AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
-    OrphanPort, RateLimitInfo, SessionStatus, SubAgent, ToolCall,
+    OrphanPort, RateLimitInfo, SessionStatus, SubAgent, TmuxLocation, ToolCall,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +14,15 @@ fn now_ms() -> u64 {
 
 fn now_secs() -> u64 {
     now_ms() / 1000
+}
+
+fn tmux_pane(session: &str, window_index: u32, window_name: &str) -> Option<TmuxLocation> {
+    Some(TmuxLocation {
+        session_name: session.into(),
+        window_index,
+        window_name: window_name.into(),
+        pane_index: 0,
+    })
 }
 
 pub fn populate_demo(app: &mut App) {
@@ -201,6 +210,7 @@ pub fn populate_demo(app: &mut App) {
             pending_since_ms: now - 6_000, // 6s ago => bar animates
             thinking_since_ms: 0,
             config_root: "~/.claude".into(),
+            tmux: tmux_pane("work", 1, "webshop"),
             file_accesses: vec![
                 FileAccess {
                     path: "src/checkout/payment.rs".into(),
@@ -311,6 +321,7 @@ pub fn populate_demo(app: &mut App) {
             pending_since_ms: 0,
             thinking_since_ms: 0,
             config_root: "~/.claude-work".into(),
+            tmux: None,
             file_accesses: vec![],
         },
         AgentSession {
@@ -417,6 +428,7 @@ pub fn populate_demo(app: &mut App) {
             // session's 2.8s max tool duration before it caps at 100%.
             thinking_since_ms: now - 1_000,
             config_root: "~/.claude".into(),
+            tmux: None,
             file_accesses: vec![],
         },
         AgentSession {
@@ -473,6 +485,7 @@ pub fn populate_demo(app: &mut App) {
             pending_since_ms: 0,
             thinking_since_ms: 0,
             config_root: "~/.codex".into(),
+            tmux: tmux_pane("work", 2, "data-viz"),
             file_accesses: vec![],
         },
         AgentSession {
@@ -517,6 +530,7 @@ pub fn populate_demo(app: &mut App) {
             pending_since_ms: 0,
             thinking_since_ms: 0,
             config_root: "~/.local/share/opencode".into(),
+            tmux: tmux_pane("ops", 1, "infra"),
             file_accesses: vec![],
         },
     ];

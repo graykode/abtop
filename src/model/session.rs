@@ -158,6 +158,28 @@ impl LaunchSurface {
     }
 }
 
+/// The tmux pane a session's agent process runs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxLocation {
+    pub session_name: String,
+    pub window_index: u32,
+    /// Window name as reported by tmux (user text, sanitized), may be empty.
+    pub window_name: String,
+    pub pane_index: u32,
+}
+
+impl TmuxLocation {
+    /// `session:window_name`, or `session:window_index` when the window has
+    /// no name.
+    pub fn label(&self) -> String {
+        if self.window_name.is_empty() {
+            format!("{}:{}", self.session_name, self.window_index)
+        } else {
+            format!("{}:{}", self.session_name, self.window_name)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentSession {
     /// Which CLI tool this session belongs to: "claude", "codex", etc.
@@ -232,6 +254,9 @@ pub struct AgentSession {
     /// For Claude Code: the active .claude* profile folder. For Codex: "~/.codex".
     /// For OpenCode: the data directory containing opencode.db.
     pub config_root: String,
+    /// tmux pane whose process tree holds the agent process, on the default
+    /// tmux server. `None` outside tmux. Filled in by `MultiCollector`.
+    pub tmux: Option<TmuxLocation>,
 }
 
 impl AgentSession {
@@ -343,6 +368,7 @@ mod tests {
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: String::new(),
+            tmux: None,
         }
     }
 
