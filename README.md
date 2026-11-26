@@ -61,6 +61,8 @@ abtop --mouse            # Enable mouse click/scroll navigation
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 Mouse capture is off by default so terminal drag selection and copy keep working. Launch with `--mouse` if you prefer click targets and wheel navigation.
 
+Memory (the sessions table's Memory column, the header's Σ total, `mem_mb` in `--json`) covers each session's whole process tree: the agent plus its MCP servers, shells and other descendants. On Linux each process counts its PSS in RAM and in swap: shared pages are split among the processes that map them instead of being counted in full for each, and swapped-out pages count too, since closing the session frees them as well. Elsewhere, its RSS. A session running inside another one (e.g. `codex exec` started by Claude Code) is counted once in the total.
+
 ### Terminal Jump
 
 Press `Enter` to focus the terminal running the selected agent. abtop supports cmux, tmux, and iTerm2 on macOS.
@@ -72,6 +74,8 @@ tmux new -s work
 # pane 2: claude (project B)
 # → Enter on a session in abtop jumps to its pane
 ```
+
+When sessions run in tmux (the default server, even if abtop itself runs outside tmux), wide terminals get a Tmux column with each session's `session:window`, and `--json` reports `tmux_session`, `tmux_window_index`, `tmux_window_name` and `tmux_pane_index` (`null` outside tmux).
 
 ## Supported Agents
 
@@ -193,7 +197,7 @@ is a reference consumer: a local-first web dashboard built on exactly this API.
 
 abtop reads local files and local process/open-file metadata only. No API keys, no auth. In the TUI and `--once` output, tool names and file paths are shown, but file contents and prompt text are never displayed. Session summaries are generated via `claude --print`, which makes its own API call — this is the only indirect network usage.
 
-The JSON snapshot includes richer local dashboard data, including `summary`, `chat_messages`, working directories, config roots, tool-call previews, child process commands, token counts, and port metadata. Chat text is bounded and redacted by the collectors, but it is still derived from local transcripts and may contain sensitive project context. Treat JSON snapshots as local/private data and avoid writing them to shared logs or exposing them on a network without your own access controls.
+The JSON snapshot includes richer local dashboard data, including `summary`, `chat_messages`, working directories, config roots, tmux session and window names, tool-call previews, child process commands, token counts, and port metadata. Chat text is bounded and redacted by the collectors, but it is still derived from local transcripts and may contain sensitive project context. Treat JSON snapshots as local/private data and avoid writing them to shared logs or exposing them on a network without your own access controls.
 
 ## Acknowledgements
 

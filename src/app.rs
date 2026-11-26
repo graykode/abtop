@@ -1037,6 +1037,7 @@ mod tests {
             version: String::new(),
             git_branch: String::new(),
             mem_mb: 0,
+            owns_process_tree: true,
             token_history: vec![],
             context_history: vec![],
             context_window: 0,
@@ -1052,6 +1053,7 @@ mod tests {
             thinking_since_ms: 0,
             file_accesses: vec![],
             config_root: String::new(),
+            tmux: None,
             git_added: 0,
             git_modified: 0,
         }

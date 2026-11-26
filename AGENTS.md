@@ -184,6 +184,7 @@ lsof -i -P -n -sTCP:LISTEN         # Open ports
 ```
 - Build parent→children map from ppid
 - Map listening PID → parent agent PID → session
+- Session memory (`mem_mb`, MEM column, header Σ) = agent process + all descendants. Linux: each process counts its PSS in RAM and in swap (`Pss:` + `SwapPss:` of `/proc/{pid}/smaps_rollup`), read only for PIDs in session trees: PIDs not seen yet at once, each known PID again once per slow period, on the tick its PID falls due (so the re-reads are spread over the 5 ticks); RSS when unreadable. Other platforms: RSS. The aggregate counts a session nested in another session's tree (e.g. `codex exec` run by Claude Code) once.
 
 ### 7. Git status per project
 ```bash
@@ -217,6 +218,15 @@ File format read by abtop:
 ### 10. Other files
 - `~/.claude/stats-cache.json` — daily aggregates. Only updated on `/stats`, NOT real-time.
 - `~/.claude/history.jsonl` — prompt history with sessionId.
+
+### 11. tmux location
+```bash
+tmux list-panes -a -F 'N#{pane_pid}N#{session_name}N#{window_index}N#{pane_index}N#{window_name}'   # N: a nonce, new for each call
+```
+- One call per slow tick on the default server (or the one in `$TMUX`), cached in between; every tick each session is mapped to the pane whose pid is its agent PID or an ancestor of it, using the shared process table.
+- No tmux binary, no server, or any error → no location, silently. The call gets 2 s: when the server does not answer, the `tmux` client is killed and the panes listed before are kept.
+- Session/window names are user text: sanitized before display. tmux passes window names through raw (tabs, newlines), so no separator character is safe: every field is preceded by a random nonce (16 hex digits) made for that call, and the output is split on it, five fields per pane. A name cannot hold a nonce it never saw, so it cannot fake a field or a record.
+- Shown in the sessions table as an optional Tmux column (`session:window_name`, index when the name is empty; only when some session has a location and the table is ≥140 columns wide) and as `tmux_*` fields in `--json`.
 
 ## Session Status Detection
 
@@ -291,6 +301,7 @@ Tracks child processes that have open ports. When a parent session dies but the 
   - Session scan + transcript tail: every 2s
   - Process tree (ps): every 2s
   - Port scan (lsof) + git status + rate limits: every 10s (5 ticks)
+  - PSS of session-tree processes: each PID every 10s (5 ticks), spread over the ticks
 
 ## Commit Convention
 

@@ -91,6 +91,9 @@ pub(crate) fn draw_sessions_panel_active(
     let show_tokens = w >= 86;
     let show_memory = w >= 110;
     let show_turn = w >= 110;
+    // Only when some session runs in tmux; below 140 the columns above
+    // already fill the row.
+    let show_tmux = w >= 140 && app.sessions.iter().any(|s| s.tmux.is_some());
 
     let project_w: u16 = if w >= 120 {
         14
@@ -126,6 +129,7 @@ pub(crate) fn draw_sessions_panel_active(
         t("col.ctx")
     };
     let tokens_w: u16 = if w >= 100 { 7 } else { 5 };
+    let tmux_w: u16 = if w >= 160 { 20 } else { 14 };
 
     let visible = app.visible_indices();
     for &i in &visible {
@@ -208,6 +212,15 @@ pub(crate) fn draw_sessions_panel_active(
                 Style::default().fg(theme.inactive_fg),
             )));
         }
+        if show_tmux {
+            cells.push(Cell::from(Span::styled(
+                match &session.tmux {
+                    Some(location) => truncate_str(&location.label(), tmux_w as usize),
+                    None => "—".into(),
+                },
+                Style::default().fg(theme.inactive_fg),
+            )));
+        }
         cells.extend([
             Cell::from(Span::styled(
                 truncate_str(&summary_col, w.saturating_sub(24) as usize),
@@ -258,11 +271,16 @@ pub(crate) fn draw_sessions_panel_active(
         rows.push(Row::new(cells).style(row_style).height(1));
 
         // 2nd line: task text in Summary column
-        let summary_idx = 3 + show_pid as usize + show_session_id as usize + show_config as usize;
+        let summary_idx = 3
+            + show_pid as usize
+            + show_session_id as usize
+            + show_config as usize
+            + show_tmux as usize;
         let total_cols = 6
             + show_pid as usize
             + show_session_id as usize
             + show_config as usize
+            + show_tmux as usize
             + show_model as usize
             + show_tokens as usize
             + show_memory as usize
@@ -318,6 +336,9 @@ pub(crate) fn draw_sessions_panel_active(
                 if show_config {
                     sa_cells.push(Cell::from(""));
                 }
+                if show_tmux {
+                    sa_cells.push(Cell::from(""));
+                }
                 sa_cells.extend([
                     Cell::from(""),
                     Cell::from(Span::styled(icon, Style::default().fg(sa_fg))),
@@ -360,6 +381,9 @@ pub(crate) fn draw_sessions_panel_active(
     if show_config {
         header_cells.push(Cell::from(Span::styled(config_label, header_style)));
     }
+    if show_tmux {
+        header_cells.push(Cell::from(Span::styled(t("col.tmux"), header_style)));
+    }
     header_cells.extend([
         Cell::from(Span::styled(t("col.summary"), header_style)),
         Cell::from(Span::styled(t("col.status"), header_style)),
@@ -392,6 +416,9 @@ pub(crate) fn draw_sessions_panel_active(
     }
     if show_config {
         widths_vec.push(Constraint::Length(config_w)); // config root
+    }
+    if show_tmux {
+        widths_vec.push(Constraint::Length(tmux_w)); // tmux location
     }
     widths_vec.push(Constraint::Fill(1)); // summary (fills remaining)
     widths_vec.push(Constraint::Length(status_w)); // status
@@ -1296,6 +1323,7 @@ mod tests {
             turn_count: 1,
             current_tasks: vec!["waiting for input".into()],
             mem_mb: 0,
+            owns_process_tree: true,
             version: String::new(),
             git_branch: String::new(),
             git_added: 0,
@@ -1316,6 +1344,7 @@ mod tests {
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: String::new(),
+            tmux: None,
         });
 
         let backend = TestBackend::new(120, 20);
@@ -1477,6 +1506,67 @@ mod tests {
         assert_eq!(buffer[(1, 4)].symbol(), "►");
     }
 
+    fn render_sessions(sessions: Vec<AgentSession>, width: u16) -> String {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        app.sessions = sessions;
+        let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+        terminal
+            .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+        format!("{}", terminal.backend())
+    }
+
+    fn in_tmux(mut session: AgentSession, window_name: &str) -> AgentSession {
+        session.tmux = Some(crate::model::TmuxLocation {
+            session_name: "dev".into(),
+            window_index: 3,
+            window_name: window_name.into(),
+            pane_index: 1,
+        });
+        session
+    }
+
+    #[test]
+    fn tmux_column_shows_session_and_window_on_wide_terminals() {
+        let sessions = vec![
+            in_tmux(test_session("first111", "first"), "wm-feature"),
+            in_tmux(test_session("second22", "second"), ""),
+            test_session("third333", "third"),
+        ];
+
+        let wide = render_sessions(sessions.clone(), 170);
+        assert!(wide.contains("Tmux"), "{wide}");
+        assert!(wide.contains("dev:wm-feature"), "{wide}");
+        // Unnamed window: fall back to its index.
+        assert!(wide.contains("dev:3 "), "{wide}");
+        // The existing columns are all still there.
+        for header in [
+            "Pid", "Project", "Session", "Config", "Summary", "Memory", "Turn",
+        ] {
+            assert!(wide.contains(header), "missing {header}\n{wide}");
+        }
+
+        let narrower = render_sessions(sessions, 120);
+        assert!(!narrower.contains("Tmux"), "{narrower}");
+    }
+
+    #[test]
+    fn tmux_column_needs_a_session_in_tmux() {
+        let text = render_sessions(vec![test_session("first111", "first")], 170);
+        assert!(!text.contains("Tmux"), "{text}");
+    }
+
+    #[test]
+    fn tmux_location_leaves_an_80_column_table_unchanged() {
+        let plain = vec![test_session("first111", "first")];
+        let located = vec![in_tmux(test_session("first111", "first"), "wm-feature")];
+        let text = render_sessions(located, 80);
+        assert_eq!(text, render_sessions(plain, 80));
+        for header in ["AI", "Project", "Sess", "Summary", "Status", "Ctx"] {
+            assert!(text.contains(header), "missing {header}\n{text}");
+        }
+    }
+
     fn test_session(session_id: &str, project_name: &str) -> AgentSession {
         AgentSession {
             agent_cli: "claude",
@@ -1497,6 +1587,7 @@ mod tests {
             turn_count: 1,
             current_tasks: vec!["waiting for input".into()],
             mem_mb: 0,
+            owns_process_tree: true,
             version: String::new(),
             git_branch: String::new(),
             git_added: 0,
@@ -1517,6 +1608,7 @@ mod tests {
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: "~/.claude".into(),
+            tmux: None,
         }
     }
 }

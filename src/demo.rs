@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::model::{
     AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
-    OrphanPort, RateLimitInfo, SessionStatus, SubAgent, ToolCall,
+    OrphanPort, RateLimitInfo, SessionStatus, SubAgent, TmuxLocation, ToolCall,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +14,15 @@ fn now_ms() -> u64 {
 
 fn now_secs() -> u64 {
     now_ms() / 1000
+}
+
+fn tmux_pane(session: &str, window_index: u32, window_name: &str) -> Option<TmuxLocation> {
+    Some(TmuxLocation {
+        session_name: session.into(),
+        window_index,
+        window_name: window_name.into(),
+        pane_index: 0,
+    })
 }
 
 pub fn populate_demo(app: &mut App) {
@@ -39,7 +48,8 @@ pub fn populate_demo(app: &mut App) {
             total_cache_create: 185_000,
             turn_count: 34,
             current_tasks: vec!["Edit src/checkout/payment.rs".into()],
-            mem_mb: 342,
+            mem_mb: 703, // agent 342 + children
+            owns_process_tree: true,
             version: "2.1.87".into(),
             git_branch: "main".into(),
             git_added: 2,
@@ -200,6 +210,7 @@ pub fn populate_demo(app: &mut App) {
             pending_since_ms: now - 6_000, // 6s ago => bar animates
             thinking_since_ms: 0,
             config_root: "~/.claude".into(),
+            tmux: tmux_pane("work", 1, "webshop"),
             file_accesses: vec![
                 FileAccess {
                     path: "src/checkout/payment.rs".into(),
@@ -272,6 +283,7 @@ pub fn populate_demo(app: &mut App) {
             turn_count: 71,
             current_tasks: vec!["waiting for user input".into()],
             mem_mb: 128,
+            owns_process_tree: true,
             version: "2.1.87".into(),
             git_branch: "feat/batch-inference".into(),
             git_added: 1,
@@ -309,6 +321,7 @@ pub fn populate_demo(app: &mut App) {
             pending_since_ms: 0,
             thinking_since_ms: 0,
             config_root: "~/.claude-work".into(),
+            tmux: None,
             file_accesses: vec![],
         },
         AgentSession {
@@ -329,7 +342,8 @@ pub fn populate_demo(app: &mut App) {
             total_cache_create: 45_000,
             turn_count: 12,
             current_tasks: vec!["Bash npm run dev".into()],
-            mem_mb: 86,
+            mem_mb: 256, // agent 86 + children
+            owns_process_tree: true,
             version: "2.1.87".into(),
             git_branch: "main".into(),
             git_added: 0,
@@ -414,6 +428,7 @@ pub fn populate_demo(app: &mut App) {
             // session's 2.8s max tool duration before it caps at 100%.
             thinking_since_ms: now - 1_000,
             config_root: "~/.claude".into(),
+            tmux: None,
             file_accesses: vec![],
         },
         AgentSession {
@@ -434,7 +449,8 @@ pub fn populate_demo(app: &mut App) {
             total_cache_create: 12_000,
             turn_count: 6,
             current_tasks: vec!["Write src/charts/heatmap.py".into()],
-            mem_mb: 64,
+            mem_mb: 95, // agent 64 + child
+            owns_process_tree: true,
             version: "0.116.0".into(),
             git_branch: "feat/heatmap".into(),
             git_added: 3,
@@ -469,6 +485,7 @@ pub fn populate_demo(app: &mut App) {
             pending_since_ms: 0,
             thinking_since_ms: 0,
             config_root: "~/.codex".into(),
+            tmux: tmux_pane("work", 2, "data-viz"),
             file_accesses: vec![],
         },
         AgentSession {
@@ -490,6 +507,7 @@ pub fn populate_demo(app: &mut App) {
             turn_count: 9,
             current_tasks: vec!["thinking...".into()],
             mem_mb: 156,
+            owns_process_tree: true,
             version: "1.4.0".into(),
             git_branch: "main".into(),
             git_added: 1,
@@ -512,6 +530,7 @@ pub fn populate_demo(app: &mut App) {
             pending_since_ms: 0,
             thinking_since_ms: 0,
             config_root: "~/.local/share/opencode".into(),
+            tmux: tmux_pane("ops", 1, "infra"),
             file_accesses: vec![],
         },
     ];

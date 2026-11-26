@@ -158,6 +158,28 @@ impl LaunchSurface {
     }
 }
 
+/// The tmux pane a session's agent process runs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxLocation {
+    pub session_name: String,
+    pub window_index: u32,
+    /// Window name as reported by tmux (user text, sanitized), may be empty.
+    pub window_name: String,
+    pub pane_index: u32,
+}
+
+impl TmuxLocation {
+    /// `session:window_name`, or `session:window_index` when the window has
+    /// no name.
+    pub fn label(&self) -> String {
+        if self.window_name.is_empty() {
+            format!("{}:{}", self.session_name, self.window_index)
+        } else {
+            format!("{}:{}", self.session_name, self.window_name)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentSession {
     /// Which CLI tool this session belongs to: "claude", "codex", etc.
@@ -183,7 +205,16 @@ pub struct AgentSession {
     pub total_cache_create: u64,
     pub turn_count: u32,
     pub current_tasks: Vec<String>,
+    /// Memory of the session's process tree (the agent process and all its
+    /// descendants) in MiB: on Linux the PSS of each process in RAM and in
+    /// swap, elsewhere its RSS. Filled in by `MultiCollector`; 0 when
+    /// `owns_process_tree` is false.
     pub mem_mb: u64,
+    /// True when `pid` is this session's own agent process, so that process
+    /// and its descendants are attributed to the session (`mem_mb`,
+    /// `children`). False for a Codex thread served by a shared app-server
+    /// process, or a session without a live process.
+    pub owns_process_tree: bool,
     pub version: String,
     pub git_branch: String,
     pub git_added: u32,
@@ -223,6 +254,9 @@ pub struct AgentSession {
     /// For Claude Code: the active .claude* profile folder. For Codex: "~/.codex".
     /// For OpenCode: the data directory containing opencode.db.
     pub config_root: String,
+    /// tmux pane whose process tree holds the agent process, on the default
+    /// tmux server. `None` outside tmux. Filled in by `MultiCollector`.
+    pub tmux: Option<TmuxLocation>,
 }
 
 impl AgentSession {
@@ -313,6 +347,7 @@ mod tests {
             turn_count: 0,
             current_tasks: Vec::new(),
             mem_mb: 0,
+            owns_process_tree: true,
             version: String::new(),
             git_branch: String::new(),
             git_added: 0,
@@ -333,6 +368,7 @@ mod tests {
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: String::new(),
+            tmux: None,
         }
     }
 

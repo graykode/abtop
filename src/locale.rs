@@ -43,6 +43,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("col.turn", "Turn");
     m.insert("col.config", "Config");
     m.insert("col.cfg", "Cfg");
+    m.insert("col.tmux", "Tmux");
 
     // Agent labels
     m.insert("agent.claude", "*CC");
@@ -294,6 +295,7 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("col.turn", "轮");
     m.insert("col.config", "配置");
     m.insert("col.cfg", "配");
+    m.insert("col.tmux", "Tmux");
 
     // Agent labels
     m.insert("agent.claude", "*CC");

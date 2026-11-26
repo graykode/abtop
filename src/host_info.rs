@@ -5,6 +5,7 @@
 //! "metrics unavailable" and render a graceful fallback.
 
 use serde::Serialize;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct HostMetrics {
@@ -226,6 +227,9 @@ mod windows_impl {
 /// Aggregate per-session metrics into a single agent-wide summary.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct AgentAggregate {
+    /// Memory of all session process trees in MiB, each process counted
+    /// once: a session nested in another one's tree (e.g. `codex exec` run
+    /// from Claude Code's Bash tool) is already part of that tree.
     pub mem_mb: u64,
     /// Average context window fill across active sessions (0.0 - 100.0).
     pub avg_ctx_pct: f64,
@@ -238,8 +242,17 @@ impl AgentAggregate {
         let mut ctx_sum = 0.0;
         let mut ctx_n = 0usize;
         let mut active = 0usize;
+        // A session's tree contains the trees of the sessions nested in it,
+        // so only count trees whose root is outside every other tree.
+        let nested: HashSet<u32> = sessions
+            .iter()
+            .flat_map(|s| s.children.iter().map(|c| c.pid))
+            .collect();
+        let mut counted_roots = HashSet::new();
         for s in sessions {
-            mem_mb = mem_mb.saturating_add(s.mem_mb);
+            if s.owns_process_tree && !nested.contains(&s.pid) && counted_roots.insert(s.pid) {
+                mem_mb = mem_mb.saturating_add(s.mem_mb);
+            }
             if s.context_percent > 0.0 {
                 ctx_sum += s.context_percent;
                 ctx_n += 1;
@@ -258,5 +271,61 @@ impl AgentAggregate {
             avg_ctx_pct,
             active_count: active,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AgentSession, ChildProcess};
+
+    fn session(pid: u32, mem_mb: u64, children: &[u32]) -> AgentSession {
+        let mut app = crate::app::App::new_with_config(
+            crate::theme::Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        crate::demo::populate_demo(&mut app);
+        let mut session = app.sessions.remove(0);
+        session.pid = pid;
+        session.mem_mb = mem_mb;
+        session.owns_process_tree = true;
+        session.children = children
+            .iter()
+            .map(|&pid| ChildProcess {
+                pid,
+                command: "x".to_string(),
+                mem_kb: 0,
+                port: None,
+            })
+            .collect();
+        session
+    }
+
+    #[test]
+    fn aggregate_counts_a_nested_session_once() {
+        // Claude Code (100) runs `codex exec` (102) from its Bash tool (101):
+        // the Claude tree already holds the Codex tree (102, 103).
+        let claude = session(100, 900, &[101, 102, 103]);
+        let codex = session(102, 300, &[103]);
+        let other = session(200, 50, &[201]);
+
+        let agg = AgentAggregate::from_sessions(&[codex, claude, other]);
+
+        assert_eq!(agg.mem_mb, 950);
+    }
+
+    #[test]
+    fn aggregate_counts_each_root_once() {
+        // A session that doesn't own its pid claims nothing, so the session
+        // that does still counts; the same process listed twice counts once.
+        let mut hosted = session(100, 0, &[]);
+        hosted.owns_process_tree = false;
+        let first = session(100, 900, &[]);
+        let same_pid = session(100, 900, &[]);
+
+        let agg = AgentAggregate::from_sessions(&[hosted, first, same_pid]);
+
+        assert_eq!(agg.mem_mb, 900);
     }
 }

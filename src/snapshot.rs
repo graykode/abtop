@@ -100,6 +100,15 @@ pub struct SessionView {
     pub cwd: String,
     /// Home-abbreviated config root (e.g. "~/.claude", "~/.codex").
     pub config_root: String,
+    /// tmux session of the pane running the agent (default tmux server);
+    /// `null` when the agent doesn't run in tmux, as are the fields below.
+    pub tmux_session: Option<String>,
+    /// Index of that pane's tmux window.
+    pub tmux_window_index: Option<u32>,
+    /// Name of that pane's tmux window (user text, sanitized; may be empty).
+    pub tmux_window_name: Option<String>,
+    /// Index of the pane within its window.
+    pub tmux_pane_index: Option<u32>,
     /// Coarse activity state; serializes as its variant name (e.g. `"Thinking"`).
     pub status: SessionStatus,
     /// Model identifier reported by the session (e.g. `"claude-opus-4-6"`).
@@ -124,7 +133,12 @@ pub struct SessionView {
     pub cache_create_tokens: u64,
     /// Number of user/assistant turns observed.
     pub turn_count: u32,
-    /// Resident memory of the session process tree, in MiB.
+    /// Memory of the session's process tree (the agent and all its
+    /// descendants) in MiB, i.e. what closing the session gives back: on
+    /// Linux the PSS of each process in RAM and in swap, so pages shared
+    /// between processes are not counted twice; RSS elsewhere. 0 when the
+    /// session doesn't own its process (a Codex thread served by a shared
+    /// app-server).
     pub mem_mb: u64,
     /// Current git branch of `cwd`, or empty when not a repo.
     pub git_branch: String,
@@ -212,6 +226,10 @@ impl App {
                 project_name: s.project_name.clone(),
                 cwd: s.cwd.clone(),
                 config_root: s.config_root.clone(),
+                tmux_session: s.tmux.as_ref().map(|t| t.session_name.clone()),
+                tmux_window_index: s.tmux.as_ref().map(|t| t.window_index),
+                tmux_window_name: s.tmux.as_ref().map(|t| t.window_name.clone()),
+                tmux_pane_index: s.tmux.as_ref().map(|t| t.pane_index),
                 status: s.status.clone(),
                 model: s.model.clone(),
                 effort: s.effort.clone(),
@@ -384,6 +402,36 @@ mod tests {
         // Re-parse as generic JSON to confirm it is well-formed.
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert!(parsed["sessions"].is_array());
+    }
+
+    #[test]
+    fn tmux_location_fields_are_null_outside_tmux() {
+        let snap = demo_app().to_snapshot(2_000);
+        let json = serde_json::to_value(&snap).expect("snapshot serializes");
+        let sessions = json["sessions"].as_array().expect("sessions array");
+        let by_project = |name: &str| {
+            sessions
+                .iter()
+                .find(|s| s["project_name"] == name)
+                .expect("demo session")
+        };
+
+        let in_tmux = by_project("webshop");
+        assert_eq!(in_tmux["tmux_session"], "work");
+        assert_eq!(in_tmux["tmux_window_index"], 1);
+        assert_eq!(in_tmux["tmux_window_name"], "webshop");
+        assert_eq!(in_tmux["tmux_pane_index"], 0);
+
+        // The demo's desktop-app session runs outside tmux.
+        let outside = by_project("ml-pipeline");
+        for key in [
+            "tmux_session",
+            "tmux_window_index",
+            "tmux_window_name",
+            "tmux_pane_index",
+        ] {
+            assert!(outside[key].is_null(), "{key} should be null");
+        }
     }
 
     #[test]

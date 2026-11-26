@@ -537,11 +537,9 @@ impl CodexCollector {
         let result = parse_codex_jsonl(jsonl_path)?;
 
         let proc = process_ctx.pid.and_then(|p| process_info.get(&p));
-        let mem_mb = if process_ctx.owns_process_tree {
-            proc.map(|p| p.rss_kb / 1024).unwrap_or(0)
-        } else {
-            0
-        };
+        // Process tree memory: populated by MultiCollector when the session
+        // owns its process tree.
+        let mem_mb = 0;
         let display_pid = process_ctx.pid.unwrap_or(0);
 
         let project_name = process::last_path_segment(&result.cwd)
@@ -649,6 +647,7 @@ impl CodexCollector {
                 turn_count: result.turn_count,
                 current_tasks,
                 mem_mb,
+                owns_process_tree: process_ctx.owns_process_tree,
                 version: result.version,
                 git_branch: result.git_branch,
                 git_added,
@@ -673,6 +672,8 @@ impl CodexCollector {
                         .parent()
                         .unwrap_or(std::path::Path::new(".")),
                 ),
+                // Populated by MultiCollector
+                tmux: None,
             },
             rate_limit,
         ))
@@ -1955,6 +1956,7 @@ mod tests {
         assert_eq!(sessions[0].agent_cli, "codex");
         assert_eq!(sessions[0].status, SessionStatus::Waiting);
         assert_eq!(sessions[0].mem_mb, 0);
+        assert!(!sessions[0].owns_process_tree);
         assert!(sessions[0].children.is_empty());
     }
 
@@ -2337,6 +2339,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(session.status, SessionStatus::Executing);
+        assert!(session.owns_process_tree);
         assert_eq!(
             session.current_tasks,
             vec!["exec_command cargo test".to_string()]
