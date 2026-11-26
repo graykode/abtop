@@ -384,7 +384,7 @@ pub(crate) fn draw_sessions_panel_active(
         Constraint::Length(4), // agent label (+1 for the App/IDE suffix letter)
     ];
     if show_pid {
-        widths_vec.push(Constraint::Length(6)); // pid
+        widths_vec.push(Constraint::Length(7)); // pid (Linux pid_max 4194304: 7 digits)
     }
     widths_vec.push(Constraint::Length(project_w)); // project
     if show_session_id {
@@ -700,10 +700,10 @@ pub(crate) fn draw_sessions_panel_active(
                                 .join(" ");
                             let port_str =
                                 child.port.map(|p| format!(" :{}", p)).unwrap_or_default();
-                            let max_cmd = (children_area.width as usize).saturating_sub(18);
+                            let max_cmd = (children_area.width as usize).saturating_sub(20);
                             lines.push(Line::from(vec![
                                 Span::styled(
-                                    format!(" {:<6}", child.pid),
+                                    format!(" {:<7} ", child.pid),
                                     Style::default().fg(theme.main_fg),
                                 ),
                                 Span::styled(
@@ -1393,6 +1393,42 @@ mod tests {
             ide_text.contains("*CCi"),
             "IDE-extension session should get the 'i' suffix\n{ide_text}"
         );
+    }
+
+    #[test]
+    fn seven_digit_pids_are_shown_in_full() {
+        // Linux pid_max can be 4194304, so pids have up to 7 digits.
+        let mut session = test_session("first111", "first");
+        session.pid = 4_194_304;
+        session.children = vec![crate::model::ChildProcess {
+            pid: 4_194_303,
+            command: "node mcp-server.js".into(),
+            mem_kb: 2048,
+            port: None,
+        }];
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        app.sessions = vec![session];
+        let render = |width: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            terminal
+                .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+                .unwrap();
+            format!("{}", terminal.backend())
+        };
+
+        let wide = render(130);
+        assert!(wide.contains("4194304"), "pid column cuts the pid\n{wide}");
+        assert!(
+            wide.contains("4194303 node"),
+            "child pid runs into its command\n{wide}"
+        );
+
+        // At 80 columns the Pid column is hidden and nothing else moves.
+        let narrow = render(80);
+        for header in ["AI", "Project", "Sess", "Summary", "Status", "Ctx"] {
+            assert!(narrow.contains(header), "missing {header}\n{narrow}");
+        }
+        assert!(narrow.contains("4194303 node"), "{narrow}");
     }
 
     #[test]
