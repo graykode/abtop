@@ -391,8 +391,8 @@ impl ClaudeCollector {
             .unwrap_or("?")
             .to_string();
 
-        let proc = process_info.get(&sf.pid);
-        let mem_mb = proc.map(|p| p.rss_kb / 1024).unwrap_or(0);
+        // Process tree memory: populated by MultiCollector
+        let mem_mb = 0;
 
         // Use the already-resolved project_dir so a post-/clear sid lookup
         // lands in the same (possibly worktree) directory as the original.
@@ -692,6 +692,7 @@ impl ClaudeCollector {
             turn_count,
             current_tasks,
             mem_mb,
+            owns_process_tree: true,
             version,
             git_branch,
             git_added,

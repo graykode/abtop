@@ -116,7 +116,8 @@ impl OpenCodeCollector {
             };
 
             let proc = shared.process_info.get(&matched_pid);
-            let mem_mb = proc.map(|p| p.rss_kb / 1024).unwrap_or(0);
+            // Process tree memory: populated by MultiCollector
+            let mem_mb = 0;
 
             let age_ms = now_ms.saturating_sub(ds.time_updated);
             let since_update_secs = age_ms / 1000;
@@ -212,6 +213,7 @@ impl OpenCodeCollector {
                 turn_count: ds.turn_count,
                 current_tasks,
                 mem_mb,
+                owns_process_tree: true,
                 version: ds.version.clone(),
                 git_branch: String::new(),
                 git_added: 0,

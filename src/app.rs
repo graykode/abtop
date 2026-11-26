@@ -1037,6 +1037,7 @@ mod tests {
             version: String::new(),
             git_branch: String::new(),
             mem_mb: 0,
+            owns_process_tree: true,
             token_history: vec![],
             context_history: vec![],
             context_window: 0,

@@ -61,6 +61,8 @@ abtop --mouse            # Enable mouse click/scroll navigation
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 Mouse capture is off by default so terminal drag selection and copy keep working. Launch with `--mouse` if you prefer click targets and wheel navigation.
 
+Memory (the sessions table's Memory column, the header's Σ total, `mem_mb` in `--json`) covers each session's whole process tree: the agent plus its MCP servers, shells and other descendants. On Linux each process counts its PSS in RAM and in swap: shared pages are split among the processes that map them instead of being counted in full for each, and swapped-out pages count too, since closing the session frees them as well. Elsewhere, its RSS. A session running inside another one (e.g. `codex exec` started by Claude Code) is counted once in the total.
+
 ### Terminal Jump
 
 Press `Enter` to focus the terminal running the selected agent. abtop supports cmux, tmux, and iTerm2 on macOS.

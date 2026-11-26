@@ -265,6 +265,74 @@ pub fn has_active_descendant(
     false
 }
 
+/// Memory of `root` and all its descendants (the tree the children panel
+/// shows, plus the root itself), in KiB. Each process counts what `pss_kb`
+/// returns for it (on Linux its PSS in RAM and in swap) or, when that is
+/// `None`, its RSS, so a process whose PSS cannot be read still counts. Pids
+/// missing from `process_info` count as 0.
+pub fn tree_mem_kb(
+    root: u32,
+    children_map: &HashMap<u32, Vec<u32>>,
+    process_info: &HashMap<u32, ProcInfo>,
+    mut pss_kb: impl FnMut(u32) -> Option<u64>,
+) -> u64 {
+    // pid 0 is not a process: its "children" are init and kthreadd, i.e. the
+    // whole host.
+    if root == 0 {
+        return 0;
+    }
+    let mut total = 0u64;
+    let mut stack = vec![root];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        if let Some(info) = process_info.get(&pid) {
+            total = total.saturating_add(pss_kb(pid).unwrap_or(info.rss_kb));
+        }
+        if let Some(kids) = children_map.get(&pid) {
+            stack.extend(kids);
+        }
+    }
+    total
+}
+
+/// Proportional set size of a process in RAM and in swap, in KiB: its
+/// private pages plus an equal share of each page it shares with others, so
+/// summing it over many processes counts shared memory once, and the pages
+/// swapped out count too, since ending the process frees them as well. Read
+/// from `/proc/<pid>/smaps_rollup` (the kernel walks every mapping, so it is
+/// costlier than `stat`); `None` when that can't be read (process gone,
+/// kernel thread, no permission).
+#[cfg(target_os = "linux")]
+pub fn read_pss_and_swap_kb(pid: u32) -> Option<u64> {
+    parse_pss_and_swap_kb(&fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?)
+}
+
+/// PSS is Linux-only: elsewhere every process is counted by its RSS.
+#[cfg(not(target_os = "linux"))]
+pub fn read_pss_and_swap_kb(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// `Pss:` plus `SwapPss:` (KiB) of a `smaps_rollup` dump; `None` without a
+/// `Pss:` line. `Pss_Anon:`, `Pss_File:`, ... are breakdowns of `Pss:`, and
+/// `Swap:` counts shared swap in full, so none of them must match.
+#[cfg(any(target_os = "linux", test))]
+fn parse_pss_and_swap_kb(smaps_rollup: &str) -> Option<u64> {
+    let field = |name: &str| {
+        smaps_rollup.lines().find_map(|line| {
+            line.strip_prefix(name)?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+    };
+    Some(field("Pss:")? + field("SwapPss:").unwrap_or(0))
+}
+
 /// On Linux, parse /proc/net/tcp[6] for LISTEN sockets, then match inodes
 /// via scan_proc_fds. Only scans FDs for PIDs in `known_pids` (from
 /// get_process_info) to avoid scanning all 500+ /proc entries.
@@ -659,5 +727,103 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(20, proc(20, 99));
         assert!(!is_descendant_of(20, 7, &m));
+    }
+
+    #[test]
+    fn parse_pss_and_swap_kb_adds_the_swapped_share() {
+        // Layout of /proc/<pid>/smaps_rollup on Linux 6.x/7.x.
+        let rollup = "5f8843163000-7ffd8fd57000 ---p 00000000 00:00 0   [rollup]\n\
+                      Rss:                7596 kB\n\
+                      Pss:                1872 kB\n\
+                      Pss_Dirty:          1380 kB\n\
+                      Pss_Anon:           1380 kB\n\
+                      Pss_File:            492 kB\n\
+                      Pss_Shmem:             0 kB\n\
+                      Shared_Clean:       6172 kB\n\
+                      Swap:                512 kB\n\
+                      SwapPss:             300 kB\n";
+        assert_eq!(parse_pss_and_swap_kb(rollup), Some(1872 + 300));
+    }
+
+    #[test]
+    fn parse_pss_and_swap_kb_ignores_breakdown_lines_and_bad_input() {
+        // Without a `Pss:` line the process is unreadable (RSS fallback).
+        assert_eq!(
+            parse_pss_and_swap_kb("Pss_Anon:  10 kB\nPss_File:  20 kB\nSwapPss:  5 kB\n"),
+            None
+        );
+        // A kernel thread's smaps_rollup is empty.
+        assert_eq!(parse_pss_and_swap_kb(""), None);
+        assert_eq!(parse_pss_and_swap_kb("Pss:   lots kB\n"), None);
+        // No usable `SwapPss:` line: the share in RAM alone.
+        assert_eq!(parse_pss_and_swap_kb("Pss:  64 kB\n"), Some(64));
+        assert_eq!(
+            parse_pss_and_swap_kb("Pss:  64 kB\nSwapPss: ? kB\n"),
+            Some(64)
+        );
+    }
+
+    fn proc_rss(pid: u32, ppid: u32, rss_kb: u64) -> ProcInfo {
+        ProcInfo {
+            rss_kb,
+            ..proc(pid, ppid)
+        }
+    }
+
+    fn table(procs: &[(u32, u32, u64)]) -> HashMap<u32, ProcInfo> {
+        procs
+            .iter()
+            .map(|&(pid, ppid, rss_kb)| (pid, proc_rss(pid, ppid, rss_kb)))
+            .collect()
+    }
+
+    #[test]
+    fn tree_mem_kb_sums_pss_of_the_tree_with_rss_fallback() {
+        // 10 agent ─┬─ 11 MCP server ── 12 its child
+        //           └─ 13 shell, PSS unreadable: counted by RSS
+        // 20 unrelated process: not counted, never read
+        let procs = table(&[
+            (10, 1, 900),
+            (11, 10, 800),
+            (12, 11, 700),
+            (13, 10, 600),
+            (20, 1, 500),
+        ]);
+        let children = get_children_map(&procs);
+        let pss = HashMap::from([(10, 300), (11, 200), (12, 100), (20, 50)]);
+        let mut read = Vec::new();
+
+        let total = tree_mem_kb(10, &children, &procs, |pid| {
+            read.push(pid);
+            pss.get(&pid).copied()
+        });
+
+        assert_eq!(total, 300 + 200 + 100 + 600);
+        read.sort_unstable();
+        assert_eq!(read, vec![10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn tree_mem_kb_without_pss_is_the_rss_sum_of_the_subtree() {
+        let procs = table(&[(10, 1, 900), (11, 10, 800), (12, 11, 700), (13, 10, 600)]);
+        let children = get_children_map(&procs);
+        assert_eq!(tree_mem_kb(10, &children, &procs, |_| None), 3000);
+        assert_eq!(tree_mem_kb(11, &children, &procs, |_| None), 1500);
+    }
+
+    #[test]
+    fn tree_mem_kb_is_zero_for_pid_zero_and_gone_roots() {
+        // children_map[0] holds init: pid 0 must not mean "the whole host".
+        let procs = table(&[(1, 0, 100), (10, 1, 900)]);
+        let children = get_children_map(&procs);
+        assert_eq!(tree_mem_kb(0, &children, &procs, |_| None), 0);
+        assert_eq!(tree_mem_kb(99, &children, &procs, |_| None), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_pss_and_swap_kb_reads_own_process() {
+        let kb = read_pss_and_swap_kb(std::process::id()).expect("own smaps_rollup is readable");
+        assert!(kb > 0);
     }
 }

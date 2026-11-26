@@ -183,7 +183,16 @@ pub struct AgentSession {
     pub total_cache_create: u64,
     pub turn_count: u32,
     pub current_tasks: Vec<String>,
+    /// Memory of the session's process tree (the agent process and all its
+    /// descendants) in MiB: on Linux the PSS of each process in RAM and in
+    /// swap, elsewhere its RSS. Filled in by `MultiCollector`; 0 when
+    /// `owns_process_tree` is false.
     pub mem_mb: u64,
+    /// True when `pid` is this session's own agent process, so that process
+    /// and its descendants are attributed to the session (`mem_mb`,
+    /// `children`). False for a Codex thread served by a shared app-server
+    /// process, or a session without a live process.
+    pub owns_process_tree: bool,
     pub version: String,
     pub git_branch: String,
     pub git_added: u32,
@@ -313,6 +322,7 @@ mod tests {
             turn_count: 0,
             current_tasks: Vec::new(),
             mem_mb: 0,
+            owns_process_tree: true,
             version: String::new(),
             git_branch: String::new(),
             git_added: 0,

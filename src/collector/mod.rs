@@ -304,6 +304,36 @@ pub struct MultiCollector {
     /// with the existing 1-of-N HashMap-overwrite caveat).
     pub mcp_suppress: bool,
     desktop_rollout_scanner: DesktopRolloutScanner,
+    /// PSS in RAM and in swap (KiB) of the processes in session trees, `None`
+    /// when unreadable. Each value expires once per slow period (see
+    /// `expire_pss`), so it is re-read every `SLOW_POLL_INTERVAL` ticks.
+    pss_cache: HashMap<u32, Option<u64>>,
+}
+
+/// Drop the cached PSS values due on this tick. Each pid falls due once every
+/// `SLOW_POLL_INTERVAL` ticks, on the tick matching its pid, so the re-reads
+/// are spread over the slow period instead of all landing on one tick. Pids
+/// gone from every session tree leave the cache the same way.
+fn expire_pss(pss_cache: &mut HashMap<u32, Option<u64>>, tick: u32) {
+    pss_cache.retain(|&pid, _| pid % SLOW_POLL_INTERVAL != tick % SLOW_POLL_INTERVAL);
+}
+
+/// Set `mem_mb` of every session that owns its process tree to the memory of
+/// that tree (see `process::tree_mem_kb`). PSS values come from `pss_cache`;
+/// a pid not cached yet is read with `read_pss` and cached.
+fn fill_session_mem(
+    sessions: &mut [AgentSession],
+    children_map: &HashMap<u32, Vec<u32>>,
+    process_info: &HashMap<u32, process::ProcInfo>,
+    pss_cache: &mut HashMap<u32, Option<u64>>,
+    read_pss: impl Fn(u32) -> Option<u64>,
+) {
+    for s in sessions.iter_mut().filter(|s| s.owns_process_tree) {
+        let kb = process::tree_mem_kb(s.pid, children_map, process_info, |pid| {
+            *pss_cache.entry(pid).or_insert_with(|| read_pss(pid))
+        });
+        s.mem_mb = kb / 1024;
+    }
 }
 
 /// How often to refresh expensive I/O (in ticks). 5 ticks × 2s = 10s.
@@ -348,6 +378,7 @@ impl MultiCollector {
             mcp_servers: Vec::new(),
             mcp_suppress: true,
             desktop_rollout_scanner: DesktopRolloutScanner::new(),
+            pss_cache: HashMap::new(),
         }
     }
 
@@ -443,6 +474,19 @@ impl MultiCollector {
         // Hide dead sessions: Codex uses pid==0 sentinel, Claude is filtered in collect().
         all.retain(|s| !matches!(s.status, SessionStatus::Done));
         all.sort_by_key(|s| std::cmp::Reverse(s.started_at));
+
+        // Session memory: the whole process tree, by PSS in RAM and in swap on
+        // Linux. Reading smaps_rollup is costly, so only pids in session trees
+        // are read: pids not seen yet at once, known ones again once per slow
+        // period, spread over its ticks so that no tick pays for all of them.
+        expire_pss(&mut self.pss_cache, self.tick_count);
+        fill_session_mem(
+            &mut all,
+            &shared.children_map,
+            &shared.process_info,
+            &mut self.pss_cache,
+            process::read_pss_and_swap_kb,
+        );
 
         // --- Orphan port detection ---
         // 1. Update tracked port children from live sessions
@@ -564,5 +608,112 @@ mod tests {
         scanner.in_flight_pids = Some(vec![42]);
 
         assert!(!scanner.should_start(&[42]));
+    }
+
+    fn demo_session(pid: u32, owns_process_tree: bool) -> AgentSession {
+        let mut app = crate::app::App::new_with_config(
+            crate::theme::Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        crate::demo::populate_demo(&mut app);
+        let mut session = app.sessions.remove(0);
+        session.pid = pid;
+        session.mem_mb = 0;
+        session.owns_process_tree = owns_process_tree;
+        session
+    }
+
+    fn proc_info(pid: u32, ppid: u32, rss_kb: u64) -> (u32, process::ProcInfo) {
+        let info = process::ProcInfo {
+            pid,
+            ppid,
+            rss_kb,
+            cpu_pct: 0.0,
+            command: "x".to_string(),
+        };
+        (pid, info)
+    }
+
+    #[test]
+    fn fill_session_mem_prices_owned_trees_and_reuses_cached_pss() {
+        // 10 agent ── 11 MCP server (PSS unreadable: RSS)
+        // 20 app-server hosting a thread that doesn't own it: stays 0
+        let mut procs: HashMap<u32, process::ProcInfo> = [
+            proc_info(10, 1, 4096),
+            proc_info(11, 10, 2048),
+            proc_info(20, 1, 8192),
+        ]
+        .into_iter()
+        .collect();
+        let mut sessions = vec![demo_session(10, true), demo_session(20, false)];
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read_pss = |pid: u32| {
+            reads.borrow_mut().push(pid);
+            (pid != 11).then_some(3072)
+        };
+        let mut cache = HashMap::new();
+
+        let children = process::get_children_map(&procs);
+        fill_session_mem(&mut sessions, &children, &procs, &mut cache, read_pss);
+        assert_eq!(sessions[0].mem_mb, 5); // 3 MiB PSS + 2 MiB RSS
+        assert_eq!(sessions[1].mem_mb, 0);
+        reads.borrow_mut().sort_unstable();
+        assert_eq!(*reads.borrow(), vec![10, 11]);
+
+        // A later tick: cached values, the unreadable one included, are
+        // reused; only a process that appeared since then is read.
+        procs.extend([proc_info(12, 11, 1024)]);
+        let children = process::get_children_map(&procs);
+        fill_session_mem(&mut sessions, &children, &procs, &mut cache, read_pss);
+        assert_eq!(sessions[0].mem_mb, 8); // + 3 MiB PSS of pid 12
+        assert_eq!(*reads.borrow(), vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn pss_rereads_are_spread_over_the_slow_period() {
+        // An agent (10) and nine descendants: two pids per residue mod 5.
+        let mut procs: HashMap<u32, process::ProcInfo> = (10..20)
+            .map(|pid| proc_info(pid, if pid == 10 { 1 } else { 10 }, 1024))
+            .collect();
+        let mut sessions = vec![demo_session(10, true)];
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read_pss = |pid: u32| {
+            reads.borrow_mut().push(pid);
+            Some(2048)
+        };
+        let mut cache = HashMap::new();
+
+        // First tick: nothing is cached, every pid is read.
+        let children = process::get_children_map(&procs);
+        expire_pss(&mut cache, 1);
+        fill_session_mem(&mut sessions, &children, &procs, &mut cache, read_pss);
+        assert_eq!(reads.take().len(), 10);
+        assert_eq!(sessions[0].mem_mb, 20);
+
+        // Each later tick re-reads only the pids due on it, two here, and
+        // every pid is re-read exactly once over the next slow period.
+        let mut period = Vec::new();
+        for tick in 2..=SLOW_POLL_INTERVAL + 1 {
+            expire_pss(&mut cache, tick);
+            fill_session_mem(&mut sessions, &children, &procs, &mut cache, read_pss);
+            let due = reads.take();
+            assert_eq!(due.len(), 2, "tick {tick}: {due:?}");
+            period.extend(due);
+        }
+        period.sort_unstable();
+        assert_eq!(period, (10..20).collect::<Vec<_>>());
+        assert_eq!(sessions[0].mem_mb, 20);
+
+        // A pid gone from the tree leaves the cache within a period, unread.
+        procs.remove(&19);
+        let children = process::get_children_map(&procs);
+        for tick in 7..=11 {
+            expire_pss(&mut cache, tick);
+            fill_session_mem(&mut sessions, &children, &procs, &mut cache, read_pss);
+        }
+        assert!(!cache.contains_key(&19));
+        assert!(!reads.take().contains(&19));
+        assert_eq!(sessions[0].mem_mb, 18);
     }
 }

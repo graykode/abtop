@@ -124,7 +124,12 @@ pub struct SessionView {
     pub cache_create_tokens: u64,
     /// Number of user/assistant turns observed.
     pub turn_count: u32,
-    /// Resident memory of the session process tree, in MiB.
+    /// Memory of the session's process tree (the agent and all its
+    /// descendants) in MiB, i.e. what closing the session gives back: on
+    /// Linux the PSS of each process in RAM and in swap, so pages shared
+    /// between processes are not counted twice; RSS elsewhere. 0 when the
+    /// session doesn't own its process (a Codex thread served by a shared
+    /// app-server).
     pub mem_mb: u64,
     /// Current git branch of `cwd`, or empty when not a repo.
     pub git_branch: String,

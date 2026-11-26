@@ -184,6 +184,7 @@ lsof -i -P -n -sTCP:LISTEN         # Open ports
 ```
 - Build parent→children map from ppid
 - Map listening PID → parent agent PID → session
+- Session memory (`mem_mb`, MEM column, header Σ) = agent process + all descendants. Linux: each process counts its PSS in RAM and in swap (`Pss:` + `SwapPss:` of `/proc/{pid}/smaps_rollup`), read only for PIDs in session trees: PIDs not seen yet at once, each known PID again once per slow period, on the tick its PID falls due (so the re-reads are spread over the 5 ticks); RSS when unreadable. Other platforms: RSS. The aggregate counts a session nested in another session's tree (e.g. `codex exec` run by Claude Code) once.
 
 ### 7. Git status per project
 ```bash
@@ -291,6 +292,7 @@ Tracks child processes that have open ports. When a parent session dies but the 
   - Session scan + transcript tail: every 2s
   - Process tree (ps): every 2s
   - Port scan (lsof) + git status + rate limits: every 10s (5 ticks)
+  - PSS of session-tree processes: each PID every 10s (5 ticks), spread over the ticks
 
 ## Commit Convention
 
